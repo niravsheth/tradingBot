@@ -1,0 +1,57 @@
+spring:
+  datasource:
+    #    url: jdbc:postgresql://localhost:5432/trading_bot
+    url: jdbc:h2:file:~/testdb
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    database-platform: org.hibernate.dialect.H2Dialect
+    driver-class-name: org.h2.driver
+    console:
+      path: /h2-console
+
+tradier:
+  api:
+    key: h3zGBQqRK3OSrA5wKQYQi2I6FfUI
+    base-url: https://api.tradier.com/v1
+    sandbox: false
+    account-id: 6YB56930
+
+telegram:
+  bot:
+    token: 7074621534:AAEUOUplsrPrpZgG0ghx7EU5efrHFdkkRbs
+    chat-id: 1368492647
+
+trading:
+  symbol: QQQ
+  total-capital: 194  # Total capital to allocate
+  max-position-percentage: 50  # Max % of capital per position
+  min-position-size: 0  # Minimum position size in dollars
+  max-position-size: 98
+  confidence-allocation:  # How to allocate based on confidence
+    high: 0.30    # 30% of available capital for high confidence (>0.8)
+    medium: 0.20  # 20% of available capital for medium confidence (0.6-0.8)
+    low: 0.10     # 10% of available capital for low confidence (<0.6)
+  risk-percentage: 2.0
+  min-volume: 25
+  min-iv: 0.15
+  max-spread-percentage: 10.0
+  start-hour: 10
+  start-minute: 0
+  end-hour: 15
+  end-minute: 30
+  signal-expiration-minutes: 5
+  min-volume-ratio: 1.0
+
+# Safety Features - CRITICAL
+safety:
+  trading-enabled: true  # MASTER SWITCH - Set to true to enable trading
+  paper-mode: false       # true = paper trading, false = real money
+  max-daily-loss: 200     # Stop trading if down this amount
+  max-position-value: 300 # Maximum $ per position
+  max-open-positions: 3   # Maximum concurrent positions
+  emergency-contacts:     # Who to notify in emergency
+    - YOUR_PHONE_NUMBER
