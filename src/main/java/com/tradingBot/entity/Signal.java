@@ -51,4 +51,22 @@ public class Signal {
     @Column(name = "trade_id")
     private Long tradeId;
 
+    @Column(name = "market_trend")
+    private String marketTrend;
+
+    // Add getter and setter
+    public String getMarketTrend() {
+        return marketTrend;
+    }
+
+    public void setMarketTrend(String marketTrend) {
+        this.marketTrend = marketTrend;
+    }
+
+    private LocalDateTime createdAt;
+    private LocalDateTime executionStartTime;
+    private LocalDateTime executionEndTime;
+    private BigDecimal originalOptionPrice;
+    private String executionNotes;
+
 }

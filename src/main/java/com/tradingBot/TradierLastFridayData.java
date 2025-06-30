@@ -10,11 +10,11 @@ public class TradierLastFridayData {
 
     // 🔹 Global variable: Last Friday's date
     private static final LocalDate lastFridayDate = calculateLastFriday();
-    private static final String API_TOKEN = "h3zGBQqRK3OSrA5wKQYQi2I6FfUI"; // Replace with your token
-    private static final String OUTPUT_FILE = "qqq_" + lastFridayDate + ".json";
+    private static final String API_TOKEN = "h3zGBQqRK3OSrA5wKQYQi2I6FfUI"; // Replace with your token if needed
+    private static final String OUTPUT_FILE = "qqq_" + lastFridayDate + "_minute_data.json";
 
     public static void main(String[] args) {
-        System.out.println("Fetching QQQ data for: " + lastFridayDate);
+        System.out.println("Fetching minute-by-minute QQQ data for: " + lastFridayDate);
 
         String apiUrl = buildApiUrl();
 
@@ -43,6 +43,7 @@ public class TradierLastFridayData {
 
         } catch (IOException e) {
             System.err.println("Error fetching data: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -52,10 +53,13 @@ public class TradierLastFridayData {
         return today.with(TemporalAdjusters.previousOrSame(DayOfWeek.FRIDAY));
     }
 
-    // 🔹 Build API URL using the global date
+    // 🔹 Build API URL for minute-by-minute data using the global date
     private static String buildApiUrl() {
+        // Using /v1/markets/timesales for intraday minute data
+        // Specify session=regular for regular trading hours (9:30 AM - 4:00 PM ET)
+        // Interval set to 1m for 1-minute data
         return String.format(
-                "https://api.tradier.com/v1/markets/history?symbol=QQQ&interval=daily&start=%s&end=%s",
+                "https://api.tradier.com/v1/markets/timesales?symbol=QQQ&interval=1m&start=%s%%2009:30:00&end=%s%%2016:00:00&session_filter=regular",
                 lastFridayDate, lastFridayDate
         );
     }

@@ -13,6 +13,8 @@ public class MarketInternals {
     private BigDecimal volu; // Up Volume
     private int newHighs;
     private int newLows;
+    private double trendBias = 0.0;
+    private double advanceDecline;
 
     public boolean isBullishInternals() {
         return tick > 500 && add > 1000 && putCallRatio < 0.8;

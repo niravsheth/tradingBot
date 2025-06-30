@@ -136,4 +136,24 @@ public class Trade {
     @Column(name = "original_target")
     private BigDecimal originalTarget;
 
+
+    @Column(name = "exit_reason")
+    private String exitReason;
+
+
+    @Column(name = "updated_at")
+    private LocalDateTime updatedAt;
+
+    private BigDecimal target;
+    @Column(name = "trailing_activated")
+    private Boolean trailingActivated = false;
+
+    @Column(name = "last_adjustment_time")
+    private LocalDateTime lastAdjustmentTime;
+
+    public boolean isPaperTrade() {
+        return optionSymbol != null && optionSymbol.startsWith("PAPER_");
+    }
+
+
 }

@@ -17,9 +17,11 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.LocalDate;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -35,7 +37,8 @@ public class TradingScheduler {
     private final TradierService tradierService;
     private final MarketDataRepository marketDataRepository;
     private final SafetyService safetyService;
-    
+    private final PositionSyncService positionSyncService;
+
     private final CapitalAllocationService capitalAllocationService;
     private static final Map<String, CachedQuote> componentQuoteCache = new ConcurrentHashMap<>();
     private static final long COMPONENT_CACHE_TTL = 30000; // 30 seconds
@@ -52,72 +55,56 @@ public class TradingScheduler {
         log.info("[v62][{}] ===== MARKET ANALYSIS START - {} =====", requestId, now);
 
         try {
-            // YOUR EXISTING SAFETY CHECKS HERE...
+            // Safety checks
+            if (!safetyService.isTradingEnabled()) {
+                log.warn("[v62][{}] Trading is disabled - skipping market analysis", requestId);
+                return;
+            }
+
+            SafetyStatus status = safetyService.getStatus();
+            log.info("[v62][{}] Safety check - Daily P&L: ${}, Open positions: {}/{}",
+                    requestId, status.getTodayPnL(), status.getOpenPositions(), status.getMaxOpenPositions());
+
+            if (!safetyService.canTrade()) {
+                log.warn("[v62][{}] Cannot open new trades - limits reached", requestId);
+                // Check if it's due to daily loss limit (assuming negative P&L threshold)
+                if (status.getTodayPnL() != null && status.getTodayPnL().compareTo(BigDecimal.valueOf(-500)) <= 0) {
+                    log.error("[v62][{}] DAILY LOSS LIMIT REACHED: ${}", requestId, status.getTodayPnL());
+                    telegramService.sendMessage(String.format("🛑 Daily loss limit reached: $%s - Trading halted",
+                            status.getTodayPnL()));
+                }
+                return;
+            }
 
             log.info("[v62][{}] Step 6: Starting option analysis for {}", requestId, tradingSymbol);
 
-            // ADD TREND CHECK
+            // GET MARKET TREND
             String currentTrend = getQQQTrend();
             log.info("[v62][{}] Current market trend: {}", requestId, currentTrend);
 
-            List<Signal> signals = strategy.analyzeOptions(tradingSymbol);
+            // PASS TREND TO STRATEGY
+            List<Signal> signals = strategy.analyzeOptions(tradingSymbol, currentTrend);
             log.info("[v62][{}] Analysis complete - Generated {} signals", requestId, signals.size());
 
             if (!signals.isEmpty()) {
-                // Filter signals based on trend
-                List<Signal> trendAlignedSignals = new ArrayList<>();
-
+                log.info("[v62][{}] === GENERATED SIGNALS ===", requestId);
                 for (Signal signal : signals) {
-                    boolean isPut = signal.getOptionSymbol().contains("P");
-                    boolean shouldTake = false;
-
-                    if (isPut && "DOWN".equals(currentTrend)) {
-                        shouldTake = true;
-                        log.info("[v62][{}] PUT aligned with DOWN trend - TAKING signal", requestId);
-                    } else if (!isPut && "UP".equals(currentTrend)) {
-                        shouldTake = true;
-                        log.info("[v62][{}] CALL aligned with UP trend - TAKING signal", requestId);
-                    } else if ("NEUTRAL".equals(currentTrend) && signal.getConfidence() >= 0.7) {
-                        shouldTake = true;
-                        log.info("[v62][{}] NEUTRAL trend but high confidence - TAKING signal", requestId);
-                    } else {
-                        log.info("[v62][{}] Signal {} NOT aligned with {} trend - SKIPPING",
-                                requestId, signal.getOptionSymbol(), currentTrend);
-                    }
-
-                    if (shouldTake) {
-                        trendAlignedSignals.add(signal);
-                    }
+                    log.info("[v62][{}] Signal: {} {} - Strategy: {}, Confidence: {}%, Target: ${}, Stop: ${}, Trend: {}",
+                            requestId, signal.getSignalType(), signal.getOptionSymbol(),
+                            signal.getStrategy(), (int)(signal.getConfidence() * 100),
+                            signal.getTargetPrice(), signal.getStopLoss(), currentTrend);
                 }
-
-                // Log filtered signals
-                if (!trendAlignedSignals.isEmpty()) {
-                    log.info("[v62][{}] === TREND-ALIGNED SIGNALS ({} of {}) ===",
-                            requestId, trendAlignedSignals.size(), signals.size());
-                    for (Signal signal : trendAlignedSignals) {
-                        log.info("[v62][{}] Signal: {} {} - Strategy: {}, Confidence: {}%, Target: ${}, Stop: ${}",
-                                requestId, signal.getSignalType(), signal.getOptionSymbol(),
-                                signal.getStrategy(), (int)(signal.getConfidence() * 100),
-                                signal.getTargetPrice(), signal.getStopLoss());
-                    }
-                    log.info("[v62][{}] ========================", requestId);
-
-                    // Update the signals list to only include trend-aligned ones
-                    signals.clear();
-                    signals.addAll(trendAlignedSignals);
-                } else {
-                    log.info("[v62][{}] No trend-aligned signals after filtering", requestId);
-                    signals.clear();
-                }
+                log.info("[v62][{}] ========================", requestId);
             }
 
             log.info("[v62][{}] ===== MARKET ANALYSIS COMPLETE =====", requestId);
         } catch (Exception e) {
-            // YOUR EXISTING ERROR HANDLING
+            log.error("[v62][{}] ERROR in market analysis: {}", requestId, e.getMessage(), e);
+            telegramService.sendMessage(String.format("⚠️ Market analysis error [%s]: %s", requestId, e.getMessage()));
         }
     }
 
-    @Scheduled(cron = "0,15,30,45 * 9-15 * * MON-FRI")
+    @Scheduled(cron = "*/5 * 9-16 * * MON-FRI")
     public void executePendingSignals() {
         String executionId = UUID.randomUUID().toString().substring(0, 8);
         LocalTime now = LocalTime.now();
@@ -234,7 +221,6 @@ public class TradingScheduler {
             log.info("[CLOSE] Starting position close for {} - Reason: {}",
                     trade.getOptionSymbol(), reason);
 
-            // Calculate current P&L before closing
             BigDecimal currentPrice = trade.getCurrentPrice();
             if (currentPrice == null) {
                 currentPrice = tradierService.getOptionPrice(trade.getOptionSymbol());
@@ -243,22 +229,19 @@ public class TradingScheduler {
             BigDecimal pnl = currentPrice.subtract(trade.getEntryPrice())
                     .multiply(BigDecimal.valueOf(trade.getQuantity() * 100));
 
-            // Create closing order - using your existing OrderRequest pattern
             OrderRequest closeRequest = new OrderRequest();
             closeRequest.setSymbol(trade.getOptionSymbol());
             closeRequest.setQuantity(trade.getQuantity());
-            closeRequest.setSide("sell_to_close");  // For long positions
+            closeRequest.setSide("sell_to_close");
             closeRequest.setType("MARKET");
             closeRequest.setDuration("DAY");
 
-            // Place the order
             OrderResponse response = tradierService.placeOrder(closeRequest);
 
             if (response != null) {
                 log.info("[CLOSE] ✅ Successfully closed {} - P&L: ${}",
                         trade.getOptionSymbol(), pnl);
 
-                // Update trade record
                 trade.setStatus("CLOSED");
                 trade.setExitTime(LocalDateTime.now());
                 trade.setExitPrice(currentPrice);
@@ -266,7 +249,6 @@ public class TradingScheduler {
 
                 tradeRepository.save(trade);
 
-                // Send notification
                 String emoji = pnl.compareTo(BigDecimal.ZERO) > 0 ? "💰" : "💸";
                 telegramService.sendMessage(String.format(
                         "%s Position Closed: %s\nReason: %s\nP&L: $%.2f",
@@ -282,7 +264,7 @@ public class TradingScheduler {
         }
     }
 
-    @Scheduled(cron = "*/30 * 9-16 * * MON-FRI")
+    @Scheduled(cron = "*/10 * 9-16 * * MON-FRI")
     public void monitorPositions() {
         LocalTime now = LocalTime.now();
         if (now.isBefore(LocalTime.of(9, 30)) || now.isAfter(LocalTime.of(16, 0))) {
@@ -300,12 +282,14 @@ public class TradingScheduler {
 
         log.info("[MONITOR][{}] Monitoring {} open positions", monitorId, openTrades.size());
 
+        String currentTrend = getQQQTrend();
+
         for (Trade trade : openTrades) {
-            monitorPosition(trade);
+            monitorPosition(trade, currentTrend);
         }
     }
 
-    private void monitorPosition(Trade trade) {
+    private void monitorPosition(Trade trade, String marketTrend) {
         try {
             BigDecimal currentPrice = tradierService.getOptionPrice(trade.getOptionSymbol());
 
@@ -314,63 +298,57 @@ public class TradingScheduler {
                 return;
             }
 
-            // Update current price
             trade.setCurrentPrice(currentPrice);
 
-            // Calculate current P&L
             BigDecimal pnl = currentPrice.subtract(trade.getEntryPrice())
                     .multiply(BigDecimal.valueOf(trade.getQuantity() * 100));
 
             BigDecimal pnlPercent = pnl.divide(
                     trade.getEntryPrice().multiply(BigDecimal.valueOf(trade.getQuantity() * 100)),
-                    2, BigDecimal.ROUND_HALF_UP
+                    2, RoundingMode.HALF_UP
             ).multiply(BigDecimal.valueOf(100));
 
-            // Get market trend
-            String trend = getQQQTrend();
-            boolean isPut = trade.getOptionSymbol().contains("P");
-
-            // ⚡ CHECK TARGETS/STOPS FIRST - BEFORE ANY ADJUSTMENTS
-            // Check profit target FIRST
+            // CHECK TARGETS/STOPS FIRST
             if (trade.getTarget() != null && currentPrice.compareTo(trade.getTarget()) >= 0) {
                 log.info("[MONITOR] 🎯 TARGET HIT for {} - Current: ${} >= Target: ${}",
                         trade.getOptionSymbol(), currentPrice, trade.getTarget());
                 closePosition(trade, "TARGET");
-                return; // EXIT IMMEDIATELY
+                return;
             }
 
-            // Check stop loss
             if (trade.getStopLoss() != null && currentPrice.compareTo(trade.getStopLoss()) <= 0) {
                 log.warn("[MONITOR] 🛑 STOP LOSS HIT for {} - Current: ${} <= Stop: ${}",
                         trade.getOptionSymbol(), currentPrice, trade.getStopLoss());
                 closePosition(trade, "STOP_LOSS");
-                return; // EXIT IMMEDIATELY
+                return;
             }
 
-            // ⚡ NOW APPLY DYNAMIC ADJUSTMENTS (only if position still open)
+            // DYNAMIC ADJUSTMENTS
+            updateTrailingStopInline(trade, currentPrice);
             adjustForVolatility(trade, currentPrice);
-            applyPositionSpecificStrategy(trade, currentPrice);
+            applyPositionSpecificStrategy(trade, currentPrice, marketTrend);
 
-            // Determine position alignment
+            // Position alignment
+            boolean isPut = trade.getOptionSymbol().contains("P");
             String alignment = "";
             String recommendation = "";
 
             if (isPut) {
-                if ("DOWN".equals(trend)) {
+                if ("DOWN".equals(marketTrend)) {
                     alignment = "✅ ALIGNED";
                     recommendation = "HOLD/ADD";
-                } else if ("UP".equals(trend)) {
+                } else if ("UP".equals(marketTrend)) {
                     alignment = "❌ AGAINST";
                     recommendation = "EXIT/REDUCE";
                 } else {
                     alignment = "⚠️ NEUTRAL";
                     recommendation = "MONITOR";
                 }
-            } else { // Call
-                if ("UP".equals(trend)) {
+            } else {
+                if ("UP".equals(marketTrend)) {
                     alignment = "✅ ALIGNED";
                     recommendation = "HOLD/ADD";
-                } else if ("DOWN".equals(trend)) {
+                } else if ("DOWN".equals(marketTrend)) {
                     alignment = "❌ AGAINST";
                     recommendation = "EXIT/REDUCE";
                 } else {
@@ -379,27 +357,24 @@ public class TradingScheduler {
                 }
             }
 
-            // Enhanced logging with trend info
             String emoji = pnl.compareTo(BigDecimal.ZERO) >= 0 ? "📈" : "📉";
             String positionType = isPut ? "PUT" : "CALL";
 
-            // Calculate distances to stops/targets
             BigDecimal stopDistance = trade.getStopLoss() != null ?
                     currentPrice.subtract(trade.getStopLoss()) : BigDecimal.ZERO;
             BigDecimal stopPercent = trade.getStopLoss() != null ?
-                    stopDistance.divide(currentPrice, 2, BigDecimal.ROUND_HALF_UP).multiply(BigDecimal.valueOf(100)) : BigDecimal.ZERO;
+                    stopDistance.divide(currentPrice, 2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100)) : BigDecimal.ZERO;
 
             BigDecimal targetDistance = trade.getTarget() != null ?
                     trade.getTarget().subtract(currentPrice) : BigDecimal.ZERO;
             BigDecimal targetPercent = trade.getTarget() != null ?
-                    targetDistance.divide(currentPrice, 2, BigDecimal.ROUND_HALF_UP).multiply(BigDecimal.valueOf(100)) : BigDecimal.ZERO;
+                    targetDistance.divide(currentPrice, 2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100)) : BigDecimal.ZERO;
 
-            // Main monitoring log with trend analysis
             log.info("[MONITOR] {} {} {} | Trend: {} {} | Entry: ${} → Current: ${} | P&L: ${} ({}%) | Stop: ${} (-{}%) | Target: ${} (+{}%) | Action: {}",
                     emoji,
                     trade.getOptionSymbol(),
                     positionType,
-                    trend,
+                    marketTrend,
                     alignment,
                     trade.getEntryPrice(),
                     currentPrice,
@@ -412,24 +387,51 @@ public class TradingScheduler {
                     recommendation
             );
 
-            // Additional warning if position is against trend and losing
             if ("❌ AGAINST".equals(alignment) && pnl.compareTo(BigDecimal.ZERO) < 0) {
                 log.warn("[MONITOR] ⚠️ WARNING: {} position AGAINST {} trend and LOSING ${} - Consider EXIT",
-                        positionType, trend, pnl.abs());
+                        positionType, marketTrend, pnl.abs());
             }
 
-            // Opportunity alert if aligned and profitable
             if ("✅ ALIGNED".equals(alignment) && pnlPercent.compareTo(BigDecimal.valueOf(5)) > 0) {
                 log.info("[MONITOR] 💚 OPPORTUNITY: {} position ALIGNED with {} trend and UP {}% - Consider ADDING",
-                        positionType, trend, pnlPercent);
+                        positionType, marketTrend, pnlPercent);
             }
 
-            // Save updated values
             tradeRepository.save(trade);
 
         } catch (Exception e) {
             log.error("[MONITOR] Error monitoring position {}: {}",
                     trade.getOptionSymbol(), e.getMessage());
+        }
+    }
+
+    private void updateTrailingStopInline(Trade trade, BigDecimal currentPrice) {
+        try {
+            BigDecimal entryPrice = trade.getEntryPrice();
+            BigDecimal currentStop = trade.getStopLoss();
+
+            BigDecimal profitPercent = currentPrice.subtract(entryPrice)
+                    .divide(entryPrice, 4, RoundingMode.HALF_UP);
+
+            if (profitPercent.compareTo(BigDecimal.valueOf(0.05)) > 0) {
+                BigDecimal newStop = currentPrice.multiply(BigDecimal.valueOf(0.85));
+
+                if (newStop.compareTo(currentStop) > 0) {
+                    trade.setStopLoss(newStop);
+
+                    log.info("[TRAILING] Updated stop for {} from ${} to ${} ({}% profit)",
+                            trade.getOptionSymbol(), currentStop, newStop,
+                            profitPercent.multiply(BigDecimal.valueOf(100)));
+
+                    telegramService.sendMessage(String.format(
+                            "📈 Trailing stop updated for %s\nNew stop: $%.2f (was $%.2f)\nProfit: %.1f%%",
+                            trade.getOptionSymbol(), newStop, currentStop,
+                            profitPercent.multiply(BigDecimal.valueOf(100)).doubleValue()
+                    ));
+                }
+            }
+        } catch (Exception e) {
+            log.error("[TRAILING] Error updating trailing stop: {}", e.getMessage());
         }
     }
 
@@ -439,19 +441,16 @@ public class TradingScheduler {
 
     private void adjustForVolatility(Trade trade, BigDecimal currentPrice) {
         try {
-            // Get QQQ quote for volatility calculation
             QuoteResponse qqqResponse = tradierService.getQuote("QQQ");
             if (qqqResponse == null || qqqResponse.getQuote() == null) return;
 
             Quote qqqQuote = qqqResponse.getQuote();
             if (qqqQuote.getHigh() == null || qqqQuote.getLow() == null || qqqQuote.getLast() == null) return;
 
-            // Calculate intraday volatility
             BigDecimal dayRange = qqqQuote.getHigh().subtract(qqqQuote.getLow());
             BigDecimal volatility = dayRange.divide(qqqQuote.getLast(), 4, BigDecimal.ROUND_HALF_UP);
 
-            // High volatility = wider stops
-            if (volatility.compareTo(BigDecimal.valueOf(0.01)) > 0) { // >1% range
+            if (volatility.compareTo(BigDecimal.valueOf(0.01)) > 0) {
                 BigDecimal volatilityMultiplier = BigDecimal.ONE.subtract(volatility.multiply(BigDecimal.valueOf(2)));
                 BigDecimal widerStop = currentPrice.multiply(volatilityMultiplier);
 
@@ -466,46 +465,83 @@ public class TradingScheduler {
         }
     }
 
-    private void applyPositionSpecificStrategy(Trade trade, BigDecimal currentPrice) {
+    // UPDATED METHOD WITH DYNAMIC ADJUSTMENTS
+    private void applyPositionSpecificStrategy(Trade trade, BigDecimal currentPrice, String marketTrend) {
         try {
             boolean isPut = trade.getOptionSymbol().contains("P");
-            String trend = getQQQTrend(); // We'll implement this
+            boolean isAligned = (isPut && "DOWN".equals(marketTrend)) || (!isPut && "UP".equals(marketTrend));
 
-            if (isPut) {
-                // Put option management
-                if ("UP".equals(trend)) {
-                    // Tighter stops in uptrending market for puts
-                    BigDecimal tightStop = currentPrice.multiply(BigDecimal.valueOf(0.98)); // 2% stop
-                    if (trade.getStopLoss() == null || tightStop.compareTo(trade.getStopLoss()) > 0) {
-                        log.info("[MONITOR] 📉 PUT in UPTREND - Tightening stop to ${}", tightStop);
-                        trade.setStopLoss(tightStop);
-                    }
-                } else if ("DOWN".equals(trend)) {
-                    // Extend targets in downtrend for puts
-                    if (trade.getTarget() != null) {
-                        BigDecimal extendedTarget = trade.getTarget().multiply(BigDecimal.valueOf(1.2));
-                        log.info("[MONITOR] 📉 PUT in DOWNTREND - Extending target to ${}", extendedTarget);
-                        trade.setTarget(extendedTarget);
+            // Calculate current profit percentage
+            BigDecimal profitPercent = currentPrice.subtract(trade.getEntryPrice())
+                    .divide(trade.getEntryPrice(), 4, RoundingMode.HALF_UP);
+
+            if (isAligned) {
+                // POSITION ALIGNED WITH TREND - BE AGGRESSIVE
+
+                // If profitable, extend targets
+                if (profitPercent.compareTo(BigDecimal.valueOf(0.20)) > 0) { // 20% profit
+                    BigDecimal newTarget = trade.getTarget().multiply(BigDecimal.valueOf(1.5));
+                    if (newTarget.compareTo(trade.getTarget()) > 0) {
+                        log.info("[MONITOR] 🚀 TREND ALIGNED & PROFITABLE - Extending target from ${} to ${}",
+                                trade.getTarget(), newTarget);
+                        trade.setTarget(newTarget);
+
+                        // Also trail stop closer
+                        BigDecimal newStop = currentPrice.multiply(BigDecimal.valueOf(0.80)); // 20% stop
+                        if (newStop.compareTo(trade.getStopLoss()) > 0) {
+                            trade.setStopLoss(newStop);
+                            log.info("[MONITOR] 📊 Tightening stop to ${} to lock in profits", newStop);
+                        }
                     }
                 }
-            } else {
-                // Call option management
-                if ("UP".equals(trend)) {
-                    // Extend targets in uptrend for calls
-                    if (trade.getTarget() != null) {
-                        BigDecimal extendedTarget = trade.getTarget().multiply(BigDecimal.valueOf(1.2));
-                        log.info("[MONITOR] 📈 CALL in UPTREND - Extending target to ${}", extendedTarget);
-                        trade.setTarget(extendedTarget);
+
+                // If slightly profitable, just trail stop
+                else if (profitPercent.compareTo(BigDecimal.valueOf(0.10)) > 0) { // 10% profit
+                    BigDecimal newStop = currentPrice.multiply(BigDecimal.valueOf(0.85)); // 15% stop
+                    if (newStop.compareTo(trade.getStopLoss()) > 0) {
+                        trade.setStopLoss(newStop);
+                        log.info("[MONITOR] 📈 Trailing stop to ${} (trend aligned)", newStop);
                     }
-                } else if ("DOWN".equals(trend)) {
-                    // Tighter stops in downtrend for calls
-                    BigDecimal tightStop = currentPrice.multiply(BigDecimal.valueOf(0.98));
-                    if (trade.getStopLoss() == null || tightStop.compareTo(trade.getStopLoss()) > 0) {
-                        log.info("[MONITOR] 📈 CALL in DOWNTREND - Tightening stop to ${}", tightStop);
-                        trade.setStopLoss(tightStop);
+                }
+
+            } else {
+                // POSITION AGAINST TREND - BE DEFENSIVE
+
+                // Tighten stops aggressively
+                BigDecimal tightStop = currentPrice.multiply(BigDecimal.valueOf(0.95)); // 5% stop
+                if (trade.getStopLoss() == null || tightStop.compareTo(trade.getStopLoss()) > 0) {
+                    log.warn("[MONITOR] ⚠️ AGAINST TREND - Tightening stop to ${}", tightStop);
+                    trade.setStopLoss(tightStop);
+                }
+
+                // Lower targets to take profits quickly
+                if (profitPercent.compareTo(BigDecimal.valueOf(0.10)) > 0) { // Any profit
+                    BigDecimal quickTarget = currentPrice.multiply(BigDecimal.valueOf(1.15)); // 15% target
+                    if (quickTarget.compareTo(trade.getTarget()) < 0) {
+                        log.info("[MONITOR] 💰 AGAINST TREND - Lowering target to ${} to secure profit", quickTarget);
+                        trade.setTarget(quickTarget);
                     }
                 }
             }
+
+            // TIME-BASED ADJUSTMENTS
+            LocalTime now = LocalTime.now();
+            if (now.isAfter(LocalTime.of(15, 0))) { // Last hour
+                // Tighten both stops and targets
+                BigDecimal eodStop = currentPrice.multiply(BigDecimal.valueOf(0.90)); // 10% stop
+                BigDecimal eodTarget = currentPrice.multiply(BigDecimal.valueOf(1.20)); // 20% target
+
+                if (eodStop.compareTo(trade.getStopLoss()) > 0) {
+                    trade.setStopLoss(eodStop);
+                    log.info("[MONITOR] ⏰ END OF DAY - Tightening stop to ${}", eodStop);
+                }
+
+                if (eodTarget.compareTo(trade.getTarget()) < 0) {
+                    trade.setTarget(eodTarget);
+                    log.info("[MONITOR] ⏰ END OF DAY - Lowering target to ${}", eodTarget);
+                }
+            }
+
         } catch (Exception e) {
             log.error("Error applying position-specific strategy: {}", e.getMessage());
         }
@@ -525,7 +561,7 @@ public class TradingScheduler {
         }
     }
 
-    private String getQQQTrend() {
+    public String getQQQTrend() {
         try {
             QuoteResponse response = tradierService.getQuote("QQQ");
             if (response == null || response.getQuote() == null) {
@@ -540,20 +576,16 @@ public class TradingScheduler {
                 return "NEUTRAL";
             }
 
-            // Initialize trend score
             double trendScore = 0.0;
 
-            // Get market internals for context
             MarketInternals internals = getMarketInternals();
             double volatilityAdjustment = getVolatilityAdjustment();
 
-            // Get recent market data for better trend analysis
-            List<MarketData> recentData = marketDataRepository.findRecentData("QQQ", 20); // Last 20 minutes
+            List<MarketData> recentData = marketDataRepository.findRecentData("QQQ", 20);
 
             int upMoves = 0;
             int downMoves = 0;
 
-            // Method 1: Check price momentum over last few data points
             if (recentData.size() >= 5) {
                 for (int i = 1; i < Math.min(recentData.size(), 10); i++) {
                     BigDecimal prevPrice = recentData.get(i-1).getPrice();
@@ -566,25 +598,22 @@ public class TradingScheduler {
                     }
                 }
 
-                // Strong trend detection
                 if (upMoves > downMoves * 2) {
                     log.info("[TREND] Strong UP trend detected - Up moves: {}, Down moves: {}", upMoves, downMoves);
-                    trendScore += 3.0; // Strong signal
+                    trendScore += 3.0;
                 } else if (downMoves > upMoves * 2) {
                     log.info("[TREND] Strong DOWN trend detected - Down moves: {}, Up moves: {}", downMoves, upMoves);
-                    trendScore -= 3.0; // Strong signal
+                    trendScore -= 3.0;
                 }
             }
 
-            // Method 2: Multi-timeframe analysis with heavier weighting on recent
             BigDecimal price5MinAgo = getPriceMinutesAgo(recentData, 5);
             BigDecimal price10MinAgo = getPriceMinutesAgo(recentData, 10);
             BigDecimal price15MinAgo = getPriceMinutesAgo(recentData, 15);
 
-            // Weight recent moves more heavily
             if (price5MinAgo != null) {
                 if (currentPrice.compareTo(price5MinAgo) > 0) {
-                    trendScore += 1.5; // Heavier weight for recent
+                    trendScore += 1.5;
                 } else if (currentPrice.compareTo(price5MinAgo) < 0) {
                     trendScore -= 1.5;
                 }
@@ -600,60 +629,72 @@ public class TradingScheduler {
 
             if (price15MinAgo != null) {
                 if (currentPrice.compareTo(price15MinAgo) > 0) {
-                    trendScore += 0.5; // Less weight for older
+                    trendScore += 0.5;
                 } else if (currentPrice.compareTo(price15MinAgo) < 0) {
                     trendScore -= 0.5;
                 }
             }
 
-            // Method 3: Day change
             BigDecimal dayChange = currentPrice.subtract(previousClose)
-                    .divide(previousClose, 4, BigDecimal.ROUND_HALF_UP);
+                    .divide(previousClose, 4, RoundingMode.HALF_UP);
 
-            if (dayChange.compareTo(BigDecimal.valueOf(0.002)) > 0) { // >0.2%
+            if (dayChange.compareTo(BigDecimal.valueOf(0.002)) > 0) {
                 trendScore += 1.0;
-            } else if (dayChange.compareTo(BigDecimal.valueOf(-0.002)) < 0) { // <-0.2%
+            } else if (dayChange.compareTo(BigDecimal.valueOf(-0.002)) < 0) {
                 trendScore -= 1.0;
             }
 
-            // NEW: Add VWAP bias
             try {
-                // Get or calculate VWAP
-                BigDecimal vwap = calculateCurrentVWAP(); // You'll need to implement this
+                BigDecimal vwap = calculateCurrentVWAP();
                 if (vwap != null && currentPrice.compareTo(vwap) > 0) {
-                    trendScore += 0.5; // Slight bullish bias above VWAP
+                    trendScore += 0.5;
                 } else if (vwap != null && currentPrice.compareTo(vwap) < 0) {
-                    trendScore -= 0.5; // Slight bearish bias below VWAP
+                    trendScore -= 0.5;
                 }
             } catch (Exception e) {
                 log.debug("VWAP calculation skipped: {}", e.getMessage());
             }
 
-            // NEW: Consider volume-weighted moves
             try {
                 double volumeRatio = calculateVolumeRatio(recentData);
                 if (volumeRatio > 1.5) {
-                    // Volume confirms direction
                     if (trendScore > 0) {
-                        trendScore += 1.0; // Volume confirms uptrend
+                        trendScore += 1.0;
                     } else if (trendScore < 0) {
-                        trendScore -= 1.0; // Volume confirms downtrend
+                        trendScore -= 1.0;
                     }
                 }
             } catch (Exception e) {
                 log.debug("Volume ratio calculation skipped: {}", e.getMessage());
             }
 
-            // NEW: Component stock analysis (Magnificent 7 weighting) - WITH CACHING
             double componentScore = analyzeQQQComponentsCached();
             trendScore += componentScore;
 
-            // NEW: Market internals influence
             if (internals != null) {
                 trendScore += internals.getTrendBias();
             }
 
-            // Log detailed debug info
+            BigDecimal positionPercent = null;
+            BigDecimal dayHigh = quote.getHigh();
+            BigDecimal dayLow = quote.getLow();
+
+            if (dayHigh != null && dayLow != null && !dayHigh.equals(dayLow)) {
+                BigDecimal range = dayHigh.subtract(dayLow);
+                BigDecimal fromLow = currentPrice.subtract(dayLow);
+                positionPercent = fromLow.divide(range, 3, BigDecimal.ROUND_HALF_UP);
+
+                if (positionPercent.compareTo(BigDecimal.valueOf(0.8)) > 0) {
+                    trendScore += 3.0;
+                    log.info("[TREND] Price at {}% of day's range - BULLISH",
+                            positionPercent.multiply(BigDecimal.valueOf(100)));
+                } else if (positionPercent.compareTo(BigDecimal.valueOf(0.2)) < 0) {
+                    trendScore -= 3.0;
+                    log.info("[TREND] Price at {}% of day's range - BEARISH",
+                            positionPercent.multiply(BigDecimal.valueOf(100)));
+                }
+            }
+
             log.info("[TREND] QQQ Trend Analysis - Current: ${}, 5min ago: ${}, 10min ago: ${}, Base Score: {}",
                     currentPrice, price5MinAgo, price10MinAgo, trendScore);
 
@@ -662,7 +703,7 @@ public class TradingScheduler {
                             "Component Score: {}, VIX adj: {}, Internals: {}, Final Score: {}",
                     upMoves, downMoves,
                     (price5MinAgo != null ? (currentPrice.compareTo(price5MinAgo) > 0 ? "+1.5" : "-1.5") : "0"),
-                    (price10MinAgo != null ? (currentPrice.compareTo(price10MinAgo) > 0 ? "+1" : "-1") : "0"),
+                    (price10MinAgo != null ? (currentPrice.compareTo(price10MinAgo) > 0 ? "+1.0" : "-1.0") : "0"),
                     (price15MinAgo != null ? (currentPrice.compareTo(price15MinAgo) > 0 ? "+0.5" : "-0.5") : "0"),
                     dayChange.compareTo(BigDecimal.valueOf(0.002)) > 0 ? "+1" :
                             (dayChange.compareTo(BigDecimal.valueOf(-0.002)) < 0 ? "-1" : "0"),
@@ -671,17 +712,39 @@ public class TradingScheduler {
                     String.format("%.2f", internals != null ? internals.getTrendBias() : 0.0),
                     String.format("%.2f", trendScore));
 
-            // Determine final trend with DYNAMIC thresholds based on volatility
-            String trend;
-            double upThreshold = 3.0 * volatilityAdjustment;    // Higher threshold in high volatility
-            double downThreshold = -3.0 * volatilityAdjustment;
+            double volatilityFactor = 1.0;
+            if (dayHigh != null && dayLow != null && currentPrice.compareTo(BigDecimal.ZERO) > 0) {
+                BigDecimal dayRange = dayHigh.subtract(dayLow);
+                double rangePercent = dayRange.divide(currentPrice, 4, BigDecimal.ROUND_HALF_UP)
+                        .multiply(BigDecimal.valueOf(100)).doubleValue();
 
+                if (rangePercent > 1.5) {
+                    volatilityFactor = 1.3;
+                } else if (rangePercent < 0.5) {
+                    volatilityFactor = 0.8;
+                }
+            }
+
+            double upThreshold = 3.0 * volatilityFactor;
+            double downThreshold = -3.0 * volatilityFactor;
+
+            String trend;
             if (trendScore >= upThreshold) {
                 trend = "UP";
             } else if (trendScore <= downThreshold) {
                 trend = "DOWN";
             } else {
                 trend = "NEUTRAL";
+            }
+
+            if (Math.abs(trendScore) < upThreshold * 1.2 && positionPercent != null) {
+                if (positionPercent.compareTo(BigDecimal.valueOf(0.9)) > 0) {
+                    trend = "UP";
+                    log.warn("[TREND] Borderline score {} but at day's high - calling UP", String.format("%.2f", trendScore));
+                } else if (positionPercent.compareTo(BigDecimal.valueOf(0.1)) < 0) {
+                    trend = "DOWN";
+                    log.warn("[TREND] Borderline score {} but at day's low - calling DOWN", String.format("%.2f", trendScore));
+                }
             }
 
             log.info("[TREND] Final QQQ Trend: {} (Score: {}, Thresholds: ±{})",
@@ -699,16 +762,14 @@ public class TradingScheduler {
         double componentScore = 0.0;
 
         try {
-            // Define components and their weights
             Map<String, Double> componentWeights = new HashMap<>();
-            componentWeights.put("NVDA", 2.0);  // NVIDIA - high weight
-            componentWeights.put("MSFT", 2.0);  // Microsoft - high weight
-            componentWeights.put("AAPL", 1.0);  // Apple - normal weight
-            componentWeights.put("AMZN", 1.0);  // Amazon - normal weight
-            componentWeights.put("TSLA", 0.8);  // Tesla - lower weight (volatile)
-            componentWeights.put("AVGO", 0.8);  // Broadcom - lower weight
+            componentWeights.put("NVDA", 2.0);
+            componentWeights.put("MSFT", 2.0);
+            componentWeights.put("AAPL", 1.0);
+            componentWeights.put("AMZN", 1.0);
+            componentWeights.put("TSLA", 0.8);
+            componentWeights.put("AVGO", 0.8);
 
-            // Check if we need to refresh cache
             boolean needsRefresh = false;
             for (String symbol : componentWeights.keySet()) {
                 CachedQuote cached = componentQuoteCache.get(symbol);
@@ -718,21 +779,17 @@ public class TradingScheduler {
                 }
             }
 
-            // Refresh cache if needed with BATCH call
             if (needsRefresh) {
                 String symbols = String.join(",", componentWeights.keySet());
                 log.debug("[TREND] Refreshing component quotes cache for: {}", symbols);
 
-                // BATCH API CALL - much more efficient
                 Map<String, Quote> freshQuotes = tradierService.getMultipleQuotes(symbols);
 
-                // Update cache
                 for (Map.Entry<String, Quote> entry : freshQuotes.entrySet()) {
                     componentQuoteCache.put(entry.getKey(), new CachedQuote(entry.getValue()));
                 }
             }
 
-            // Calculate weighted trend from cached data
             double totalWeight = 0.0;
             double weightedTrend = 0.0;
 
@@ -749,15 +806,14 @@ public class TradingScheduler {
                                 .subtract(componentQuote.getPreviousClose())
                                 .divide(componentQuote.getPreviousClose(), 4, BigDecimal.ROUND_HALF_UP);
 
-                        // Score based on magnitude of move
                         double symbolScore = 0.0;
-                        if (dayChange.compareTo(BigDecimal.valueOf(0.01)) > 0) { // >1%
+                        if (dayChange.compareTo(BigDecimal.valueOf(0.01)) > 0) {
                             symbolScore = 1.0;
-                        } else if (dayChange.compareTo(BigDecimal.valueOf(0.005)) > 0) { // >0.5%
+                        } else if (dayChange.compareTo(BigDecimal.valueOf(0.005)) > 0) {
                             symbolScore = 0.5;
-                        } else if (dayChange.compareTo(BigDecimal.valueOf(-0.005)) < 0) { // <-0.5%
+                        } else if (dayChange.compareTo(BigDecimal.valueOf(-0.005)) < 0) {
                             symbolScore = -0.5;
-                        } else if (dayChange.compareTo(BigDecimal.valueOf(-0.01)) < 0) { // <-1%
+                        } else if (dayChange.compareTo(BigDecimal.valueOf(-0.01)) < 0) {
                             symbolScore = -1.0;
                         }
 
@@ -773,9 +829,8 @@ public class TradingScheduler {
                 }
             }
 
-            // Normalize by total weight
             if (totalWeight > 0) {
-                componentScore = weightedTrend / totalWeight * 2.0; // Scale to ±2 range
+                componentScore = weightedTrend / totalWeight * 2.0;
                 log.info("[TREND] Component analysis score: {} (NVDA/MSFT weighted, cached)",
                         String.format("%.2f", componentScore));
             }
@@ -787,10 +842,8 @@ public class TradingScheduler {
         return componentScore;
     }
 
-    // NEW: Get volatility adjustment based on VIX
     private double getVolatilityAdjustment() {
         try {
-            // Cache VIX for 5 minutes
             if (cachedVix == null || vixCacheTime == null ||
                     LocalDateTime.now().isAfter(vixCacheTime.plusMinutes(5))) {
 
@@ -804,46 +857,39 @@ public class TradingScheduler {
             if (cachedVix != null) {
                 double vix = cachedVix.doubleValue();
 
-                // Adjust thresholds based on VIX
                 if (vix < 15) {
-                    return 0.8;  // Lower thresholds in low volatility
+                    return 0.8;
                 } else if (vix > 25) {
-                    return 1.3;  // Higher thresholds in high volatility
+                    return 1.3;
                 } else if (vix > 30) {
-                    return 1.5;  // Much higher thresholds in extreme volatility
+                    return 1.5;
                 }
             }
         } catch (Exception e) {
             log.debug("VIX fetch failed, using default adjustment: {}", e.getMessage());
         }
 
-        return 1.0; // Default multiplier
+        return 1.0;
     }
 
-    // NEW: Get market internals (simplified version)
     private MarketInternals getMarketInternals() {
         try {
             MarketInternals internals = new MarketInternals();
 
-            // Get key market indicators (you'd need to add these symbols to your data feed)
-            // For now, using proxies
-
-            // TICK proxy: Up vs Down volume in QQQ
             QuoteResponse qqqResponse = tradierService.getQuote("QQQ");
             if (qqqResponse != null && qqqResponse.getQuote() != null) {
                 Quote qqqQuote = qqqResponse.getQuote();
 
-                // Simple breadth calculation
                 if (qqqQuote.getBidSize() != null && qqqQuote.getAskSize() != null) {
                     double breadth = (double) qqqQuote.getBidSize() /
                             (qqqQuote.getBidSize() + qqqQuote.getAskSize());
 
                     if (breadth > 0.6) {
-                        internals.setTrendBias(0.5); // Bullish breadth
+                        internals.setTrendBias(0.5);
                     } else if (breadth < 0.4) {
-                        internals.setTrendBias(-0.5); // Bearish breadth
+                        internals.setTrendBias(-0.5);
                     } else {
-                        internals.setTrendBias(0.0); // Neutral
+                        internals.setTrendBias(0.0);
                     }
                 }
             }
@@ -855,7 +901,6 @@ public class TradingScheduler {
         }
     }
 
-    // Simple market internals class
     private static class MarketInternals {
         private double trendBias = 0.0;
 
@@ -868,10 +913,7 @@ public class TradingScheduler {
         }
     }
 
-    // Helper method to calculate current VWAP
     private BigDecimal calculateCurrentVWAP() {
-        // Simple implementation - get from latest technical analysis
-        // You might want to cache this or calculate it more efficiently
         try {
             List<MarketData> todaysData = marketDataRepository
                     .findBySymbolAndTimestampAfterOrderByTimestampAsc("QQQ",
@@ -883,7 +925,7 @@ public class TradingScheduler {
             BigDecimal cumulativeVolume = BigDecimal.ZERO;
 
             for (MarketData data : todaysData) {
-                BigDecimal typicalPrice = data.getPrice(); // Simplified
+                BigDecimal typicalPrice = data.getPrice();
                 long volume = data.getVolume() != null ? data.getVolume() : 0;
 
                 cumulativePriceVolume = cumulativePriceVolume
@@ -900,17 +942,14 @@ public class TradingScheduler {
         }
     }
 
-    // Helper method to calculate volume ratio
     private double calculateVolumeRatio(List<MarketData> recentData) {
         if (recentData.size() < 10) return 1.0;
 
-        // Get last 5 minutes volume
         long recentVolume = recentData.stream()
                 .skip(Math.max(0, recentData.size() - 5))
                 .mapToLong(d -> d.getVolume() != null ? d.getVolume() : 0)
                 .sum();
 
-        // Get previous 5 minutes volume
         long previousVolume = recentData.stream()
                 .skip(Math.max(0, recentData.size() - 10))
                 .limit(5)
@@ -920,96 +959,6 @@ public class TradingScheduler {
         return previousVolume > 0 ? (double) recentVolume / previousVolume : 1.0;
     }
 
-    // Helper method to analyze major QQQ components
-    private double analyzeQQQComponents() {
-        double componentScore = 0.0;
-
-        try {
-            // Define components and their weights
-            // Higher weight for market leaders
-            Map<String, Double> componentWeights = new HashMap<>();
-            componentWeights.put("NVDA", 2.0);  // NVIDIA - high weight
-            componentWeights.put("MSFT", 2.0);  // Microsoft - high weight
-            componentWeights.put("AAPL", 1.0);  // Apple - normal weight
-            componentWeights.put("AMZN", 1.0);  // Amazon - normal weight
-            componentWeights.put("TSLA", 0.8);  // Tesla - lower weight (volatile)
-            componentWeights.put("AVGO", 0.8);  // Broadcom - lower weight
-
-            // Get quotes for all components in one call
-            String symbols = String.join(",", componentWeights.keySet());
-            Map<String, Quote> componentQuotes = getMultipleQuotes(symbols);
-
-            double totalWeight = 0.0;
-            double weightedTrend = 0.0;
-
-            for (Map.Entry<String, Double> entry : componentWeights.entrySet()) {
-                String symbol = entry.getKey();
-                Double weight = entry.getValue();
-
-                Quote componentQuote = componentQuotes.get(symbol);
-                if (componentQuote != null && componentQuote.getLast() != null &&
-                        componentQuote.getPreviousClose() != null) {
-
-                    BigDecimal dayChange = componentQuote.getLast()
-                            .subtract(componentQuote.getPreviousClose())
-                            .divide(componentQuote.getPreviousClose(), 4, BigDecimal.ROUND_HALF_UP);
-
-                    // Score based on magnitude of move
-                    double symbolScore = 0.0;
-                    if (dayChange.compareTo(BigDecimal.valueOf(0.01)) > 0) { // >1%
-                        symbolScore = 1.0;
-                    } else if (dayChange.compareTo(BigDecimal.valueOf(0.005)) > 0) { // >0.5%
-                        symbolScore = 0.5;
-                    } else if (dayChange.compareTo(BigDecimal.valueOf(-0.005)) < 0) { // <-0.5%
-                        symbolScore = -0.5;
-                    } else if (dayChange.compareTo(BigDecimal.valueOf(-0.01)) < 0) { // <-1%
-                        symbolScore = -1.0;
-                    }
-
-                    weightedTrend += symbolScore * weight;
-                    totalWeight += weight;
-
-                    if (Math.abs(symbolScore) > 0) {
-                        log.debug("[TREND] {} change: {}% (score: {}, weight: {})",
-                                symbol, dayChange.multiply(BigDecimal.valueOf(100)),
-                                symbolScore, weight);
-                    }
-                }
-            }
-
-            // Normalize by total weight
-            if (totalWeight > 0) {
-                componentScore = weightedTrend / totalWeight * 2.0; // Scale to ±2 range
-                log.info("[TREND] Component analysis score: {} (NVDA/MSFT heavy weighted)",
-                        String.format("%.2f", componentScore));
-            }
-
-        } catch (Exception e) {
-            log.error("Error analyzing QQQ components: {}", e.getMessage());
-        }
-
-        return componentScore;
-    }
-
-    // Helper method to get multiple quotes efficiently
-    private Map<String, Quote> getMultipleQuotes(String symbols) {
-        Map<String, Quote> quotes = new HashMap<>();
-        try {
-            // This would need to be implemented in TradierService
-            // For now, fall back to individual calls
-            for (String symbol : symbols.split(",")) {
-                QuoteResponse response = tradierService.getQuote(symbol);
-                if (response != null && response.getQuote() != null) {
-                    quotes.put(symbol, response.getQuote());
-                }
-            }
-        } catch (Exception e) {
-            log.error("Error fetching component quotes: {}", e.getMessage());
-        }
-        return quotes;
-    }
-
-    // Helper method
     private BigDecimal getPriceMinutesAgo(List<MarketData> recentData, int minutes) {
         if (recentData == null || recentData.isEmpty()) return null;
 
@@ -1025,12 +974,24 @@ public class TradingScheduler {
         return null;
     }
 
-    // Placeholder method to get average volume (to be implemented based on your data)
     private long getAverageVolumeForQQQ() {
-        // This should fetch historical average volume from your data repository or Tradier API
-        // Placeholder value for now
-        return 50000000L; // Example average volume for QQQ
+        return 50000000L;
     }
 
-
+//    @Scheduled(cron = "0 */5 * * * *") // Every 5 minutes
+//    public void cleanupExpiredSignals() {
+//        List<Signal> expiredSignals = signalRepository.findExpiredPendingSignals(LocalDateTime.now());
+//
+//        if (!expiredSignals.isEmpty()) {
+//            log.info("[CLEANUP] Marking {} expired signals", expiredSignals.size());
+//
+//            for (Signal signal : expiredSignals) {
+//                signal.setStatus("EXPIRED");
+//                signal.setExecuted(true);
+//                signal.setExecutionNotes("Auto-expired");
+//            }
+//
+//            signalRepository.saveAll(expiredSignals);
+//        }
+//    }
 }

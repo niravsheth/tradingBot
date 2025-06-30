@@ -27,16 +27,16 @@ telegram:
 
 trading:
   symbol: QQQ
-  total-capital: 194  # Total capital to allocate
+  total-capital: 2000 # Total capital to allocate
   max-position-percentage: 50  # Max % of capital per position
   min-position-size: 0  # Minimum position size in dollars
-  max-position-size: 98
+  max-position-size: 1000
   confidence-allocation:  # How to allocate based on confidence
-    high: 0.30    # 30% of available capital for high confidence (>0.8)
+    high: 0.60    # 30% of available capital for high confidence (>0.8)
     medium: 0.20  # 20% of available capital for medium confidence (0.6-0.8)
     low: 0.10     # 10% of available capital for low confidence (<0.6)
   risk-percentage: 2.0
-  min-volume: 25
+  min-volume: 10
   min-iv: 0.15
   max-spread-percentage: 10.0
   start-hour: 10
@@ -45,13 +45,92 @@ trading:
   end-minute: 30
   signal-expiration-minutes: 5
   min-volume-ratio: 1.0
+  # Trend filtering
+  trend-filter:
+    enabled: true
+    strict-mode: true
+    neutral-allows-all: false
+  # Signal timing - VERY SHORT windows
+  signal-expiration:
+    unusual-flow: 2        # 2 minutes - execute immediately
+    scalp: 4              # 4 minutes
+    breakout: 5           # 5 minutes
+    default: 4            # 4 minutes default
+    near-close: 1         # 1 minute only after 3:30
+    high-confidence: 3    # 3 minutes for 85%+ signals
+
+  # Execution frequency - CHECK EVERY 5 SECONDS
+  execution:
+    frequency-seconds: 5   # Was 10, now 5 for faster execution
+    high-priority-threshold: 0.85
+
+  # Late session rules
+  late-session:
+    start-time: "15:30"   # 3:30 PM
+    min-confidence: 0.90  # 90% minimum after 3:30
+
+  # Price movement limits for 0DTE
+  price-movement:
+    max-option-price-change: 0.15  # 15% max for options
+    max-underlying-change: 0.01    # 1% max for QQQ
+
+  # Neutral market - STRICT BLOCKING
+  neutral-market:
+    allow-trades: false   # NEVER trade in neutral
+    allow-unusual-flow: false  # Not even unusual flow
+
+  # Position monitoring
+  monitoring:
+    frequency-seconds: 10  # Check every 10 seconds
+
+  # Trailing stops - MORE AGGRESSIVE
+  trailing-stop:
+    enabled: true
+    start-profit: 0.02    # Start at 2% profit
+    breakeven-profit: 0.05 # Lock breakeven at 5%
+    levels:
+      - profit: 0.02
+        stop: 0.98        # 2% below entry
+      - profit: 0.05
+        stop: 1.02        # Breakeven + commission
+      - profit: 0.10
+        stop: 0.75        # 25% trailing
+      - profit: 0.20
+        stop: 0.80        # 20% trailing
+      - profit: 0.30
+        stop: 0.85        # 15% trailing
+      - profit: 0.50
+        stop: 0.90        # 10% trailing
+
+    # Reduce strategy complexity
+  strategies:
+    enabled:
+      - UNUSUAL_FLOW
+      - OPENING_DRIVE
+      - VWAP_BREAKOUT
+      - VWAP_REVERSION
+    max-concurrent: 2
+
+  # Position limits by trend
+  trend-based-limits:
+    enabled: true
+    with-trend-max: 3
+    against-trend-max: 0
+
+  trend-detection:
+    weights:
+      immediate: 2.0
+      short-term: 1.0
+      medium-term: 0.5
+    reversal:
+      enabled: true
 
 # Safety Features - CRITICAL
 safety:
   trading-enabled: true  # MASTER SWITCH - Set to true to enable trading
   paper-mode: false       # true = paper trading, false = real money
   max-daily-loss: 200     # Stop trading if down this amount
-  max-position-value: 300 # Maximum $ per position
+  max-position-value: 1000 # Maximum $ per position
   max-open-positions: 3   # Maximum concurrent positions
   emergency-contacts:     # Who to notify in emergency
     - YOUR_PHONE_NUMBER

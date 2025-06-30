@@ -81,7 +81,7 @@ public class TechnicalAnalysisService {
         // Calculate support and resistance levels
         calculateSupportResistance(sessionData, ta);
 
-        // Analyze trends
+        // Analyze trends - UPDATED METHOD
         analyzeTrends(sessionData, ta);
 
         // Check for reversals
@@ -106,19 +106,9 @@ public class TechnicalAnalysisService {
                 ta.getVwap(), ta.getCurrentPrice(), ta.getRsi(), ta.getVolumeRatio(), ta.getMarketRegime());
 
         // Get previous close from market data
-        // Option 1: From your data provider (Tradier)
         BigDecimal previousClose = getPreviousCloseFromTradier(symbol);
         ta.setPreviousClose(previousClose);
 
-        // Option 2: From your stored data
-        // BigDecimal previousClose = getStoredPreviousClose(symbol);
-        // ta.setPreviousClose(previousClose);
-
-        // For pre-market data (if available from your data source)
-        // ta.setPreMarketHigh(getPreMarketHigh(symbol));
-        // ta.setPreMarketLow(getPreMarketLow(symbol));
-
-        // Fix: Ensure only one type of divergence
         // DISABLE DIVERGENCE - it's broken and blocking all signals
         ta.setHasRsiDivergence(false);
 
@@ -128,8 +118,6 @@ public class TechnicalAnalysisService {
     // Helper method to get previous close from Tradier
     private BigDecimal getPreviousCloseFromTradier(String symbol) {
         try {
-            // Make API call to get previous close
-            // This is pseudo-code - adjust based on your Tradier API
             QuoteResponse quote = tradierService.getQuote(symbol);
             if (quote != null && quote.getQuote().getPreviousClose() != null) {
                 return quote.getQuote().getPreviousClose();
@@ -137,8 +125,6 @@ public class TechnicalAnalysisService {
         } catch (Exception e) {
             log.error("Failed to get previous close for {}: {}", symbol, e.getMessage());
         }
-
-        // Return current price as fallback (no gap)
         return null;
     }
 
@@ -579,29 +565,35 @@ public class TechnicalAnalysisService {
                 current.compareTo(n1Low) < 0 && current.compareTo(n2Low) < 0;
     }
 
+    // UPDATED analyzeTrends METHOD - MUCH MORE SENSITIVE
     private void analyzeTrends(List<MarketData> data, TechnicalAnalysis ta) {
-        if (data.size() < 10) {
+        if (data.size() < 5) {
             ta.setTrend("NEUTRAL");
             ta.setStrength(0.0);
             return;
         }
 
-        // Simple trend analysis using price action
-        BigDecimal firstPrice = data.get(Math.max(0, data.size() - 20)).getPrice();
+        // Use very short timeframe for 0DTE (5 bars instead of 10)
+        BigDecimal firstPrice = data.get(Math.max(0, data.size() - 5)).getPrice();
         BigDecimal lastPrice = data.get(data.size() - 1).getPrice();
         BigDecimal priceChange = lastPrice.subtract(firstPrice);
         BigDecimal priceChangePercent = priceChange.divide(firstPrice, 4, RoundingMode.HALF_UP);
 
-        if (priceChangePercent.compareTo(BigDecimal.valueOf(0.01)) > 0) {
-            ta.setTrend("BULLISH");
-            ta.setStrength(Math.min(priceChangePercent.doubleValue() * 10, 1.0));
-        } else if (priceChangePercent.compareTo(BigDecimal.valueOf(-0.01)) < 0) {
-            ta.setTrend("BEARISH");
-            ta.setStrength(Math.min(Math.abs(priceChangePercent.doubleValue()) * 10, 1.0));
+        // EXTREMELY sensitive thresholds for intraday - 0.05% (5 basis points)
+        if (priceChangePercent.compareTo(BigDecimal.valueOf(0.0005)) > 0) { // 0.05%
+            ta.setTrend("UP"); // Match TradingScheduler naming
+            ta.setStrength(Math.min(priceChangePercent.doubleValue() * 200, 1.0)); // Scale up
+        } else if (priceChangePercent.compareTo(BigDecimal.valueOf(-0.0005)) < 0) { // -0.05%
+            ta.setTrend("DOWN"); // Match TradingScheduler naming
+            ta.setStrength(Math.min(Math.abs(priceChangePercent.doubleValue()) * 200, 1.0));
         } else {
             ta.setTrend("NEUTRAL");
-            ta.setStrength(Math.abs(priceChangePercent.doubleValue()) * 10);
+            ta.setStrength(Math.abs(priceChangePercent.doubleValue()) * 200);
         }
+
+        log.info("[TA] Trend Analysis - First: ${}, Last: ${}, Change: {}%, Trend: {}",
+                firstPrice, lastPrice, priceChangePercent.multiply(BigDecimal.valueOf(100)),
+                ta.getTrend());
     }
 
     private void checkReversals(TechnicalAnalysis ta) {
@@ -674,14 +666,14 @@ public class TechnicalAnalysisService {
             return;
         }
 
-        // Trend-based regimes
+        // Trend-based regimes - UPDATED TO USE NEW NAMING
         double trendStrength = ta.getStrength();
         String trend = ta.getTrend();
 
         if (trendStrength > 0.7) {
-            if ("BULLISH".equals(trend)) {
+            if ("UP".equals(trend)) {
                 ta.setMarketRegime(MarketRegime.TRENDING_UP);
-            } else if ("BEARISH".equals(trend)) {
+            } else if ("DOWN".equals(trend)) {
                 ta.setMarketRegime(MarketRegime.TRENDING_DOWN);
             }
         } else {
@@ -744,60 +736,9 @@ public class TechnicalAnalysisService {
     }
 
     private void checkDivergences(List<MarketData> data, TechnicalAnalysis ta) {
-        if (data.size() < 20) {
-            ta.setHasRsiDivergence(false);
-            ta.setHasMacdDivergence(false);
-            return;
-        }
-
-        // Check RSI divergence
-        boolean rsiDivergence = false;
-
-        // Find recent price highs/lows
-        int lookback = Math.min(10, data.size() - 1);
-        BigDecimal recentHigh = BigDecimal.ZERO;
-        BigDecimal recentLow = BigDecimal.valueOf(999999);
-        int highIndex = -1;
-        int lowIndex = -1;
-
-        for (int i = data.size() - lookback; i < data.size(); i++) {
-            BigDecimal price = data.get(i).getPrice();
-            if (price.compareTo(recentHigh) > 0) {
-                recentHigh = price;
-                highIndex = i;
-            }
-            if (price.compareTo(recentLow) < 0) {
-                recentLow = price;
-                lowIndex = i;
-            }
-        }
-
-        // Check if current price is near recent high/low
-        BigDecimal currentPrice = ta.getCurrentPrice();
-        BigDecimal threshold = currentPrice.multiply(BigDecimal.valueOf(0.002)); // 0.2%
-
-        // Bearish divergence: price makes new high but RSI doesn't
-        if (currentPrice.subtract(recentHigh).abs().compareTo(threshold) < 0 && ta.getRsi() < 65) {
-            rsiDivergence = true;
-            log.info("[TA] Bearish RSI divergence detected - Price near high but RSI only {:.1f}", ta.getRsi());
-        }
-
-        // Bullish divergence: price makes new low but RSI doesn't
-        if (currentPrice.subtract(recentLow).abs().compareTo(threshold) < 0 && ta.getRsi() > 35) {
-            rsiDivergence = true;
-            log.info("[TA] Bullish RSI divergence detected - Price near low but RSI at {:.1f}", ta.getRsi());
-        }
-
-        ta.setHasRsiDivergence(rsiDivergence);
-
-        // Simple MACD divergence check based on momentum strength
-        boolean macdDivergence = false;
-        if ("BULLISH".equals(ta.getTrend()) && ta.getMomentumStrength() < 0.3) {
-            macdDivergence = true;
-        } else if ("BEARISH".equals(ta.getTrend()) && ta.getMomentumStrength() > -0.3) {
-            macdDivergence = true;
-        }
-        ta.setHasMacdDivergence(macdDivergence);
+        // DISABLED - always set to false
+        ta.setHasRsiDivergence(false);
+        ta.setHasMacdDivergence(false);
     }
 
     private void calculateVwapExtensions(TechnicalAnalysis ta) {

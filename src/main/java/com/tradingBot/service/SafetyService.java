@@ -3,7 +3,9 @@ package com.tradingBot.service;
 
 import com.tradingBot.entity.Trade;
 import com.tradingBot.repository.TradeRepository;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -12,6 +14,8 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 @Service
+@Getter
+@Setter
 @Slf4j
 @RequiredArgsConstructor
 public class SafetyService {
@@ -180,6 +184,8 @@ public class SafetyService {
         private BigDecimal maxDailyLoss;
         private BigDecimal maxPositionValue;
         private int maxOpenPositions;
+
+        private int DailyLossLimit;
 
         // Getters and setters
         public boolean isTradingEnabled() { return tradingEnabled; }

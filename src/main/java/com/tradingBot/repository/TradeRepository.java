@@ -35,4 +35,21 @@ public interface TradeRepository extends JpaRepository<Trade, Long> {
     List<Trade> findByOptionSymbolAndStatus(String optionSymbol, String status);
 
 
+    List<Trade> findByStatusAndOptionSymbol(String status, String optionSymbol);
+
+    List<Trade> findByEntryTimeBetween(LocalDateTime start, LocalDateTime end);
+
+    @Query("SELECT t FROM Trade t WHERE t.status = 'OPEN' AND t.symbol = :symbol")
+    List<Trade> findOpenPositionsBySymbol(@Param("symbol") String symbol);
+
+    @Query("SELECT t FROM Trade t WHERE t.status = 'CLOSED' AND t.exitTime >= :startTime")
+    List<Trade> findRecentClosedTrades(@Param("startTime") LocalDateTime startTime);
+
+    @Query("SELECT COUNT(t) FROM Trade t WHERE t.status = 'OPEN'")
+    int countOpenPositions();
+
+    @Query("SELECT SUM(t.realizedPnl) FROM Trade t WHERE t.status = 'CLOSED' AND t.exitTime >= :startTime")
+    BigDecimal calculatePnLSince(@Param("startTime") LocalDateTime startTime);
+
+
 }

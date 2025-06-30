@@ -38,4 +38,26 @@ public interface SignalRepository extends JpaRepository<Signal, Long> {
     @Query("SELECT s FROM Signal s WHERE s.status = 'EXECUTED' AND s.timestamp > :timestamp")
     List<Signal> findExecutedSignalsAfter(@Param("timestamp") LocalDateTime timestamp);
 
+
+    @Query("SELECT s FROM Signal s WHERE s.executed = false " +
+            "AND s.status = 'PENDING' " +
+            "AND s.expirationTime > :currentTime " +
+            "ORDER BY s.confidence DESC, s.createdAt ASC")
+    List<Signal> findFreshUnexecutedSignalsPrioritized(@Param("currentTime") LocalDateTime currentTime);
+
+    List<Signal> findByExecutedFalse();
+
+    List<Signal> findByExecutedFalseAndExpirationTimeAfter(LocalDateTime currentTime);
+
+    @Query("SELECT s FROM Signal s WHERE s.optionSymbol = :optionSymbol " +
+            "AND s.createdAt > :timeLimit AND s.executed = false")
+    List<Signal> findRecentSignalsForOption(@Param("optionSymbol") String optionSymbol,
+                                            @Param("timeLimit") LocalDateTime timeLimit);
+
+    List<Signal> findByStrategyAndCreatedAtAfter(String strategy, LocalDateTime after);
+
+    @Query("SELECT COUNT(s) FROM Signal s WHERE s.executed = true AND s.status = 'EXECUTED' " +
+            "AND s.createdAt >= :startTime")
+    int countExecutedSignalsSince(@Param("startTime") LocalDateTime startTime);
+
 }

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingBot.entity.*;
 import com.tradingBot.model.*;
 import com.tradingBot.repository.*;
+import com.tradingBot.service.PositionSyncService.BrokerPosition;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -13,11 +14,14 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -30,7 +34,7 @@ public class TradingService {
     private final SafetyService safetyService;
     private final MarketDataRepository marketDataRepository;
     private final CapitalAllocationService capitalAllocationService;
-    private final PositionSyncService positionSyncService; // NEW DEPENDENCY
+    private final PositionSyncService positionSyncService;
 
     @Value("${trading.max-position-size}")
     private BigDecimal maxPositionSize;
@@ -46,137 +50,159 @@ public class TradingService {
         String executionId = UUID.randomUUID().toString().substring(0, 8);
         log.info("[v62][{}] === SIGNAL EXECUTION START ===", executionId);
 
-        if (!safetyService.isTradingEnabled()) {
-            log.warn("[v62][{}] Trading is disabled - cannot execute signals", executionId);
-            return;
-        }
-
-        if (!safetyService.canTrade()) {
-            log.warn("[v62][{}] Trading blocked by safety checks", executionId);
-            return;
-        }
-
-        // Only get fresh signals that haven't expired
+        // Get fresh signals prioritized by confidence and age
         List<Signal> signals = signalRepository
-                .findFreshUnexecutedSignals(LocalDateTime.now().minusMinutes(5), LocalDateTime.now());
+                .findFreshUnexecutedSignalsPrioritized(LocalDateTime.now());
 
-        log.info("[v62][{}] Found {} fresh unexecuted signals to process", executionId, signals.size());
+        log.info("[v62][{}] Found {} fresh unexecuted signals", executionId, signals.size());
 
-        if (signals.isEmpty()) {
-            log.debug("[v62][{}] No signals to execute", executionId);
-            return;
-        }
-
-        BigDecimal availableCapital = capitalAllocationService.getAvailableCapital();
-        log.info("[v62][{}] Available capital for trading: ${}", executionId, availableCapital);
-
-        if (availableCapital.compareTo(new BigDecimal("0")) < 0) {
-            log.warn("[v62][{}] Insufficient capital (${}) - skipping signal execution",
-                    executionId, availableCapital);
-            return;
-        }
-
-        for (Signal signal : signals) {
-            try {
-                log.info("[v62][{}] Processing signal #{} for {} (Confidence: {}%)",
-                        executionId, signal.getId(), signal.getOptionSymbol(),
-                        (int)(signal.getConfidence() * 100));
-
-                executeSignal(signal, executionId);
-
-            } catch (Exception e) {
-                log.error("[v62][{}] Error executing signal #{}: {}",
-                        executionId, signal.getId(), e.getMessage(), e);
-                telegramService.sendMessage(String.format(
-                        "⚠️ Error executing signal [%s]: %s", executionId, e.getMessage()));
+        if (!signals.isEmpty()) {
+            // Log signal details
+            for (Signal signal : signals) {
+                long secondsToExpiration = Duration.between(
+                        LocalDateTime.now(), signal.getExpirationTime()).getSeconds();
+                log.info("[v62][{}] Pending: {} - Confidence: {}%, Expires in {}s",
+                        executionId, signal.getOptionSymbol(),
+                        (int)(signal.getConfidence() * 100), secondsToExpiration);
             }
         }
 
-        log.info("[v62][{}] === SIGNAL EXECUTION COMPLETE ===", executionId);
+        // Execute high priority signals first
+        List<Signal> highPrioritySignals = signals.stream()
+                .filter(s -> s.getConfidence() >= 0.85 ||
+                        s.getStrategy().contains("UNUSUAL_FLOW"))
+                .collect(Collectors.toList());
+
+        if (!highPrioritySignals.isEmpty()) {
+            log.info("[v62][{}] Executing {} HIGH PRIORITY signals first",
+                    executionId, highPrioritySignals.size());
+        }
+
+        // Process high priority first, then others
+        for (Signal signal : highPrioritySignals) {
+            executeSignal(signal, executionId);
+        }
+
+        // Then process remaining signals
+        for (Signal signal : signals) {
+            if (!highPrioritySignals.contains(signal)) {
+                executeSignal(signal, executionId);
+            }
+        }
     }
 
     private void executeSignal(Signal signal, String executionId) {
         log.info("[v62][{}] Executing signal for {} with confidence {}%",
                 executionId, signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
 
-        // First check if signal is still valid
-        boolean isScalp = signal.getStrategy() != null && signal.getStrategy().contains("SCALP");
+        // Check signal age
+        LocalDateTime now = LocalDateTime.now();
 
-        // For scalp trades, extend expiration slightly for execution
-        if (isScalp && LocalDateTime.now().isAfter(signal.getExpirationTime().minusMinutes(2))) {
-            log.info("[v62][{}] Extending scalp trade expiration for execution", executionId);
-            signal.setExpirationTime(LocalDateTime.now().plusMinutes(5));
-        }
-
-        if (LocalDateTime.now().isAfter(signal.getExpirationTime())) {
-            log.warn("[v62][{}] Signal #{} has expired - skipping execution", executionId, signal.getId());
-            signal.setStatus("EXPIRED");
-            signal.setExecuted(true); // Mark as processed
-            signalRepository.save(signal);
-            return;
-        }
-
-        if (!safetyService.canTrade()) {
-            log.warn("[v62][{}] Safety check failed during execution", executionId);
-            return;
-        }
-
-        // Re-validate market conditions
-        if (!validateSignalStillValid(signal, executionId)) {
-            log.warn("[v62][{}] Signal #{} no longer valid - market conditions changed", executionId, signal.getId());
-            signal.setStatus("INVALIDATED");
+        // Check if we're in late session
+        LocalTime currentTime = now.toLocalTime();
+        if (currentTime.isAfter(LocalTime.of(15, 30)) && signal.getConfidence() < 0.90) {
+            log.warn("[v62][{}] LATE SESSION - Signal confidence {}% < 90% required - SKIPPING",
+                    executionId, (int)(signal.getConfidence() * 100));
+            signal.setStatus("BLOCKED_LATE_SESSION");
             signal.setExecuted(true);
+            signal.setExecutionNotes("Late session - requires 90%+ confidence");
             signalRepository.save(signal);
             return;
         }
 
-        log.debug("[v62][{}] Step 1: Getting quote for {}", executionId, signal.getOptionSymbol());
+        long secondsToExpiration = Duration.between(now, signal.getExpirationTime()).getSeconds();
+
+        // Hard expiration check
+        if (secondsToExpiration <= 0) {
+            log.warn("[v62][{}] Signal #{} EXPIRED - {} seconds ago",
+                    executionId, signal.getId(), -secondsToExpiration);
+            signal.setStatus("EXPIRED");
+            signal.setExecuted(true);
+            signal.setExecutionNotes("Expired before execution");
+            signalRepository.save(signal);
+            return;
+        }
+
+        // URGENT execution if near expiration
+        if (secondsToExpiration < 30) {
+            log.warn("[v62][{}] URGENT - Signal expires in {} seconds!",
+                    executionId, secondsToExpiration);
+        }
+
+        // Final trend check - NEVER trade in neutral
+        if ("NEUTRAL".equals(signal.getMarketTrend())) {
+            log.error("[v62][{}] Signal has NEUTRAL trend - BLOCKING EXECUTION", executionId);
+            signal.setStatus("BLOCKED_NEUTRAL");
+            signal.setExecuted(true);
+            signal.setExecutionNotes("Neutral market - no trades allowed");
+            signalRepository.save(signal);
+            return;
+        }
+
+        // Get fresh quote
         QuoteResponse quoteResponse = tradierService.getQuote(signal.getOptionSymbol());
         if (quoteResponse == null || quoteResponse.getQuote() == null) {
             log.error("[v62][{}] Failed to get quote for {}", executionId, signal.getOptionSymbol());
             signal.setStatus("FAILED");
             signal.setExecuted(true);
-            signal.setReason(signal.getReason() + " - Failed to get quote");
+            signal.setExecutionNotes("Failed to get quote");
             signalRepository.save(signal);
             return;
         }
 
         Quote quote = quoteResponse.getQuote();
         BigDecimal currentPrice = quote.getLast();
-        log.info("[v62][{}] Option {} - Price: ${}, Bid: ${}, Ask: ${}",
-                executionId, signal.getOptionSymbol(), currentPrice, quote.getBid(), quote.getAsk());
 
-        log.debug("[v62][{}] Step 2: Calculating position size based on confidence", executionId);
+        // Check if option price moved too much (15% max for 0DTE)
+        if (signal.getOriginalOptionPrice() != null &&
+                signal.getOriginalOptionPrice().compareTo(BigDecimal.ZERO) > 0) {
+
+            BigDecimal priceChange = currentPrice.subtract(signal.getOriginalOptionPrice())
+                    .divide(signal.getOriginalOptionPrice(), 4, RoundingMode.HALF_UP).abs();
+
+            if (priceChange.compareTo(BigDecimal.valueOf(0.15)) > 0) {
+                log.warn("[v62][{}] Option price moved {}% - too much movement",
+                        executionId, priceChange.multiply(BigDecimal.valueOf(100)));
+                signal.setStatus("PRICE_MOVED");
+                signal.setExecuted(true);
+                signal.setExecutionNotes(String.format("Price moved %.1f%%",
+                        priceChange.multiply(BigDecimal.valueOf(100)).doubleValue()));
+                signalRepository.save(signal);
+                return;
+            }
+        }
+
+        // Validate underlying hasn't moved too much
+        if (!validateSignalStillValid(signal, executionId)) {
+            signal.setStatus("INVALIDATED");
+            signal.setExecuted(true);
+            signal.setExecutionNotes("Market conditions changed");
+            signalRepository.save(signal);
+            return;
+        }
+
+        // All checks passed - proceed with execution
+        log.info("[v62][{}] All checks passed - proceeding with execution", executionId);
+
+        // Calculate position size
         BigDecimal allocatedCapital = capitalAllocationService
                 .calculatePositionSize(signal.getConfidence(), currentPrice);
 
         if (allocatedCapital.compareTo(BigDecimal.ZERO) <= 0) {
-            log.warn("[v62][{}] No capital allocated for signal", executionId);
+            log.warn("[v62][{}] No capital allocated", executionId);
             return;
         }
 
-        log.debug("[v62][{}] Step 3: Calculating number of contracts", executionId);
         int quantity = capitalAllocationService.calculateContracts(allocatedCapital, currentPrice);
-
         if (quantity == 0) {
             log.warn("[v62][{}] Cannot afford even 1 contract at ${}", executionId, currentPrice);
             return;
         }
 
-        BigDecimal positionValue = currentPrice.multiply(BigDecimal.valueOf(quantity * 100));
-        log.info("[v62][{}] Position details - Contracts: {}, Value: ${}, Allocated: ${}",
-                executionId, quantity, positionValue, allocatedCapital);
-
-        if (!safetyService.validatePositionSize(positionValue)) {
-            log.error("[v62][{}] Position size ${} exceeds safety limits", executionId, positionValue);
-            return;
-        }
-
+        // Execute trade
         if (paperMode) {
-            log.info("[v62][{}] Executing PAPER trade", executionId);
             executePaperTrade(signal, currentPrice, quantity, executionId);
         } else {
-            log.info("[v62][{}] Executing REAL trade", executionId);
             executeRealTrade(signal, currentPrice, quantity, executionId);
         }
     }
@@ -296,12 +322,7 @@ public class TradingService {
         // For opening positions:
         // - BUY signal -> buy_to_open
         // - SELL signal -> sell_to_open
-        String side;
-        if (signal.getSignalType().equals("BUY")) {
-            side = "buy_to_open";
-        } else {
-            side = "sell_to_open";
-        }
+        String side = "buy_to_open";
         orderRequest.setSide(side);
         orderRequest.setType("market");
         orderRequest.setDuration("day");
@@ -353,40 +374,52 @@ public class TradingService {
         }
     }
 
-
     @Transactional
     public void checkOpenPositions() {
         String checkId = UUID.randomUUID().toString().substring(0, 8);
         log.debug("[v62][{}] Checking open positions", checkId);
 
-        // Get positions from BROKER API as source of truth
-        Map<String, PositionSyncService.BrokerPosition> brokerPositions =
+        // ALWAYS sync with broker first
+        positionSyncService.refreshPositions();
+
+        // Get REAL positions from broker
+        Map<String, BrokerPosition> brokerPositions =
                 positionSyncService.getCurrentPositions(false);
 
-        // Also check DB for paper trades and strategy metadata
+        // Get DB trades for metadata (stops, targets, strategy)
         List<Trade> dbTrades = tradeRepository.findByStatusAndSymbol("OPEN", "QQQ");
 
         log.info("[v62][{}] Found {} broker positions, {} DB trades",
                 checkId, brokerPositions.size(), dbTrades.size());
 
-        // Check real positions from broker
-        for (PositionSyncService.BrokerPosition brokerPos : brokerPositions.values()) {
-            // Find corresponding DB trade for strategy metadata
+        // Process each broker position
+        for (Map.Entry<String, BrokerPosition> entry : brokerPositions.entrySet()) {
+            String optionSymbol = entry.getKey();
+            BrokerPosition brokerPos = entry.getValue();
+
+            // Skip if not an option position
+            if (!optionSymbol.contains("C") && !optionSymbol.contains("P")) {
+                continue;
+            }
+
+            // Find matching DB trade
             Trade dbTrade = dbTrades.stream()
-                    .filter(t -> t.getOptionSymbol().equals(brokerPos.getSymbol()))
+                    .filter(t -> t.getOptionSymbol().equals(optionSymbol) ||
+                            t.getOptionSymbol().equals("PAPER_" + optionSymbol))
                     .findFirst()
                     .orElse(null);
 
             if (dbTrade != null) {
-                // Use DB trade metadata with broker position data
-                checkBrokerPosition(brokerPos, dbTrade, checkId);
+                // Use DB metadata with broker prices
+                checkPositionWithRealPrice(brokerPos, dbTrade, checkId);
             } else {
-                // No metadata, use broker position only
-                checkBrokerPositionWithoutMetadata(brokerPos, checkId);
+                // No DB record - create one or use conservative stops
+                log.warn("[v62][{}] No DB record for broker position: {}", checkId, optionSymbol);
+                checkBrokerOnlyPosition(brokerPos, checkId);
             }
         }
 
-        // Check paper trades (not at broker)
+        // Check paper trades separately
         for (Trade trade : dbTrades) {
             if (trade.getOptionSymbol().startsWith("PAPER_")) {
                 checkPaperPosition(trade, checkId);
@@ -394,98 +427,282 @@ public class TradingService {
         }
     }
 
-    private void checkBrokerPosition(PositionSyncService.BrokerPosition brokerPos,
-                                     Trade dbTrade, String checkId) {
-        log.info("[v62][{}] Checking broker position: {} with DB metadata",
+    private void checkBrokerOnlyPosition(BrokerPosition brokerPos, String checkId) {
+        log.info("[v62][{}] Checking broker position without DB metadata: {}",
                 checkId, brokerPos.getSymbol());
 
-        BigDecimal currentPrice = brokerPos.getCurrentPrice();
-        BigDecimal pnl = brokerPos.getPnl();
-
-        log.info("[v62][{}] Position {} - Entry: ${}, Current: ${}, P&L: ${} ({}%)",
-                checkId, brokerPos.getSymbol(),
-                brokerPos.getAvgCost(), currentPrice, pnl,
-                brokerPos.getPnlPercent().multiply(new BigDecimal(100)).intValue());
-
-        // Check exit conditions using DB metadata
-        boolean shouldClose = false;
-        String reason = "";
-
         try {
-            // Use targets from DB trade
-            if (dbTrade.getStopLoss() != null &&
-                    currentPrice.compareTo(dbTrade.getStopLoss()) <= 0) {
-                shouldClose = true;
-                reason = "Stop loss hit";
-            } else if (dbTrade.getTargetPrice() != null &&
-                    currentPrice.compareTo(dbTrade.getTargetPrice()) >= 0) {
-                shouldClose = true;
-                reason = "Target reached";
-            } else if (LocalDateTime.now().getHour() >= 15 &&
-                    LocalDateTime.now().getMinute() >= 30) {
-                shouldClose = true;
-                reason = "End of day exit";
+            // Get fresh quote
+            QuoteResponse quoteResponse = tradierService.getQuote(brokerPos.getSymbol());
+            if (quoteResponse == null || quoteResponse.getQuote() == null) {
+                log.error("[v62][{}] Failed to get quote for {}", checkId, brokerPos.getSymbol());
+                return;
             }
-            // Check if option is near expiration (for 0DTE)
-            else if (LocalDateTime.now().getHour() >= 15 &&
-                    LocalDateTime.now().getMinute() >= 50) {
-                shouldClose = true;
-                reason = "Near expiration exit";
-            }
-        } catch (Exception e) {
-            log.error("[v62][{}] Error checking exit conditions for {}: {}",
-                    checkId, brokerPos.getSymbol(), e.getMessage());
-            return;
-        }
 
-        if (shouldClose) {
-            closeBrokerPosition(dbTrade, brokerPos, currentPrice, reason, checkId);
+            Quote quote = quoteResponse.getQuote();
+            BigDecimal currentBid = quote.getBid();
+            BigDecimal currentPrice = currentBid != null && currentBid.compareTo(BigDecimal.ZERO) > 0 ?
+                    currentBid : quote.getLast();
+
+            if (currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                log.warn("[v62][{}] Invalid price for {}", checkId, brokerPos.getSymbol());
+                return;
+            }
+
+            // Update broker position with current price
+            brokerPos.setCurrentPrice(currentPrice);
+
+            // Recalculate P&L
+            BigDecimal pnl = currentPrice.subtract(brokerPos.getAvgCost())
+                    .multiply(BigDecimal.valueOf(brokerPos.getAbsoluteQuantity() * 100));
+            BigDecimal pnlPercent = pnl.divide(
+                    brokerPos.getAvgCost().multiply(BigDecimal.valueOf(brokerPos.getAbsoluteQuantity() * 100)),
+                    4, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100));
+
+            log.info("[v62][{}] {} - Entry: ${}, Current: ${}, P&L: ${} ({}%)",
+                    checkId, brokerPos.getSymbol(), brokerPos.getAvgCost(),
+                    currentPrice, pnl, pnlPercent);
+
+            // Conservative exit rules without metadata
+            boolean shouldClose = false;
+            String reason = "";
+
+            // Exit if down 40% (conservative for untracked positions)
+            if (pnlPercent.compareTo(BigDecimal.valueOf(-40)) <= 0) {
+                shouldClose = true;
+                reason = "40% loss limit (untracked)";
+            }
+            // Exit if up 60%
+            else if (pnlPercent.compareTo(BigDecimal.valueOf(60)) >= 0) {
+                shouldClose = true;
+                reason = "60% profit target (untracked)";
+            }
+            // End of day check
+            else if (LocalTime.now().isAfter(LocalTime.of(15, 45))) {
+                shouldClose = true;
+                reason = "End of day exit (untracked)";
+            }
+
+            if (shouldClose) {
+                // Create minimal trade record for closing
+                Trade trade = new Trade();
+                trade.setSymbol("QQQ");
+                trade.setOptionSymbol(brokerPos.getSymbol());
+                trade.setType(brokerPos.getSymbol().contains("C") ? "CALL" : "PUT");
+                trade.setAction("BUY");
+                trade.setQuantity(brokerPos.getAbsoluteQuantity());
+                trade.setEntryPrice(brokerPos.getAvgCost());
+                trade.setStatus("OPEN");
+                trade.setStrategy("UNTRACKED_POSITION");
+
+                executePositionClose(trade, brokerPos, currentPrice, reason, checkId);
+            }
+
+        } catch (Exception e) {
+            log.error("[v62][{}] Error checking broker-only position: {}",
+                    checkId, e.getMessage());
         }
     }
 
-    private void checkBrokerPositionWithoutMetadata(PositionSyncService.BrokerPosition brokerPos,
-                                                    String checkId) {
-        log.info("[v62][{}] Checking broker position without metadata: {}",
-                checkId, brokerPos.getSymbol());
+    private void checkPositionWithRealPrice(BrokerPosition brokerPos,
+                                            Trade dbTrade, String checkId) {
+        try {
+            // GET FRESH QUOTE FROM TRADIER
+            String optionSymbol = brokerPos.getSymbol();
+            QuoteResponse quoteResponse = tradierService.getQuote(optionSymbol);
 
-        BigDecimal currentPrice = brokerPos.getCurrentPrice();
-        BigDecimal pnl = brokerPos.getPnl();
-        BigDecimal pnlPercent = brokerPos.getPnlPercent();
+            if (quoteResponse == null || quoteResponse.getQuote() == null) {
+                log.error("[v62][{}] Failed to get quote for {}", checkId, optionSymbol);
+                return;
+            }
 
-        // Conservative exit rules without metadata
-        boolean shouldClose = false;
-        String reason = "";
+            Quote quote = quoteResponse.getQuote();
+            BigDecimal currentBid = quote.getBid();
+            BigDecimal currentAsk = quote.getAsk();
+            BigDecimal currentMid = currentBid.add(currentAsk).divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP);
+            BigDecimal currentLast = quote.getLast();
 
-        // Exit if down 30%
-        if (pnlPercent.compareTo(new BigDecimal("-0.30")) <= 0) {
-            shouldClose = true;
-            reason = "30% loss limit";
+            // Use the most conservative price for stop loss checks
+            BigDecimal currentPrice = currentBid; // Use BID for stop loss (worst case)
+
+            if (currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                currentPrice = currentLast;
+            }
+
+            if (currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                log.warn("[v62][{}] Invalid price for {} - Bid: ${}, Last: ${}",
+                        checkId, optionSymbol, currentBid, currentLast);
+                return;
+            }
+
+            // Update current price in DB
+            dbTrade.setCurrentPrice(currentPrice);
+
+            // Calculate P&L using broker's position data
+            BigDecimal entryPrice = brokerPos.getAvgCost(); // Use broker's average cost
+            BigDecimal pnl = currentPrice.subtract(entryPrice)
+                    .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100));
+
+            BigDecimal pnlPercent = currentPrice.subtract(entryPrice)
+                    .divide(entryPrice, 4, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100));
+
+            log.info("[v62][{}] {} - Entry: ${} → Bid: ${} / Mid: ${} / Ask: ${} | P&L: ${} ({}%)",
+                    checkId, optionSymbol, entryPrice, currentBid, currentMid, currentAsk,
+                    pnl, pnlPercent);
+
+            // CHECK STOPS AND TARGETS
+            boolean shouldClose = false;
+            String closeReason = "";
+
+            // Stop Loss Check - Use BID price
+            if (dbTrade.getStopLoss() != null && currentBid.compareTo(dbTrade.getStopLoss()) <= 0) {
+                shouldClose = true;
+                closeReason = "STOP_LOSS_HIT";
+                log.warn("[v62][{}] 🛑 STOP LOSS HIT - Bid ${} <= Stop ${}",
+                        checkId, currentBid, dbTrade.getStopLoss());
+            }
+
+            // Target Check - Use ASK price (conservative for targets)
+            else if (dbTrade.getTarget() != null && currentAsk.compareTo(dbTrade.getTarget()) >= 0) {
+                shouldClose = true;
+                closeReason = "TARGET_REACHED";
+                log.info("[v62][{}] 🎯 TARGET HIT - Ask ${} >= Target ${}",
+                        checkId, currentAsk, dbTrade.getTarget());
+            }
+
+            // Time-based exits
+            else if (LocalTime.now().isAfter(LocalTime.of(15, 50))) {
+                shouldClose = true;
+                closeReason = "EOD_EXIT";
+                log.warn("[v62][{}] ⏰ End of day exit - 3:50 PM", checkId);
+            }
+
+            // Execute close if needed
+            if (shouldClose) {
+                executePositionClose(dbTrade, brokerPos, currentMid, closeReason, checkId);
+            } else {
+                // Update trailing stops if profitable
+                if (pnlPercent.compareTo(BigDecimal.valueOf(5)) > 0) {
+                    updateTrailingStopWithRealPrice(dbTrade, currentBid, entryPrice, pnlPercent);
+                }
+
+                // Save updated prices
+                dbTrade.setCurrentPrice(currentPrice);
+                dbTrade.setProfit(pnl);
+                tradeRepository.save(dbTrade);
+            }
+
+        } catch (Exception e) {
+            log.error("[v62][{}] Error checking position {}: {}",
+                    checkId, brokerPos.getSymbol(), e.getMessage());
         }
-        // Exit if up 50%
-        else if (pnlPercent.compareTo(new BigDecimal("0.50")) >= 0) {
-            shouldClose = true;
-            reason = "50% profit target";
-        }
-        // End of day
-        else if (LocalDateTime.now().getHour() >= 15 &&
-                LocalDateTime.now().getMinute() >= 30) {
-            shouldClose = true;
-            reason = "End of day exit";
+    }
+
+    private void updateTrailingStopWithRealPrice(Trade trade, BigDecimal currentBid,
+                                                 BigDecimal entryPrice, BigDecimal profitPercent) {
+        BigDecimal currentStop = trade.getStopLoss();
+        BigDecimal newStop = null;
+        String level = "";
+
+        // CONSERVATIVE TRAILING STOPS FOR 0DTE
+        if (profitPercent.compareTo(BigDecimal.valueOf(50)) >= 0) {
+            // 50%+ profit: Stop at entry + 30%
+            newStop = entryPrice.multiply(BigDecimal.valueOf(1.30));
+            level = "50%+ profit → 30% locked";
+        } else if (profitPercent.compareTo(BigDecimal.valueOf(30)) >= 0) {
+            // 30%+ profit: Stop at entry + 15%
+            newStop = entryPrice.multiply(BigDecimal.valueOf(1.15));
+            level = "30%+ profit → 15% locked";
+        } else if (profitPercent.compareTo(BigDecimal.valueOf(20)) >= 0) {
+            // 20%+ profit: Stop at entry + 8%
+            newStop = entryPrice.multiply(BigDecimal.valueOf(1.08));
+            level = "20%+ profit → 8% locked";
+        } else if (profitPercent.compareTo(BigDecimal.valueOf(10)) >= 0) {
+            // 10%+ profit: Stop at breakeven
+            newStop = entryPrice.multiply(BigDecimal.valueOf(1.01));
+            level = "10%+ profit → breakeven";
         }
 
-        if (shouldClose) {
-            // Create minimal trade record for closing
-            Trade trade = new Trade();
-            trade.setSymbol("QQQ");
-            trade.setOptionSymbol(brokerPos.getSymbol());
-            trade.setType(brokerPos.getSymbol().contains("C") ? "CALL" : "PUT");
-            trade.setAction("BUY");
-            trade.setQuantity(Math.abs(brokerPos.getQuantity()));
-            trade.setEntryPrice(brokerPos.getAvgCost());
-            trade.setStatus("OPEN");
-            trade.setStrategy("UNTRACKED_POSITION");
+        // Only update if new stop is higher and reasonable
+        if (newStop != null &&
+                (currentStop == null || newStop.compareTo(currentStop) > 0) &&
+                newStop.compareTo(currentBid.multiply(BigDecimal.valueOf(0.80))) < 0) { // Stop must be < 80% of current bid
 
-            closeBrokerPosition(trade, brokerPos, currentPrice, reason, checkId);
+            trade.setStopLoss(newStop);
+            trade.setTrailingActivated(true);
+            trade.setLastAdjustmentTime(LocalDateTime.now());
+
+            log.info("[TRAILING] {} - Updated stop to ${} ({})",
+                    trade.getOptionSymbol(), newStop, level);
+        }
+    }
+
+    private void executePositionClose(Trade trade, BrokerPosition brokerPos,
+                                      BigDecimal exitPrice, String reason, String checkId) {
+        try {
+            log.info("[v62][{}] EXECUTING CLOSE for {} - Reason: {}",
+                    checkId, trade.getOptionSymbol(), reason);
+
+            // Create market order to close
+            OrderRequest closeOrder = new OrderRequest();
+            closeOrder.setupForOption(brokerPos.getSymbol());
+            closeOrder.setSymbol(brokerPos.getSymbol());
+            closeOrder.setQuantity(Math.abs(brokerPos.getQuantity()));
+            closeOrder.setSide("sell_to_close");
+            closeOrder.setType("market");
+            closeOrder.setDuration("day");
+
+            log.info("[v62][{}] Placing MARKET close order for {} contracts",
+                    checkId, closeOrder.getQuantity());
+
+            OrderResponse response = tradierService.placeOrder(closeOrder);
+
+            if (response != null && response.getOrder() != null) {
+                // Update trade record
+                trade.setExitPrice(exitPrice);
+                trade.setExitTime(LocalDateTime.now());
+                trade.setStatus("CLOSED");
+                trade.setCloseReason(reason);
+                trade.setExitReason(reason);
+
+                // Calculate final P&L
+                BigDecimal finalPnl = exitPrice.subtract(brokerPos.getAvgCost())
+                        .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100));
+                trade.setRealizedPnl(finalPnl);
+                trade.setProfit(finalPnl);
+
+                tradeRepository.save(trade);
+
+                // Refresh positions
+                positionSyncService.refreshPositions();
+
+                // Send alert
+                String emoji = finalPnl.compareTo(BigDecimal.ZERO) >= 0 ? "✅" : "❌";
+//                telegramService.sendMessage(String.format(
+//                        "%s Position Closed: %s\n" +
+//                                "Reason: %s\n" +
+//                                "Entry: $%.2f → Exit: $%.2f\n" +
+//                                "P&L: $%.2f (%.1f%%)\n" +
+//                                "Order ID: %s",
+//                        emoji, trade.getOptionSymbol(),
+//                        reason,
+//                        brokerPos.getAvgCost(), exitPrice,
+//                        finalPnl,
+//                        finalPnl.divide(brokerPos.getAvgCost()
+//                                        .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100)),
+//                                2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100)),
+//                        response.getOrder().getId()
+//                ));
+
+            } else {
+                log.error("[v62][{}] Failed to place close order", checkId);
+                telegramService.sendMessage("❌ Failed to close position: " + trade.getOptionSymbol());
+            }
+
+        } catch (Exception e) {
+            log.error("[v62][{}] Error executing close: {}", checkId, e.getMessage());
+            telegramService.sendMessage("❌ Error closing position: " + e.getMessage());
         }
     }
 
@@ -553,49 +770,6 @@ public class TradingService {
         }
     }
 
-    private void closeBrokerPosition(Trade trade, PositionSyncService.BrokerPosition brokerPos,
-                                     BigDecimal exitPrice, String reason, String checkId) {
-        log.info("[v62][{}] Closing broker position {} - Reason: {}",
-                checkId, brokerPos.getSymbol(), reason);
-
-        OrderRequest orderRequest = new OrderRequest();
-        orderRequest.setupForOption(brokerPos.getSymbol());
-        try {
-            orderRequest.setSymbol(brokerPos.getSymbol());
-        } catch (Exception e) {
-            log.warn("[v62][{}] Failed to set symbol: {}", checkId, e.getMessage());
-        }
-
-        orderRequest.setQuantity(Math.abs(brokerPos.getQuantity()));
-        orderRequest.setSide("sell_to_close"); // Assuming long positions
-        orderRequest.setType("market");
-        orderRequest.setDuration("day");
-
-        log.info("[v62][{}] Closing position - Symbol: {}, Side: {}, Qty: {}",
-                checkId, brokerPos.getSymbol(), orderRequest.getSide(), orderRequest.getQuantity());
-
-        OrderResponse orderResponse = tradierService.placeOrder(orderRequest);
-        if (orderResponse != null && orderResponse.getStatus().equals("filled")) {
-            // Update trade record
-            trade.setExitPrice(exitPrice);
-            trade.setExitTime(LocalDateTime.now());
-            trade.setStatus("CLOSED");
-            trade.setCloseReason(reason);
-            trade.setRealizedPnl(brokerPos.getPnl());
-            trade.setProfit(brokerPos.getPnl());
-            tradeRepository.save(trade);
-
-            // Refresh positions after closing
-            positionSyncService.refreshPositions();
-
-            telegramService.notifyTrade(trade);
-            log.info("[v62][{}] Position closed - P&L: ${}", checkId, trade.getProfit());
-        } else {
-            log.error("[v62][{}] Failed to close position - Status: {}",
-                    checkId, orderResponse != null ? orderResponse.getStatus() : "null");
-        }
-    }
-
     private void closePaperPosition(Trade trade, BigDecimal exitPrice, String reason, String checkId) {
         log.info("[v62][{}] Closing paper position", checkId);
 
@@ -641,5 +815,79 @@ public class TradingService {
         log.info("[RECOVERY] Initial position sync on startup");
         // Use the position sync service for initial sync
         positionSyncService.syncPositionsWithDatabase();
+    }
+
+    public void closePosition(Trade trade, BigDecimal exitPrice, String reason) {
+        if (trade == null || !trade.getStatus().equals("OPEN")) {
+            log.warn("Cannot close position - invalid trade or not open");
+            return;
+        }
+
+        try {
+            log.info("[CLOSE] Closing position {} at ${} - Reason: {}",
+                    trade.getOptionSymbol(), exitPrice, reason);
+
+            // Place closing order
+            OrderRequest orderRequest = new OrderRequest();
+            orderRequest.setupForOption(trade.getOptionSymbol());
+            orderRequest.setSymbol(trade.getOptionSymbol());
+            orderRequest.setQuantity(trade.getQuantity());
+            orderRequest.setSide("sell_to_close"); // Closing a long position
+            orderRequest.setType("market");
+            orderRequest.setDuration("day");
+
+            log.info("[CLOSE] Placing close order for {} contracts of {}",
+                    trade.getQuantity(), trade.getOptionSymbol());
+
+            OrderResponse orderResponse = tradierService.placeOrder(orderRequest);
+
+            if (orderResponse != null && orderResponse.getOrder() != null) {
+                // Update trade record
+                trade.setExitPrice(exitPrice);
+                trade.setExitTime(LocalDateTime.now());
+                trade.setStatus("CLOSED");
+                trade.setExitReason(reason);
+
+                // Calculate final P/L
+                BigDecimal qty = BigDecimal.valueOf(trade.getQuantity() * 100);
+                BigDecimal entryValue = trade.getEntryPrice().multiply(qty);
+                BigDecimal exitValue = exitPrice.multiply(qty);
+                BigDecimal profitLoss = exitValue.subtract(entryValue);
+
+                trade.setRealizedPnl(profitLoss);
+                tradeRepository.save(trade);
+
+                // Update daily P/L
+                // safetyService.updateDailyPnL(profitLoss);
+
+                // Log result
+                BigDecimal profitPercent = profitLoss.divide(entryValue, 4, RoundingMode.HALF_UP)
+                        .multiply(BigDecimal.valueOf(100));
+
+                String emoji = profitLoss.compareTo(BigDecimal.ZERO) >= 0 ? "✅" : "❌";
+                log.info("[CLOSE] {} Position closed - P/L: ${} ({}%)",
+                        emoji, profitLoss, profitPercent);
+
+                // Send notification
+                telegramService.sendMessage(String.format(
+                        "%s Position Closed: %s\n" +
+                                "Exit: $%.2f (Entry: $%.2f)\n" +
+                                "P/L: $%.2f (%.1f%%)\n" +
+                                "Reason: %s",
+                        emoji, trade.getOptionSymbol(),
+                        exitPrice, trade.getEntryPrice(),
+                        profitLoss, profitPercent,
+                        reason
+                ));
+
+            } else {
+                log.error("[CLOSE] Failed to place close order for {}", trade.getOptionSymbol());
+                telegramService.sendMessage("⚠️ Failed to close position: " + trade.getOptionSymbol());
+            }
+
+        } catch (Exception e) {
+            log.error("[CLOSE] Error closing position {}: {}", trade.getOptionSymbol(), e.getMessage(), e);
+            telegramService.sendMessage("❌ Error closing position: " + trade.getOptionSymbol());
+        }
     }
 }

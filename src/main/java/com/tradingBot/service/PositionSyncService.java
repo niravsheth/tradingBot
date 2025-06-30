@@ -3,8 +3,12 @@ package com.tradingBot.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingBot.entity.Trade;
+import com.tradingBot.model.Position;
+import com.tradingBot.model.PositionsResponse;
+import com.tradingBot.model.Quote;
 import com.tradingBot.model.QuoteResponse;
 import com.tradingBot.repository.TradeRepository;
+import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -13,6 +17,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -42,6 +47,11 @@ public class PositionSyncService {
         private BigDecimal pnl;
         private BigDecimal pnlPercent;
         private LocalDateTime lastUpdated;
+        private String type; // "long" or "short"
+
+        public int getAbsoluteQuantity() {
+            return Math.abs(quantity);
+        }
     }
 
     @Data
@@ -89,6 +99,142 @@ public class PositionSyncService {
     }
 
     /**
+     * Fetch positions from Tradier API
+     */
+    private Map<String, BrokerPosition> fetchPositionsFromAPI() {
+        Map<String, BrokerPosition> positions = new HashMap<>();
+
+        try {
+            // Try the direct API method first
+            String positionsJson = tradierService.getAccountPositions();
+            if (positionsJson != null) {
+                positions = parsePositionsFromJson(positionsJson);
+            } else {
+                // Fallback to the typed response method
+                PositionsResponse response = tradierService.getPositions();
+                if (response != null && response.getPositions() != null) {
+                    positions = convertPositionsResponse(response);
+                }
+            }
+
+            // Update current prices
+            if (!positions.isEmpty()) {
+                updateCurrentPrices(positions);
+            }
+
+            log.info("[SYNC] Retrieved {} option positions from broker", positions.size());
+
+        } catch (Exception e) {
+            log.error("[SYNC] Error fetching positions from API: {}", e.getMessage(), e);
+        }
+
+        return positions;
+    }
+
+    private Map<String, BrokerPosition> parsePositionsFromJson(String positionsJson) {
+        Map<String, BrokerPosition> positions = new HashMap<>();
+
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode root = mapper.readTree(positionsJson);
+            JsonNode positionsNode = root.path("positions").path("position");
+
+            // Handle single position (object) or multiple positions (array)
+            List<JsonNode> positionsList = new ArrayList<>();
+            if (positionsNode.isArray()) {
+                positionsNode.forEach(positionsList::add);
+            } else if (!positionsNode.isMissingNode()) {
+                positionsList.add(positionsNode);
+            }
+
+            for (JsonNode pos : positionsList) {
+                String symbol = pos.path("symbol").asText();
+
+                // Skip non-option positions
+                if (!symbol.contains("C") && !symbol.contains("P")) {
+                    continue;
+                }
+
+                BrokerPosition position = new BrokerPosition();
+                position.setSymbol(symbol);
+                position.setQuantity(pos.path("quantity").asInt());
+
+                BigDecimal costBasis = new BigDecimal(pos.path("cost_basis").asDouble());
+                position.setAvgCost(costBasis.divide(
+                        new BigDecimal(Math.abs(position.getQuantity() * 100)),
+                        2,
+                        RoundingMode.HALF_UP
+                ));
+
+                position.setType(position.getQuantity() > 0 ? "long" : "short");
+                position.setLastUpdated(LocalDateTime.now());
+
+                positions.put(symbol, position);
+            }
+        } catch (Exception e) {
+            log.error("[SYNC] Error parsing positions JSON: {}", e.getMessage());
+        }
+
+        return positions;
+    }
+
+    private Map<String, BrokerPosition> convertPositionsResponse(PositionsResponse response) {
+        Map<String, BrokerPosition> positions = new HashMap<>();
+
+        for (Position pos : response.getPositions()) {
+            // Only process option positions
+            if (pos.getSymbol().contains("C") || pos.getSymbol().contains("P")) {
+                BrokerPosition brokerPos = new BrokerPosition();
+                brokerPos.setSymbol(pos.getSymbol());
+                brokerPos.setQuantity(pos.getQuantity());
+                brokerPos.setAvgCost(pos.getCostBasis().divide(
+                        BigDecimal.valueOf(Math.abs(pos.getQuantity()) * 100),
+                        2,
+                        RoundingMode.HALF_UP
+                ));
+                brokerPos.setMarketValue(pos.getMarketValue());
+                brokerPos.setPnl(pos.getUnrealizedPl());
+                brokerPos.setPnlPercent(pos.getUnrealizedPlPercent());
+                brokerPos.setType(pos.getQuantity() > 0 ? "long" : "short");
+                brokerPos.setLastUpdated(LocalDateTime.now());
+
+                positions.put(pos.getSymbol(), brokerPos);
+            }
+        }
+
+        return positions;
+    }
+
+    private void updateCurrentPrices(Map<String, BrokerPosition> positions) {
+        try {
+            // Batch quote request
+            String symbols = String.join(",", positions.keySet());
+            Map<String, Quote> quotes = tradierService.getMultipleQuotes(symbols);
+
+            for (Map.Entry<String, BrokerPosition> entry : positions.entrySet()) {
+                Quote quote = quotes.get(entry.getKey());
+                if (quote != null && quote.getBid() != null) {
+                    BrokerPosition pos = entry.getValue();
+                    // Use bid for conservative P&L calculation
+                    pos.setCurrentPrice(quote.getBid());
+
+                    // Recalculate P&L with fresh price
+                    BigDecimal pnl = pos.getCurrentPrice().subtract(pos.getAvgCost())
+                            .multiply(BigDecimal.valueOf(Math.abs(pos.getQuantity()) * 100));
+                    pos.setPnl(pnl);
+
+                    BigDecimal pnlPercent = pnl.divide(
+                            pos.getAvgCost().multiply(BigDecimal.valueOf(Math.abs(pos.getQuantity()) * 100)),
+                            4, RoundingMode.HALF_UP);
+                    pos.setPnlPercent(pnlPercent);
+                }
+            }
+        } catch (Exception e) {
+            log.error("[SYNC] Error updating current prices: {}", e.getMessage());
+        }
+    }
+
+    /**
      * Check if a specific position exists at broker
      */
     public boolean hasPosition(String optionSymbol) {
@@ -102,6 +248,14 @@ public class PositionSyncService {
     public BrokerPosition getPosition(String optionSymbol) {
         Map<String, BrokerPosition> positions = getCurrentPositions(false);
         return positions.get(optionSymbol);
+    }
+
+    /**
+     * Force refresh all positions (called after trade execution)
+     */
+    public void refreshPositions() {
+        log.info("[SYNC] Force refreshing positions");
+        getCurrentPositions(true);
     }
 
     /**
@@ -182,74 +336,6 @@ public class PositionSyncService {
     }
 
     /**
-     * Fetch positions from Tradier API
-     */
-    private Map<String, BrokerPosition> fetchPositionsFromAPI() {
-        Map<String, BrokerPosition> positions = new HashMap<>();
-
-        try {
-            String positionsJson = tradierService.getAccountPositions();
-            if (positionsJson == null) {
-                return positions;
-            }
-
-            ObjectMapper mapper = new ObjectMapper();
-            JsonNode root = mapper.readTree(positionsJson);
-            JsonNode positionsNode = root.path("positions").path("position");
-
-            // Handle single position (object) or multiple positions (array)
-            List<JsonNode> positionsList = new ArrayList<>();
-            if (positionsNode.isArray()) {
-                positionsNode.forEach(positionsList::add);
-            } else if (!positionsNode.isMissingNode()) {
-                positionsList.add(positionsNode);
-            }
-
-            for (JsonNode pos : positionsList) {
-                String symbol = pos.path("symbol").asText();
-
-                // Skip non-option positions
-                if (symbol.length() <= 3) continue;
-
-                BrokerPosition position = new BrokerPosition();
-                position.setSymbol(symbol);
-                position.setQuantity(pos.path("quantity").asInt());
-                position.setAvgCost(new BigDecimal(pos.path("cost_basis").asDouble())
-                        .divide(new BigDecimal(Math.abs(position.getQuantity() * 100)), 2, BigDecimal.ROUND_HALF_UP));
-
-                // Get current quote
-                try {
-                    QuoteResponse quote = tradierService.getQuote(symbol);
-                    if (quote != null && quote.getQuote() != null) {
-                        position.setCurrentPrice(quote.getQuote().getLast());
-
-                        // Calculate P&L
-                        BigDecimal pnl = position.getCurrentPrice()
-                                .subtract(position.getAvgCost())
-                                .multiply(new BigDecimal(position.getQuantity() * 100));
-                        position.setPnl(pnl);
-
-                        BigDecimal pnlPercent = position.getCurrentPrice()
-                                .subtract(position.getAvgCost())
-                                .divide(position.getAvgCost(), 4, BigDecimal.ROUND_HALF_UP);
-                        position.setPnlPercent(pnlPercent);
-                    }
-                } catch (Exception e) {
-                    log.error("[SYNC] Error getting quote for {}: {}", symbol, e.getMessage());
-                }
-
-                position.setLastUpdated(LocalDateTime.now());
-                positions.put(symbol, position);
-            }
-
-        } catch (Exception e) {
-            log.error("[SYNC] Error fetching positions from API: {}", e.getMessage(), e);
-        }
-
-        return positions;
-    }
-
-    /**
      * Create a trade record from broker position
      */
     private Trade createTradeFromBrokerPosition(BrokerPosition brokerPos) {
@@ -286,13 +372,5 @@ public class PositionSyncService {
         ));
 
         return trade;
-    }
-
-    /**
-     * Force refresh all positions (called after trade execution)
-     */
-    public void refreshPositions() {
-        log.info("[SYNC] Force refreshing positions");
-        getCurrentPositions(true);
     }
 }

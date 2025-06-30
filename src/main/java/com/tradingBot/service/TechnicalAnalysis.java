@@ -89,13 +89,19 @@ public class TechnicalAnalysis {
 
     // If you don't have these methods, add them:
     public String getTrend() {
-        // Simple trend determination based on VWAP position
+        // Return the trend directly without converting
+        // The analyzeTrends method now sets UP/DOWN/NEUTRAL directly
+        if (this.trend != null) {
+            return this.trend;
+        }
+
+        // Fallback if not set
         if (currentPrice != null && vwap != null) {
             int comparison = currentPrice.compareTo(vwap);
-            if (comparison > 0 && momentumStrength > 0) {
-                return "BULLISH";
-            } else if (comparison < 0 && momentumStrength < 0) {
-                return "BEARISH";
+            if (comparison > 0) {
+                return "UP";
+            } else if (comparison < 0) {
+                return "DOWN";
             }
         }
         return "NEUTRAL";

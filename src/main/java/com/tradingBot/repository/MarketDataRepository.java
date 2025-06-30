@@ -43,8 +43,21 @@ public interface MarketDataRepository extends JpaRepository<MarketData, Long> {
     /**
      * Get the latest market data entry for a symbol
      */
+
+    List<MarketData> findBySymbolAndTimestampAfterOrderByTimestampDesc(
+            String symbol, LocalDateTime after);
+
+    List<MarketData> findBySymbolAndTimestampBetweenOrderByTimestamp(
+            String symbol, LocalDateTime start, LocalDateTime end);
+
     @Query("SELECT m FROM MarketData m WHERE m.symbol = :symbol " +
             "ORDER BY m.timestamp DESC LIMIT 1")
-    MarketData findLatestBySymbol(@Param("symbol") String symbol);
+    Optional<MarketData> findLatestBySymbol(@Param("symbol") String symbol);
+
+    @Query("SELECT DISTINCT m.symbol FROM MarketData m WHERE m.timestamp > :after")
+    List<String> findActiveSymbolsSince(@Param("after") LocalDateTime after);
+
+    @Query("DELETE FROM MarketData m WHERE m.timestamp < :before")
+    void deleteOldData(@Param("before") LocalDateTime before);
 
 }

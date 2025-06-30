@@ -8,6 +8,10 @@ import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
@@ -30,6 +34,8 @@ public class TradierService {
 
     private OkHttpClient client;
     private ObjectMapper objectMapper;
+
+    private static final Map<String, Long> apiCallTimes = new ConcurrentHashMap<>();
 
     @Value("${tradier.api.key}")
     private String apiKey;
@@ -61,6 +67,7 @@ public class TradierService {
 
     // Method to get quote, checking cache first
     public QuoteResponse getQuote(String symbol) {
+        long startTime = System.currentTimeMillis();
         CachedQuote cached = quoteCache.get(symbol);
         if (cached != null && !cached.isExpired()) {
             log.debug("Using cached quote for {}: Last=${}", symbol, cached.getQuote().getQuote().getLast());
@@ -70,6 +77,12 @@ public class TradierService {
         QuoteResponse quoteResponse = fetchQuote(symbol);
         if (quoteResponse != null) {
             quoteCache.put(symbol, new CachedQuote(quoteResponse, LocalDateTime.now()));
+        }
+        long duration = System.currentTimeMillis() - startTime;
+        apiCallTimes.put("quote_" + System.currentTimeMillis(), duration);
+
+        if (duration > 1000) { // More than 1 second
+            log.warn("[PERF] Slow quote fetch for {}: {}ms", symbol, duration);
         }
         return quoteResponse;
     }
@@ -451,4 +464,62 @@ public class TradierService {
 
         return quotes;
     }
+
+    public PositionsResponse getPositions() {
+        try {
+            String url = baseUrl + "/accounts/" + accountId + "/positions";
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("Authorization", "Bearer " + apiKey);
+            headers.set("Accept", "application/json");
+
+            Request request = new Request.Builder()
+                    .url(baseUrl + "/accounts/" + accountId + "/positions")
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Accept", "application/json")
+                    .build();
+
+            Response response = client.newCall(request).execute();
+
+
+            if (response.isSuccessful()) {
+                ObjectMapper mapper = new ObjectMapper();
+                JsonNode root = mapper.readTree(response.body().string());
+                JsonNode positionsNode = root.path("positions").path("position");
+
+                PositionsResponse positionsResponse = new PositionsResponse();
+                List<Position> positions = new ArrayList<>();
+
+                if (positionsNode.isArray()) {
+                    for (JsonNode posNode : positionsNode) {
+                        Position position = parsePosition(posNode);
+                        positions.add(position);
+                    }
+                } else if (!positionsNode.isMissingNode()) {
+                    Position position = parsePosition(positionsNode);
+                    positions.add(position);
+                }
+
+                positionsResponse.setPositions(positions);
+                return positionsResponse;
+            }
+
+        } catch (Exception e) {
+            log.error("Error fetching positions: {}", e.getMessage());
+        }
+
+        return null;
+    }
+
+    private Position parsePosition(JsonNode node) {
+        Position position = new Position();
+        position.setSymbol(node.path("symbol").asText());
+        position.setQuantity(node.path("quantity").asInt());
+        position.setCostBasis(new BigDecimal(node.path("cost_basis").asText("0")));
+        position.setMarketValue(new BigDecimal(node.path("market_value").asText("0")));
+        position.setUnrealizedPl(new BigDecimal(node.path("unrealized_pl").asText("0")));
+        position.setUnrealizedPlPercent(new BigDecimal(node.path("unrealized_pl_percent").asText("0")));
+        return position;
+    }
+
 }

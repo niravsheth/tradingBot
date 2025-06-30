@@ -10,14 +10,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.UUID;
+import java.time.*;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -26,9 +20,9 @@ import java.util.stream.Collectors;
 public class ZeroDTEStrategy {
 
     private final TradierService tradierService;
+    private final TelegramService telegramService;
     private final TechnicalAnalysisService technicalAnalysisService;
     private final SignalRepository signalRepository;
-
     private final SignalOrchestrator signalOrchestrator;
 
     @Value("${trading.min-volume:50}")
@@ -47,15 +41,14 @@ public class ZeroDTEStrategy {
     private static final ZoneId ET_ZONE = ZoneId.of("America/New_York");
 
     // Updated strategy thresholds - REDUCED FOR 0DTE
-    private static final double MIN_VOLUME_RATIO_BREAKOUT = 1.2;  // Reduced from 1.5
-    private static final double MIN_VOLUME_RATIO_STANDARD = 0.8;  // Reduced from 1.0
+    private static final double MIN_VOLUME_RATIO_BREAKOUT = 1.2;
+    private static final double MIN_VOLUME_RATIO_STANDARD = 0.8;
     private static final double MAX_RSI_DIVERGENCE = 65.0;
     private static final double MIN_RSI_DIVERGENCE = 35.0;
 
     // Time windows
     private static final LocalTime OPENING_RANGE_END = LocalTime.of(9, 45);
     private static final LocalTime MORNING_SESSION_END = LocalTime.of(11, 30);
-    // Enhanced strategy parameters
     private static final LocalTime PRIME_WINDOW_1_START = LocalTime.of(9, 45);
     private static final LocalTime PRIME_WINDOW_1_END = LocalTime.of(10, 15);
     private static final LocalTime PRIME_WINDOW_2_START = LocalTime.of(10, 30);
@@ -68,21 +61,30 @@ public class ZeroDTEStrategy {
     // Flow detection thresholds
     private static final double UNUSUAL_VOLUME_RATIO = 5.0;
     private static final int UNUSUAL_VOLUME_MIN = 5000;
-    private static final double SMART_MONEY_THRESHOLD = 50000; // $50k premium
-    private static final LocalTime LUNCH_START = LocalTime.of(11, 30);
-    private static final LocalTime LUNCH_END = LocalTime.of(13, 00);
-    private static final LocalTime POWER_HOUR_START = LocalTime.of(15, 00);
-    private static final LocalTime CLOSING_CUTOFF = LocalTime.of(15, 30);
+    private static final double SMART_MONEY_THRESHOLD = 50000;
 
-    public List<Signal> analyzeOptions(String symbol) {
+    // UPDATED METHOD SIGNATURE TO ACCEPT MARKET TREND
+    public List<Signal> analyzeOptions(String symbol, String marketTrend) {
         String analysisId = UUID.randomUUID().toString().substring(0, 8);
         log.info("[v63][{}] ========== STARTING 0DTE ANALYSIS FOR {} ==========", analysisId, symbol);
+        log.info("[v63][{}] Market trend: {}", analysisId, marketTrend);
 
         List<Signal> rawSignals = new ArrayList<>();
 
         try {
             // Time check - avoid unsuitable times
             LocalTime now = LocalTime.now(ET_ZONE);
+            // STRICT TIME CHECK - After 3:30 PM, only high confidence trades
+            boolean isLateSession = now.isAfter(LocalTime.of(15, 30));
+            if (isLateSession) {
+                log.warn("[v63][{}] LATE SESSION MODE - Only 90%+ confidence signals allowed", analysisId);
+            }
+
+            // Block analysis in neutral market
+            if ("NEUTRAL".equals(marketTrend)) {
+                log.warn("[v63][{}] MARKET IS NEUTRAL - NO SIGNALS WILL BE GENERATED", analysisId);
+                return rawSignals;
+            }
             if (!isGoodTradingTime(now)) {
                 log.warn("[v63][{}] Not a good time for 0DTE trading: {}", analysisId, now);
                 return rawSignals;
@@ -102,6 +104,7 @@ public class ZeroDTEStrategy {
                 log.info("[v64][{}] Orchestrator vetoed analysis - unfavorable conditions", analysisId);
                 return rawSignals;
             }
+
             // Check for today's expiration
             LocalDate today = LocalDate.now(ET_ZONE);
             List<LocalDate> expirations = tradierService.getExpirations(symbol);
@@ -133,17 +136,29 @@ public class ZeroDTEStrategy {
             log.info("[v63][{}] Analyzing {} filtered options after confidence adjustment",
                     analysisId, filteredOptions.size());
 
-            // Analyze each option against strategies
+            // Analyze each option against strategies - PASS MARKET TREND
             for (Option option : filteredOptions) {
-                analyzeOptionWithStrategies(option, ta, rawSignals, analysisId);
+                analyzeOptionWithStrategies(option, ta, rawSignals, marketTrend, analysisId);
             }
 
             // Use orchestrator to process signals intelligently
             List<Signal> orchestratedSignals = signalOrchestrator.orchestrateSignals(
                     rawSignals, ta, analysisId);
 
-            // Save the orchestrated signals
-            saveSignals(orchestratedSignals, ta, analysisId);
+            // After getting orchestrated signals, filter by time
+            if (isLateSession && !orchestratedSignals.isEmpty()) {
+                List<Signal> highConfidenceOnly = orchestratedSignals.stream()
+                        .filter(s -> s.getConfidence() >= 0.90)
+                        .collect(Collectors.toList());
+
+                log.info("[v63][{}] Late session filter: {} signals -> {} (90%+ only)",
+                        analysisId, orchestratedSignals.size(), highConfidenceOnly.size());
+
+                orchestratedSignals = highConfidenceOnly;
+            }
+
+            // Save signals with proper expiration
+            saveSignals(orchestratedSignals, ta, marketTrend, analysisId);
 
             log.info("[v64][{}] ========== ANALYSIS COMPLETE - {} SIGNALS (from {} raw) ==========",
                     analysisId, orchestratedSignals.size(), rawSignals.size());
@@ -156,19 +171,21 @@ public class ZeroDTEStrategy {
         }
     }
 
-    // NEW METHOD: Time-based volume adjustment
+    // OVERLOADED METHOD FOR BACKWARD COMPATIBILITY
+    public List<Signal> analyzeOptions(String symbol) {
+        return analyzeOptions(symbol, "NEUTRAL");
+    }
+
     private int getAdjustedMinVolume(LocalTime now) {
         if (now.isBefore(LocalTime.of(10, 30))) {
-            return minVolume / 2;  // 25 instead of 50 early
+            return minVolume / 2;
         } else if (now.isAfter(LocalTime.of(15, 0))) {
-            return minVolume / 2;  // Lower near close
+            return minVolume / 2;
         }
         return minVolume;
     }
 
     private MarketConditions getMarketConditions() {
-        // This would fetch VIX, market breadth, etc.
-        // For now, return a placeholder
         MarketConditions conditions = new MarketConditions();
         conditions.setVix(getVixLevel());
         conditions.setMarketBreadth(calculateMarketBreadth());
@@ -177,43 +194,33 @@ public class ZeroDTEStrategy {
     }
 
     private double getVixLevel() {
-        // Fetch VIX from your data provider
-        // Placeholder: return normal VIX level
         return 18.0;
     }
 
     private double calculateMarketBreadth() {
-        // Calculate advance/decline ratio or similar
-        // Placeholder: return neutral breadth
         return 0.5;
     }
 
     private MarketInternals getMarketInternals() {
-        // Get TICK, ADD, etc.
         MarketInternals internals = new MarketInternals();
-        // Populate with real data
         return internals;
     }
 
     private double estimateMaxConfidence(TechnicalAnalysis ta) {
-        double maxConfidence = 0.5; // Base
+        double maxConfidence = 0.5;
 
-        // Volume spike scenarios
         if (ta.getVolumeRatio() > 2.0) {
             maxConfidence = Math.max(maxConfidence, 0.75);
         }
 
-        // Breakout scenarios
         if (ta.isVwapBreakout() && ta.getVolumeRatio() > 1.5) {
             maxConfidence = Math.max(maxConfidence, 0.78);
         }
 
-        // Reversion scenarios
         if (ta.isExtendedFromVwap() && (ta.getRsi() > 70 || ta.getRsi() < 30)) {
             maxConfidence = Math.max(maxConfidence, 0.80);
         }
 
-        // Support/Resistance with volume
         if ((ta.isVwapAsSupport() || ta.isVwapAsResistance()) && ta.getVolumeRatio() > 1.0) {
             maxConfidence = Math.max(maxConfidence, 0.70);
         }
@@ -222,7 +229,6 @@ public class ZeroDTEStrategy {
     }
 
     private boolean isGoodTradingTime(LocalTime now) {
-        // Prime trading windows only
         if ((now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END)) ||
                 (now.isAfter(PRIME_WINDOW_2_START) && now.isBefore(PRIME_WINDOW_2_END)) ||
                 (now.isAfter(PRIME_WINDOW_3_START) && now.isBefore(PRIME_WINDOW_3_END)) ||
@@ -237,14 +243,12 @@ public class ZeroDTEStrategy {
     private boolean detectOpeningDrive(TechnicalAnalysis ta, String analysisId) {
         LocalTime now = LocalTime.now(ET_ZONE);
 
-        // Only valid in first 30 minutes
         if (!now.isAfter(LocalTime.of(9, 30)) || !now.isBefore(LocalTime.of(10, 00))) {
             return false;
         }
 
-        // Check for gap and volume
         BigDecimal gap = calculatePremarketGap(ta);
-        boolean hasGap = gap.abs().compareTo(BigDecimal.valueOf(0.005)) > 0; // 0.5% gap
+        boolean hasGap = gap.abs().compareTo(BigDecimal.valueOf(0.005)) > 0;
         boolean hasVolume = ta.getVolumeRatio() > 1.5;
 
         if (hasGap && hasVolume) {
@@ -259,7 +263,6 @@ public class ZeroDTEStrategy {
     }
 
     private BigDecimal calculatePremarketGap(TechnicalAnalysis ta) {
-        // Calculate gap from previous close
         if (ta.getPreviousClose() != null && ta.getPreviousClose().compareTo(BigDecimal.ZERO) > 0) {
             return ta.getCurrentPrice().subtract(ta.getPreviousClose())
                     .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP);
@@ -268,15 +271,13 @@ public class ZeroDTEStrategy {
     }
 
     private boolean detectUnusualOptionsFlow(Option option, String analysisId) {
-        // Check for unusual volume patterns
         if (option.getVolume() > UNUSUAL_VOLUME_MIN &&
                 option.getOpenInterest() > 0 &&
                 option.getVolume() > option.getOpenInterest() * 2) {
 
-            // Calculate premium
             BigDecimal premium = option.getMidPrice()
                     .multiply(BigDecimal.valueOf(option.getVolume()))
-                    .multiply(BigDecimal.valueOf(100)); // Contract multiplier
+                    .multiply(BigDecimal.valueOf(100));
 
             if (premium.compareTo(BigDecimal.valueOf(SMART_MONEY_THRESHOLD)) > 0) {
                 log.info("[v63][{}] 🎯 UNUSUAL FLOW DETECTED - {} {} Vol: {} Premium: ${}",
@@ -289,17 +290,16 @@ public class ZeroDTEStrategy {
     }
 
     private double getTimeWindowMultiplier(LocalTime now) {
-        // Boost confidence during prime windows
         if ((now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END))) {
-            return 1.15; // 15% boost for morning momentum
+            return 1.15;
         } else if ((now.isAfter(PRIME_WINDOW_2_START) && now.isBefore(PRIME_WINDOW_2_END))) {
-            return 1.10; // 10% boost for late morning
+            return 1.10;
         } else if ((now.isAfter(PRIME_WINDOW_3_START) && now.isBefore(PRIME_WINDOW_3_END))) {
-            return 1.20; // 20% boost for afternoon move
+            return 1.20;
         } else if ((now.isAfter(FINAL_WINDOW_START) && now.isBefore(FINAL_WINDOW_END))) {
-            return 1.05; // 5% boost for close positioning
+            return 1.05;
         }
-        return 0.8; // 20% penalty outside prime windows
+        return 0.8;
     }
 
     private void logTechnicalAnalysis(TechnicalAnalysis ta, String analysisId) {
@@ -328,13 +328,12 @@ public class ZeroDTEStrategy {
         MarketRegime regime = ta.getMarketRegime();
         DynamicParameters params = ta.getDynamicParameters();
 
-        // Add time-based adjustment
         LocalTime now = LocalTime.now(ET_ZONE);
 
-        // Use time-based volume adjustment
         int adjustedMinVolume = getAdjustedMinVolume(now);
         double adjustedMinIV = minIV;
-        double maxMoneyness = 0.03; // 3% default - will be overridden later
+
+        // Remove the percentage-based filtering - we'll use strike-based instead
 
         switch (regime) {
             case HIGH_VOLATILITY:
@@ -352,7 +351,6 @@ public class ZeroDTEStrategy {
                 break;
         }
 
-        // Apply dynamic parameters if available
         if (params != null) {
             adjustedMinVolume = (int)(adjustedMinVolume * params.getMinVolumeMultiplier());
             adjustedMinIV = adjustedMinIV * params.getMinIVMultiplier();
@@ -364,7 +362,6 @@ public class ZeroDTEStrategy {
         log.info("[v63][{}] Base filtering - Volume: {}, IV: {:.3f}",
                 analysisId, finalMinVolume, finalMinIV);
 
-        // First pass: basic filtering
         List<Option> basicFiltered = options.stream()
                 .filter(option -> option.isValid())
                 .filter(option -> option.getVolume() >= finalMinVolume)
@@ -375,30 +372,10 @@ public class ZeroDTEStrategy {
                 .filter(option -> option.getSpreadPercentage() <= maxSpreadPercentage)
                 .collect(Collectors.toList());
 
-        // Add debug logging
-        log.info("[v63][{}] Volume filtering: {} options -> {} passed (min vol: {})",
-                analysisId, options.size(), basicFiltered.size(), finalMinVolume);
+        log.info("[v63][{}] After basic filtering: {} options", analysisId, basicFiltered.size());
 
-        // Add detailed logging for failed options
-        if (log.isDebugEnabled()) {
-            options.stream()
-                    .filter(option -> option.getVolume() < finalMinVolume)
-                    .limit(5)  // Show first 5 failures
-                    .forEach(option ->
-                            log.debug("[{}] Option {} failed volume check: {} < {}",
-                                    analysisId, option.getSymbol(), option.getVolume(), finalMinVolume)
-                    );
-        }
-
-        // Sort by distance from current price (ATM first)
-        BigDecimal currentPrice = ta.getCurrentPrice();
-        basicFiltered.sort((o1, o2) -> {
-            BigDecimal diff1 = o1.getStrikePrice().subtract(currentPrice).abs();
-            BigDecimal diff2 = o2.getStrikePrice().subtract(currentPrice).abs();
-            return diff1.compareTo(diff2);
-        });
-
-        return basicFiltered;
+        // Now apply strike filtering - this is the key change
+        return filterByConfidenceAdjustedStrikes(basicFiltered, ta, 0.0, analysisId);
     }
 
     private List<Option> filterByConfidenceAdjustedStrikes(List<Option> options,
@@ -406,72 +383,157 @@ public class ZeroDTEStrategy {
                                                            double expectedConfidence,
                                                            String analysisId) {
         BigDecimal currentPrice = ta.getCurrentPrice();
-        double maxMoneyness;
-        int maxStrikes;
 
-        // Determine moneyness threshold based on expected confidence
-        if (expectedConfidence >= 0.75) {
-            maxMoneyness = 0.005; // 0.5% - ATM only
-            maxStrikes = 4; // Only 4 closest strikes
-            log.info("[v63][{}] High confidence expected - Using tight strikes (0.5% max)", analysisId);
-        } else if (expectedConfidence >= 0.65) {
-            maxMoneyness = 0.01; // 1% OTM max
-            maxStrikes = 6;
-        } else {
-            maxMoneyness = 0.02; // 2% OTM max
-            maxStrikes = 8;
-        }
+        // GET ACTUAL STRIKE INTERVALS
+        Set<BigDecimal> strikes = options.stream()
+                .map(Option::getStrikePrice)
+                .collect(Collectors.toCollection(TreeSet::new));
 
-        // Filter by moneyness and limit strikes
+        // Find the ATM strike
+        BigDecimal atmStrike = findATMStrike(strikes, currentPrice);
+
+        // Determine strike interval (usually $1 for QQQ)
+        BigDecimal strikeInterval = determineStrikeInterval(strikes);
+
+        log.info("[v63][{}] Current price: ${}, ATM strike: ${}, Interval: ${}",
+                analysisId, currentPrice, atmStrike, strikeInterval);
+
+        // FILTER TO ONLY ATM AND 1 STRIKE OTM
         List<Option> filtered = options.stream()
                 .filter(option -> {
-                    BigDecimal moneyness = option.getStrikePrice()
-                            .subtract(currentPrice).abs()
-                            .divide(currentPrice, 4, RoundingMode.HALF_UP);
-                    return moneyness.compareTo(BigDecimal.valueOf(maxMoneyness)) <= 0;
+                    BigDecimal strike = option.getStrikePrice();
+                    BigDecimal strikesAway = strike.subtract(atmStrike)
+                            .divide(strikeInterval, 0, RoundingMode.HALF_UP).abs();
+
+                    // For 0DTE, we want ONLY:
+                    // - ATM (0 strikes away)
+                    // - 1 strike OTM
+                    // NO ITM OPTIONS for 0DTE
+
+                    boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+                    boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+
+                    if (isCall) {
+                        // For calls: ATM or 1 strike above
+                        boolean isATM = strike.equals(atmStrike);
+                        boolean is1OTM = strike.equals(atmStrike.add(strikeInterval));
+                        return isATM || is1OTM;
+                    } else if (isPut) {
+                        // For puts: ATM or 1 strike below
+                        boolean isATM = strike.equals(atmStrike);
+                        boolean is1OTM = strike.equals(atmStrike.subtract(strikeInterval));
+                        return isATM || is1OTM;
+                    }
+
+                    return false;
                 })
-                .limit(maxStrikes)
                 .collect(Collectors.toList());
 
-        log.info("[v63][{}] Strike filtering: {} options within {}% of spot price ${}",
-                analysisId, filtered.size(),
-                String.format("%.1f", maxMoneyness * 100),
-                currentPrice);
+        log.info("[v63][{}] Strike filtering: {} options -> {} (ATM + 1 OTM only)",
+                analysisId, options.size(), filtered.size());
+
+        // Log selected strikes
+        filtered.forEach(opt -> {
+            log.info("[v63][{}] Selected: {} {} - {} strikes from ATM",
+                    analysisId, opt.getType(), opt.getStrikePrice(),
+                    opt.getStrikePrice().subtract(atmStrike).divide(strikeInterval, 0, RoundingMode.HALF_UP).abs());
+        });
 
         return filtered;
     }
 
-    private void analyzeOpeningDriveStrategy(Option option, TechnicalAnalysis ta,
-                                             List<Signal> signals, String analysisId) {
-        if (!detectOpeningDrive(ta, analysisId)) {
+    private BigDecimal findATMStrike(Set<BigDecimal> strikes, BigDecimal currentPrice) {
+        // Find the closest strike to current price
+        return strikes.stream()
+                .min(Comparator.comparing(strike -> strike.subtract(currentPrice).abs()))
+                .orElse(currentPrice.setScale(0, RoundingMode.HALF_UP));
+    }
+
+    private BigDecimal determineStrikeInterval(Set<BigDecimal> strikes) {
+        if (strikes.size() < 2) {
+            return BigDecimal.ONE; // Default $1
+        }
+
+        List<BigDecimal> strikeList = new ArrayList<>(strikes);
+        Collections.sort(strikeList);
+
+        // Get the most common interval
+        Map<BigDecimal, Integer> intervalCounts = new HashMap<>();
+
+        for (int i = 1; i < Math.min(strikeList.size(), 10); i++) {
+            BigDecimal interval = strikeList.get(i).subtract(strikeList.get(i-1));
+            intervalCounts.merge(interval, 1, Integer::sum);
+        }
+
+        return intervalCounts.entrySet().stream()
+                .max(Map.Entry.comparingByValue())
+                .map(Map.Entry::getKey)
+                .orElse(BigDecimal.ONE);
+    }
+
+    // UPDATED METHOD SIGNATURE
+    private void analyzeOptionWithStrategies(Option option, TechnicalAnalysis ta,
+                                             List<Signal> signals, String marketTrend, String analysisId) {
+
+        if (detectUnusualOptionsFlow(option, analysisId)) {
+            analyzeUnusualFlow(option, ta, signals, marketTrend, analysisId);
             return;
         }
 
-        // Check for unusual flow
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isBefore(LocalTime.of(10, 0))) {
+            analyzeOpeningDriveStrategy(option, ta, signals, marketTrend, analysisId);
+            return;
+        }
 
+        if (now.isAfter(LocalTime.of(9, 45))) {
+            analyzeOpeningRangeBreakout(option, ta, signals, marketTrend, analysisId);
+        }
+
+        if (ta.getVolumeRatio() > 1.5) {
+            analyzeVolumeSpikeStrategy(option, ta, signals, marketTrend, analysisId);
+        }
+
+        if (ta.isVwapBreakout() && ta.getVolumeRatio() > 1.5) {
+            analyzeVWAPBreakout(option, ta, signals, marketTrend, analysisId);
+        } else if (ta.isExtendedFromVwap() && (ta.getRsi() > 70 || ta.getRsi() < 30)) {
+            analyzeVWAPDeviationReversion(option, ta, signals, marketTrend, analysisId);
+        } else if (ta.isVwapAsSupport() || ta.isVwapAsResistance()) {
+            analyzeVWAPSupportResistance(option, ta, signals, marketTrend, analysisId);
+        } else if (Math.abs(ta.getPriceToVwapRatio() - 1.0) < 0.005) {
+            analyzeVWAPBounce(option, ta, signals, marketTrend, analysisId);
+        }
+    }
+
+    // UPDATE ALL STRATEGY METHODS TO ACCEPT MARKET TREND
+    private void analyzeOpeningDriveStrategy(Option option, TechnicalAnalysis ta,
+                                             List<Signal> signals, String marketTrend, String analysisId) {
+        if (!detectOpeningDrive(ta, analysisId)) {
+            return;
+        }
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
+
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
         BigDecimal gap = calculatePremarketGap(ta);
         boolean isCallOption = "CALL".equalsIgnoreCase(option.getType());
         boolean isPutOption = "PUT".equalsIgnoreCase(option.getType());
 
-        // Trade in direction of gap with momentum
-        if (gap.compareTo(BigDecimal.ZERO) > 0 && isCallOption &&
-                "BULLISH".equals(ta.getTrend())) {
+        if (gap.compareTo(BigDecimal.ZERO) > 0 && isCallOption && "UP".equals(marketTrend)) {
+            double confidence = 0.70;
 
-            double confidence = 0.70; // High base confidence
-
-            // Boost for volume or unusual flow
             if (ta.getVolumeRatio() > 2.0 || hasUnusualFlow) {
                 confidence += 0.15;
             }
 
-            // Boost for momentum alignment
             if (ta.getMomentumStrength() > 0.5) {
                 confidence += 0.10;
             }
 
             if (confidence >= 0.70) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_OPENING_DRIVE_CALL", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_OPENING_DRIVE_CALL", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Opening drive +%.2f%% gap with %.1fx volume - momentum continuation%s",
                         gap.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -484,10 +546,7 @@ public class ZeroDTEStrategy {
             }
         }
 
-        // Negative gap
-        if (gap.compareTo(BigDecimal.ZERO) < 0 && isPutOption &&
-                "BEARISH".equals(ta.getTrend())) {
-
+        if (gap.compareTo(BigDecimal.ZERO) < 0 && isPutOption && "DOWN".equals(marketTrend)) {
             double confidence = 0.70;
 
             if (ta.getVolumeRatio() > 2.0 || hasUnusualFlow) {
@@ -499,7 +558,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.70) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_OPENING_DRIVE_PUT", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_OPENING_DRIVE_PUT", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Opening drive %.2f%% gap down with %.1fx volume - momentum continuation%s",
                         gap.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -513,48 +572,17 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeOptionWithStrategies(Option option, TechnicalAnalysis ta,
-                                             List<Signal> signals, String analysisId) {
-
-        // Add this FIRST to capture unusual flow as signals
-        analyzeUnusualFlow(option, ta, signals, analysisId);
-
-        MarketRegime regime = ta.getMarketRegime();
-        LocalTime now = LocalTime.now(ET_ZONE);
-
-        // Get time window multiplier
-        double timeMultiplier = getTimeWindowMultiplier(now);
-
-        // Check moneyness early
-        BigDecimal currentPrice = ta.getCurrentPrice();
-        BigDecimal moneyness = option.getStrikePrice()
-                .subtract(currentPrice).abs()
-                .divide(currentPrice, 4, RoundingMode.HALF_UP);
-
-        log.debug("[v63][{}] Analyzing {} strike ${} ({}% from spot)",
-                analysisId, option.getType(), option.getStrikePrice(),
-                String.format("%.2f", moneyness.multiply(BigDecimal.valueOf(100)).doubleValue()));
-
-        // Analyze with various strategies
-        analyzeOpeningDriveStrategy(option, ta, signals, analysisId);
-        analyzeOpeningRangeBreakout(option, ta, signals, analysisId);
-        analyzeVWAPBreakout(option, ta, signals, analysisId);
-        analyzeVWAPDeviationReversion(option, ta, signals, analysisId);
-        analyzeVolumeSpikeStrategy(option, ta, signals, analysisId);
-        analyzeVWAPSupportResistance(option, ta, signals, analysisId);
-        analyzeVWAPBounce(option, ta, signals, analysisId);
-    }
-
-    // Updated Strategy: Opening Range Breakout
     private void analyzeOpeningRangeBreakout(Option option, TechnicalAnalysis ta,
-                                             List<Signal> signals, String analysisId) {
+                                             List<Signal> signals, String marketTrend, String analysisId) {
         if (ta.getOpeningRangeHigh() == null || ta.getOpeningRangeLow() == null) {
             return;
         }
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
 
-        // Check for unusual flow
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
-
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal orHigh = ta.getOpeningRangeHigh();
         BigDecimal orLow = ta.getOpeningRangeLow();
@@ -562,20 +590,18 @@ public class ZeroDTEStrategy {
         log.info("[v63][{}] ORB Analysis - Current: ${}, OR High: ${}, OR Low: ${}",
                 analysisId, currentPrice, orHigh, orLow);
 
-        // Breakout above opening range high
         if (currentPrice.compareTo(orHigh) > 0 && "CALL".equalsIgnoreCase(option.getType())) {
             boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
 
             if (volumeRequirementMet && !ta.isHasRsiDivergence()) {
                 double confidence = calculateORBConfidence(ta, true);
 
-                // Boost confidence for unusual flow
                 if (hasUnusualFlow) {
                     confidence = Math.min(confidence * 1.15, 0.95);
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_ORB_CALL", confidence);
+                    Signal signal = createSignal(option, ta, "BUY", "0DTE_ORB_CALL", confidence, marketTrend);
                     signal.setReason(String.format(
                             "Opening range breakout above $%.2f with %.1fx volume%s",
                             orHigh, ta.getVolumeRatio(),
@@ -585,26 +611,21 @@ public class ZeroDTEStrategy {
                     log.info("[v63][{}] ✅ ORB CALL signal - Confidence: {}%",
                             analysisId, (int)(confidence * 100));
                 }
-            } else if (!volumeRequirementMet) {
-                log.debug("[{}] Skipping ORB CALL - Volume ratio {:.2f} < required {:.1f}",
-                        analysisId, ta.getVolumeRatio(), MIN_VOLUME_RATIO_BREAKOUT);
             }
         }
 
-        // Breakdown below opening range low
         if (currentPrice.compareTo(orLow) < 0 && "PUT".equalsIgnoreCase(option.getType())) {
             boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
 
             if (volumeRequirementMet && !ta.isHasRsiDivergence()) {
                 double confidence = calculateORBConfidence(ta, false);
 
-                // Boost confidence for unusual flow
                 if (hasUnusualFlow) {
                     confidence = Math.min(confidence * 1.15, 0.95);
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_ORB_PUT", confidence);
+                    Signal signal = createSignal(option, ta, "BUY", "0DTE_ORB_PUT", confidence, marketTrend);
                     signal.setReason(String.format(
                             "Opening range breakdown below $%.2f with %.1fx volume%s",
                             orLow, ta.getVolumeRatio(),
@@ -614,52 +635,46 @@ public class ZeroDTEStrategy {
                     log.info("[v63][{}] ✅ ORB PUT signal - Confidence: {}%",
                             analysisId, (int)(confidence * 100));
                 }
-            } else if (!volumeRequirementMet) {
-                log.debug("[{}] Skipping ORB PUT - Volume ratio {:.2f} < required {:.1f}",
-                        analysisId, ta.getVolumeRatio(), MIN_VOLUME_RATIO_BREAKOUT);
             }
         }
     }
 
-    // Updated VWAP Breakout with divergence check
     private void analyzeVWAPBreakout(Option option, TechnicalAnalysis ta,
-                                     List<Signal> signals, String analysisId) {
-        // Check for unusual flow
+                                     List<Signal> signals, String marketTrend, String analysisId) {
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
 
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal vwapUpper = ta.getVwapUpperBand();
         BigDecimal vwapLower = ta.getVwapLowerBand();
 
-        // Check for divergence
         if (ta.isHasRsiDivergence()) {
             log.info("[v63][{}] ⚠️ RSI divergence detected - reducing breakout confidence", analysisId);
         }
 
-        // Breakout above upper band
         if (currentPrice.compareTo(vwapUpper) > 0 && "CALL".equalsIgnoreCase(option.getType())) {
-            // Calculate breakout quality
             BigDecimal breakoutDistance = currentPrice.subtract(vwapUpper)
                     .divide(vwapUpper, 4, RoundingMode.HALF_UP);
 
-            if (breakoutDistance.compareTo(BigDecimal.valueOf(0.002)) >= 0) { // 0.2% minimum
+            if (breakoutDistance.compareTo(BigDecimal.valueOf(0.002)) >= 0) {
                 boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
 
                 if (volumeRequirementMet) {
                     double confidence = calculateBreakoutConfidence(ta, true);
 
-                    // Reduce confidence for divergence
                     if (ta.isHasRsiDivergence()) {
                         confidence *= 0.7;
                     }
 
-                    // Boost confidence for unusual flow
                     if (hasUnusualFlow) {
                         confidence = Math.min(confidence * 1.15, 0.95);
                     }
 
                     if (confidence >= 0.60) {
-                        Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BREAKOUT_CALL", confidence);
+                        Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BREAKOUT_CALL", confidence, marketTrend);
                         signal.setReason(String.format(
                                 "VWAP breakout %.2f%% above upper band with %.1fx volume%s",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -670,14 +685,10 @@ public class ZeroDTEStrategy {
                         log.info("[v63][{}] ✅ VWAP Breakout CALL - Confidence: {}%",
                                 analysisId, (int)(confidence * 100));
                     }
-                } else {
-                    log.debug("[{}] Skipping VWAP Breakout CALL - Volume ratio {:.2f} < required {:.1f}",
-                            analysisId, ta.getVolumeRatio(), MIN_VOLUME_RATIO_BREAKOUT);
                 }
             }
         }
 
-        // Breakout below lower band
         if (currentPrice.compareTo(vwapLower) < 0 && "PUT".equalsIgnoreCase(option.getType())) {
             BigDecimal breakoutDistance = vwapLower.subtract(currentPrice)
                     .divide(vwapLower, 4, RoundingMode.HALF_UP);
@@ -697,7 +708,7 @@ public class ZeroDTEStrategy {
                     }
 
                     if (confidence >= 0.60) {
-                        Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BREAKOUT_PUT", confidence);
+                        Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BREAKOUT_PUT", confidence, marketTrend);
                         signal.setReason(String.format(
                                 "VWAP breakout %.2f%% below lower band with %.1fx volume%s",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -708,26 +719,23 @@ public class ZeroDTEStrategy {
                         log.info("[v63][{}] ✅ VWAP Breakout PUT - Confidence: {}%",
                                 analysisId, (int)(confidence * 100));
                     }
-                } else {
-                    log.debug("[{}] Skipping VWAP Breakout PUT - Volume ratio {:.2f} < required {:.1f}",
-                            analysisId, ta.getVolumeRatio(), MIN_VOLUME_RATIO_BREAKOUT);
                 }
             }
         }
     }
 
-    // Updated VWAP Deviation Reversion (Mean Reversion)
     private void analyzeVWAPDeviationReversion(Option option, TechnicalAnalysis ta,
-                                               List<Signal> signals, String analysisId) {
-        // Add null check for VWAP standard deviation
+                                               List<Signal> signals, String marketTrend, String analysisId) {
         if (!ta.isExtendedFromVwap() || ta.getVwapStandardDeviation() == null ||
                 ta.getVwapStandardDeviation().compareTo(BigDecimal.ZERO) == 0) {
             return;
         }
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
 
-        // Check for unusual flow
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
-
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal vwap = ta.getVwap();
         double priceRatio = ta.getPriceToVwapRatio();
@@ -737,7 +745,6 @@ public class ZeroDTEStrategy {
                 String.format("%.3f", priceRatio),
                 ta.isExtendedFromVwap());
 
-        // PUT opportunity - price extended above VWAP
         if (priceRatio > 1.0 && "PUT".equalsIgnoreCase(option.getType()) && ta.getRsi() > 70) {
             double confidence = calculateReversionConfidence(ta, false);
 
@@ -746,7 +753,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_REVERSION_PUT", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_REVERSION_PUT", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Extended %.2f%% above VWAP with RSI %.1f - mean reversion setup%s",
                         (priceRatio - 1) * 100, ta.getRsi(),
@@ -758,7 +765,6 @@ public class ZeroDTEStrategy {
             }
         }
 
-        // CALL opportunity - price extended below VWAP
         if (priceRatio < 1.0 && "CALL".equalsIgnoreCase(option.getType()) && ta.getRsi() < 30) {
             double confidence = calculateReversionConfidence(ta, true);
 
@@ -767,7 +773,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_REVERSION_CALL", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_REVERSION_CALL", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Extended %.2f%% below VWAP with RSI %.1f - mean reversion setup%s",
                         (1 - priceRatio) * 100, ta.getRsi(),
@@ -780,13 +786,14 @@ public class ZeroDTEStrategy {
         }
     }
 
-    // Updated Volume Spike Momentum
     private void analyzeVolumeSpikeStrategy(Option option, TechnicalAnalysis ta,
-                                            List<Signal> signals, String analysisId) {
-        // Check for unusual flow
+                                            List<Signal> signals, String marketTrend, String analysisId) {
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
 
-        // Relax volume requirement if unusual flow detected
         double requiredVolumeRatio = hasUnusualFlow ? 1.5 : 2.0;
 
         if (ta.getVolumeRatio() < requiredVolumeRatio && !hasUnusualFlow) {
@@ -798,11 +805,10 @@ public class ZeroDTEStrategy {
         log.info("[v63][{}] Volume Spike Analysis - Ratio: {}x, Trend: {}",
                 analysisId,
                 String.format("%.1f", ta.getVolumeRatio()),
-                ta.getTrend());
+                marketTrend);
 
-        // Bullish volume spike
         if ("CALL".equalsIgnoreCase(option.getType()) &&
-                "BULLISH".equals(ta.getTrend()) &&
+                "UP".equals(marketTrend) &&
                 ta.getMomentumStrength() > 0.3) {
 
             double confidence = calculateVolumeSpikeConfidence(ta, true);
@@ -812,7 +818,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VOLUME_SPIKE_CALL", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_VOLUME_SPIKE_CALL", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Volume spike %.1fx with bullish momentum - continuation play%s",
                         ta.getVolumeRatio(),
@@ -824,9 +830,8 @@ public class ZeroDTEStrategy {
             }
         }
 
-        // Bearish volume spike
         if ("PUT".equalsIgnoreCase(option.getType()) &&
-                "BEARISH".equals(ta.getTrend()) &&
+                "DOWN".equals(marketTrend) &&
                 ta.getMomentumStrength() < -0.3) {
 
             double confidence = calculateVolumeSpikeConfidence(ta, false);
@@ -836,7 +841,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VOLUME_SPIKE_PUT", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_VOLUME_SPIKE_PUT", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Volume spike %.1fx with bearish momentum - continuation play%s",
                         ta.getVolumeRatio(),
@@ -849,11 +854,13 @@ public class ZeroDTEStrategy {
         }
     }
 
-    // Updated VWAP Support/Resistance
     private void analyzeVWAPSupportResistance(Option option, TechnicalAnalysis ta,
-                                              List<Signal> signals, String analysisId) {
-        // Check for unusual flow
+                                              List<Signal> signals, String marketTrend, String analysisId) {
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
 
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal vwap = ta.getVwap();
@@ -861,7 +868,6 @@ public class ZeroDTEStrategy {
         if (ta.isVwapAsSupport() && "CALL".equalsIgnoreCase(option.getType()) &&
                 currentPrice.compareTo(vwap) > 0) {
 
-            // Relax volume requirement for support/resistance
             boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD;
 
             if (volumeRequirementMet) {
@@ -872,7 +878,7 @@ public class ZeroDTEStrategy {
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_SUPPORT_CALL", confidence);
+                    Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_SUPPORT_CALL", confidence, marketTrend);
                     signal.setReason(String.format(
                             "VWAP support at $%.2f held with %d touches%s",
                             vwap, 3,
@@ -882,9 +888,6 @@ public class ZeroDTEStrategy {
                     log.info("[v63][{}] ✅ VWAP Support CALL - Confidence: {}%",
                             analysisId, (int)(confidence * 100));
                 }
-            } else {
-                log.debug("[{}] Skipping VWAP Support - Volume ratio {:.2f} < required {:.1f}",
-                        analysisId, ta.getVolumeRatio(), MIN_VOLUME_RATIO_STANDARD);
             }
         }
 
@@ -901,7 +904,7 @@ public class ZeroDTEStrategy {
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_RESISTANCE_PUT", confidence);
+                    Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_RESISTANCE_PUT", confidence, marketTrend);
                     signal.setReason(String.format(
                             "VWAP resistance at $%.2f rejected with %d touches%s",
                             vwap, 3,
@@ -911,26 +914,24 @@ public class ZeroDTEStrategy {
                     log.info("[v63][{}] ✅ VWAP Resistance PUT - Confidence: {}%",
                             analysisId, (int)(confidence * 100));
                 }
-            } else {
-                log.debug("[{}] Skipping VWAP Resistance - Volume ratio {:.2f} < required {:.1f}",
-                        analysisId, ta.getVolumeRatio(), MIN_VOLUME_RATIO_STANDARD);
             }
         }
     }
 
     private void analyzeVWAPBounce(Option option, TechnicalAnalysis ta,
-                                   List<Signal> signals, String analysisId) {
-        // Check for unusual flow
+                                   List<Signal> signals, String marketTrend, String analysisId) {
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
-
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal vwap = ta.getVwap();
 
         if (Math.abs(ta.getPriceToVwapRatio() - 1.0) > 0.005) {
-            return; // Not close enough to VWAP
+            return;
         }
 
-        // Relax volume requirement for bounces if unusual flow detected
         boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD;
 
         if (!volumeRequirementMet) {
@@ -947,7 +948,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.60) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BOUNCE_CALL", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BOUNCE_CALL", confidence, marketTrend);
                 signal.setReason(String.format("VWAP bounce with neutral RSI and volume confirmation%s",
                         hasUnusualFlow ? " (Unusual Flow)" : ""));
                 signals.add(signal);
@@ -965,7 +966,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.60) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BOUNCE_PUT", confidence);
+                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BOUNCE_PUT", confidence, marketTrend);
                 signal.setReason(String.format("VWAP rejection with neutral RSI and volume confirmation%s",
                         hasUnusualFlow ? " (Unusual Flow)" : ""));
                 signals.add(signal);
@@ -976,156 +977,113 @@ public class ZeroDTEStrategy {
         }
     }
 
-    // Apply time decay to all signals
-    private List<Signal> applyTimeDecayAndSort(List<Signal> signals, String analysisId) {
-        LocalTime now = LocalTime.now(ET_ZONE);
-        double timeDecayFactor = calculateGlobalTimeDecay(now);
-
-        log.info("[v63][{}] Applying time decay factor: {}",
-                analysisId,
-                String.format("%.2f", timeDecayFactor));
-
-        return signals.stream()
-                .map(signal -> {
-                    double adjustedConfidence = signal.getConfidence() * timeDecayFactor;
-                    signal.setConfidence(adjustedConfidence);
-                    return signal;
-                })
-                .filter(signal -> signal.getConfidence() >= 0.50)
-                .sorted(Comparator.comparing(Signal::getConfidence).reversed())
-                .collect(Collectors.toList());
-    }
-
-    private double calculateGlobalTimeDecay(LocalTime now) {
-        if (now.isBefore(LocalTime.of(11, 0))) {
-            return 1.0; // Full confidence before 11 AM
-        } else if (now.isBefore(LocalTime.of(13, 0))) {
-            return 0.9; // 90% between 11 AM - 1 PM
-        } else if (now.isBefore(LocalTime.of(14, 0))) {
-            return 0.8; // 80% between 1 PM - 2 PM
-        } else if (now.isBefore(LocalTime.of(15, 0))) {
-            return 0.7; // 70% between 2 PM - 3 PM
-        } else {
-            return 0.5; // 50% after 3 PM
-        }
-    }
-
-    private List<Signal> selectTopSignals(List<Signal> signals, TechnicalAnalysis ta,
-                                          String analysisId) {
-        List<Signal> selected = new ArrayList<>();
-
-        // First priority: Signals with unusual flow
-        signals.stream()
-                .filter(s -> s.getReason() != null && s.getReason().contains("flow"))
-                .sorted(Comparator.comparing(Signal::getConfidence).reversed())
-                .limit(2)
-                .forEach(selected::add);
-
-        // Second priority: Opening drive signals
-        if (selected.size() < 3) {
-            signals.stream()
-                    .filter(s -> s.getStrategy().contains("OPENING_DRIVE"))
-                    .filter(s -> !selected.contains(s))
-                    .findFirst()
-                    .ifPresent(selected::add);
-        }
-
-        // Third priority: Time window aligned signals
-        LocalTime now = LocalTime.now(ET_ZONE);
-        if (getTimeWindowMultiplier(now) > 1.0 && selected.size() < 3) {
-            signals.stream()
-                    .filter(s -> !selected.contains(s))
-                    .filter(s -> s.getConfidence() > 0.70)
-                    .sorted(Comparator.comparing(Signal::getConfidence).reversed())
-                    .limit(3 - selected.size())
-                    .forEach(selected::add);
-        }
-
-        // Fill remaining with highest confidence
-        if (selected.size() < 3) {
-            signals.stream()
-                    .filter(s -> !selected.contains(s))
-                    .sorted(Comparator.comparing(Signal::getConfidence).reversed())
-                    .limit(3 - selected.size())
-                    .forEach(selected::add);
-        }
-
-        return selected;
-    }
-
-    private List<String> getPriorityStrategies(MarketRegime regime) {
-        switch (regime) {
-            case TRENDING_UP:
-            case TRENDING_DOWN:
-                return List.of("BREAKOUT", "ORB", "SPIKE");
-            case CHOPPY:
-                return List.of("REVERSION", "BOUNCE", "SUPPORT");
-            case HIGH_VOLATILITY:
-                return List.of("REVERSION", "SPIKE", "BREAKOUT");
-            case LOW_VOLATILITY:
-                return List.of("BREAKOUT", "ORB", "SUPPORT");
-            default:
-                return List.of("BREAKOUT", "REVERSION", "SPIKE");
-        }
-    }
-
-    private void saveSignals(List<Signal> signals, TechnicalAnalysis ta, String analysisId) {
-        LocalDateTime expirationTime = LocalDateTime.now().plusMinutes(signalExpirationMinutes);
-
+    private void saveSignals(List<Signal> signals, TechnicalAnalysis ta, String marketTrend, String analysisId) {
         for (Signal signal : signals) {
+            // Dynamic expiration based on strategy and market conditions
+            int expirationMinutes = calculateDynamicExpiration(signal, ta);
+            LocalDateTime expirationTime = LocalDateTime.now().plusMinutes(expirationMinutes);
+
             signal.setExpirationTime(expirationTime);
             signal.setStatus("PENDING");
+            signal.setCreatedAt(LocalDateTime.now()); // Track exact creation time
             signal.setEntryAssumptionPrice(ta.getCurrentPrice());
+            signal.setMarketTrend(marketTrend);
 
-            // Set appropriate exit times based on strategy
-            if (signal.getStrategy().contains("SCALP")) {
-                // Don't override expiration for scalps, they need immediate execution
-                signal.setExpirationTime(LocalDateTime.now().plusMinutes(10)); // Give more time
-            }
+            // Store current option price for validation
+            signal.setOriginalOptionPrice(signal.getEntryPrice());
 
             signalRepository.save(signal);
 
-            log.info("[v63][{}] SAVED {} - {} {}, Confidence: {}%, Target: ${}, Stop: ${}",
+            log.info("[v63][{}] SAVED {} - {} {}, Confidence: {}%, Expires in {} min at {}",
                     analysisId, signal.getStrategy(), signal.getSignalType(),
                     signal.getOptionSymbol(), (int)(signal.getConfidence() * 100),
-                    signal.getTargetPrice(), signal.getStopLoss());
+                    expirationMinutes, expirationTime.toLocalTime());
+
+            // Alert for high-priority signals
+            if (signal.getConfidence() >= 0.85 || signal.getStrategy().contains("UNUSUAL_FLOW")) {
+                telegramService.sendMessage(String.format(
+                        "🚨 HIGH PRIORITY SIGNAL\n" +
+                                "Strategy: %s\n" +
+                                "Option: %s\n" +
+                                "Confidence: %d%%\n" +
+                                "Entry: $%.2f\n" +
+                                "Expires: %d minutes",
+                        signal.getStrategy(),
+                        signal.getOptionSymbol(),
+                        (int)(signal.getConfidence() * 100),
+                        signal.getEntryPrice(),
+                        expirationMinutes
+                ));
+            }
         }
     }
 
-    // Updated confidence calculations
+    private int calculateDynamicExpiration(Signal signal, TechnicalAnalysis ta) {
+        String strategy = signal.getStrategy();
+        LocalTime now = LocalTime.now(ET_ZONE);
+
+        // Unusual flow - very short expiration
+        if (strategy.contains("UNUSUAL_FLOW")) {
+            return 2; // 2 minutes - execute ASAP
+        }
+        // Near market close - VERY short window
+        if (now.isAfter(LocalTime.of(15, 30))) {
+            return 1; // 1 minute only!
+        }
+
+        // High confidence signals - quick execution
+        if (signal.getConfidence() >= 0.85) {
+            return 3; // 3 minutes for high confidence
+        }
+
+        // Scalp trades - medium expiration
+        if (strategy.contains("SCALP") || strategy.contains("BOUNCE")) {
+            return 4; // 4 minutes
+        }
+
+        // Breakout trades - slightly longer
+        if (strategy.contains("BREAKOUT") || strategy.contains("OPENING_DRIVE")) {
+            return 5; // 5 minutes
+        }
+
+
+        // High volatility - faster execution needed
+        if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
+            return 3; // 3 minutes
+        }
+
+        // Default - still quick
+        return 4; // 4 minutes default
+    }
+
 
     private double calculateBreakoutConfidence(TechnicalAnalysis ta, boolean bullish) {
         double confidence = 0.5;
 
-        // Volume confirmation (relaxed)
         if (ta.getVolumeRatio() >= 2.0) {
             confidence += 0.30;
         } else if (ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT) {
             confidence += 0.20;
         } else if (ta.getVolumeRatio() >= 1.0) {
-            confidence += 0.10; // Still give some credit for average volume
+            confidence += 0.10;
         }
 
-        // Momentum alignment
         if (bullish && ta.getRsi() > 55 && ta.getRsi() < 70) {
             confidence += 0.15;
         } else if (!bullish && ta.getRsi() < 45 && ta.getRsi() > 30) {
             confidence += 0.15;
         }
 
-        // Trend alignment
         if ((bullish && "BULLISH".equals(ta.getVwapTrend())) ||
                 (!bullish && "BEARISH".equals(ta.getVwapTrend()))) {
             confidence += 0.10;
         }
 
-        // Market regime bonus
         if (ta.getMarketRegime() == MarketRegime.TRENDING_UP && bullish ||
                 ta.getMarketRegime() == MarketRegime.TRENDING_DOWN && !bullish) {
             confidence += 0.10;
         }
 
-        // Apply time window multiplier
         LocalTime now = LocalTime.now(ET_ZONE);
         double timeMultiplier = getTimeWindowMultiplier(now);
         confidence *= timeMultiplier;
@@ -1133,23 +1091,19 @@ public class ZeroDTEStrategy {
         return Math.min(confidence, 0.95);
     }
 
-
     private double calculateORBConfidence(TechnicalAnalysis ta, boolean bullish) {
-        double confidence = 0.6; // Good base for ORB
+        double confidence = 0.6;
 
-        // Volume confirmation (relaxed)
         if (ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT) {
             confidence += 0.20;
         } else if (ta.getVolumeRatio() >= 1.0) {
             confidence += 0.10;
         }
 
-        // No divergence
         if (!ta.isHasRsiDivergence()) {
             confidence += 0.10;
         }
 
-        // Trend continuation
         if (ta.getStrength() > 0.5) {
             confidence += 0.10;
         }
@@ -1160,17 +1114,14 @@ public class ZeroDTEStrategy {
     private double calculateReversionConfidence(TechnicalAnalysis ta, boolean bullish) {
         double confidence = 0.6;
 
-        // Extreme RSI
         if ((bullish && ta.getRsi() < 25) || (!bullish && ta.getRsi() > 75)) {
             confidence += 0.20;
         }
 
-        // Extended from VWAP
         if (ta.isExtendedFromVwap()) {
             confidence += 0.15;
         }
 
-        // High volatility favors reversion
         if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
             confidence += 0.10;
         }
@@ -1181,21 +1132,18 @@ public class ZeroDTEStrategy {
     private double calculateVolumeSpikeConfidence(TechnicalAnalysis ta, boolean bullish) {
         double confidence = 0.5;
 
-        // Volume surge level (relaxed thresholds)
         if (ta.getVolumeRatio() > 3.0) {
             confidence += 0.30;
         } else if (ta.getVolumeRatio() > 2.0) {
             confidence += 0.20;
         } else if (ta.getVolumeRatio() > 1.5) {
-            confidence += 0.10; // New tier for moderate volume
+            confidence += 0.10;
         }
 
-        // Momentum confirmation
         if (Math.abs(ta.getMomentumStrength()) > 0.5) {
             confidence += 0.20;
         }
 
-        // Fresh move (not extended)
         if (!ta.isExtendedFromVwap()) {
             confidence += 0.10;
         }
@@ -1206,20 +1154,17 @@ public class ZeroDTEStrategy {
     private double calculateSupportResistanceConfidence(TechnicalAnalysis ta, boolean support) {
         double confidence = 0.6;
 
-        // Volume at level (relaxed)
         if (ta.getVolumeRatio() > 1.2) {
             confidence += 0.20;
         } else if (ta.getVolumeRatio() > 0.8) {
             confidence += 0.10;
         }
 
-        // RSI confirmation
         if ((support && ta.getRsi() > 40 && ta.getRsi() < 60) ||
                 (!support && ta.getRsi() > 40 && ta.getRsi() < 60)) {
             confidence += 0.15;
         }
 
-        // Multiple touches (assumed from ta.isVwapAsSupport/Resistance)
         confidence += 0.10;
 
         return Math.min(confidence, 0.95);
@@ -1228,7 +1173,6 @@ public class ZeroDTEStrategy {
     private double calculateBounceConfidence(TechnicalAnalysis ta, boolean bullish) {
         double confidence = 0.5;
 
-        // Volume surge at VWAP (relaxed)
         if (ta.getVolumeRatio() > 1.3) {
             confidence += 0.25;
         } else if (ta.getVolumeRatio() > 1.0) {
@@ -1237,12 +1181,10 @@ public class ZeroDTEStrategy {
             confidence += 0.10;
         }
 
-        // Neutral RSI (best for bounces)
         if (ta.getRsi() > 45 && ta.getRsi() < 55) {
             confidence += 0.20;
         }
 
-        // Not in strong trend
         if (ta.getStrength() < 0.5) {
             confidence += 0.10;
         }
@@ -1250,14 +1192,19 @@ public class ZeroDTEStrategy {
         return Math.min(confidence, 0.85);
     }
 
+    // UPDATED createSignal METHOD WITH MARKET TREND
     private Signal createSignal(Option option, TechnicalAnalysis ta, String signalType,
-                                String strategy, double confidence) {
+                                String strategy, double confidence, String marketTrend) {
         if (option == null || ta == null || signalType == null || strategy == null) {
             log.error("Cannot create signal with null parameters");
             return null;
         }
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, "signal-creation")) {
+            log.info("[BLOCKED] {} {} not aligned with {} trend",
+                    option.getType(), option.getStrikePrice(), marketTrend);
+            return null;
+        }
 
-        // Validate confidence range
         confidence = Math.max(0.0, Math.min(1.0, confidence));
 
         try {
@@ -1270,12 +1217,12 @@ public class ZeroDTEStrategy {
             signal.setTimestamp(LocalDateTime.now());
             signal.setExecuted(false);
             signal.setEntryAssumptionPrice(ta.getCurrentPrice());
-            signal.setMarketRegime(ta.getMarketRegime()); // Add market regime
+            signal.setMarketRegime(ta.getMarketRegime());
+            signal.setMarketTrend(marketTrend); // Store market trend
 
-            // Rest of method with better null safety...
             BigDecimal atr = ta.getAverageTrueRange();
             if (atr == null || atr.compareTo(BigDecimal.ZERO) <= 0) {
-                atr = ta.getCurrentPrice().multiply(BigDecimal.valueOf(0.005)); // 0.5% fallback
+                atr = ta.getCurrentPrice().multiply(BigDecimal.valueOf(0.005));
             }
 
             BigDecimal optionPrice = option.getMidPrice();
@@ -1286,9 +1233,9 @@ public class ZeroDTEStrategy {
 
             signal.setEntryPrice(optionPrice);
 
-            // Calculate targets with validation
-            BigDecimal targetPrice = calculateTargetPrice(optionPrice, atr, strategy, ta);
-            BigDecimal stopLoss = calculateStopLoss(optionPrice, atr, strategy, ta);
+            // DYNAMIC TARGET AND STOP CALCULATION
+            BigDecimal targetPrice = calculateDynamicTargetPrice(optionPrice, atr, strategy, ta, marketTrend, option);
+            BigDecimal stopLoss = calculateDynamicStopLoss(optionPrice, atr, strategy, ta, marketTrend, option);
 
             signal.setTargetPrice(targetPrice);
             signal.setStopLoss(stopLoss);
@@ -1301,51 +1248,174 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private BigDecimal calculateTargetPrice(BigDecimal optionPrice, BigDecimal atr,
-                                            String strategy, TechnicalAnalysis ta) {
-        // Implementation with null safety and validation
-        BigDecimal baseMultiplier = BigDecimal.valueOf(0.5);
-
-        if (strategy.contains("BREAKOUT")) {
-            baseMultiplier = BigDecimal.valueOf(0.7);
-        } else if (strategy.contains("REVERSION")) {
-            baseMultiplier = BigDecimal.valueOf(0.4);
-        } else if (strategy.contains("SPIKE")) {
-            baseMultiplier = BigDecimal.valueOf(0.3);
+    // NEW DYNAMIC STOP LOSS CALCULATION
+    private BigDecimal calculateDynamicStopLoss(BigDecimal entryPrice, BigDecimal atr, String strategy,
+                                                TechnicalAnalysis ta, String marketTrend, Option option) {
+        if (entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0) {
+            return BigDecimal.ZERO;
         }
 
-        BigDecimal targetMove = atr.multiply(baseMultiplier);
-        return optionPrice.add(targetMove);
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+        boolean isAligned = (isPut && "DOWN".equals(marketTrend)) || (!isPut && "UP".equals(marketTrend));
+
+        // Base stop loss percentages
+        BigDecimal baseStopPercentage;
+
+        if (isAligned) {
+            // WIDER stops for trend-aligned positions
+            switch (strategy) {
+                case "0DTE_UNUSUAL_FLOW_CALL":
+                case "0DTE_UNUSUAL_FLOW_PUT":
+                    baseStopPercentage = BigDecimal.valueOf(0.40); // 40% stop for high conviction
+                    break;
+                case "0DTE_OPENING_DRIVE_CALL":
+                case "0DTE_OPENING_DRIVE_PUT":
+                    baseStopPercentage = BigDecimal.valueOf(0.45); // 45% for opening drive
+                    break;
+                case "0DTE_VWAP_BREAKOUT_CALL":
+                case "0DTE_VWAP_BREAKOUT_PUT":
+                    baseStopPercentage = BigDecimal.valueOf(0.35); // 35% for breakouts
+                    break;
+                case "0DTE_VWAP_REVERSION_CALL":
+                case "0DTE_VWAP_REVERSION_PUT":
+                    baseStopPercentage = BigDecimal.valueOf(0.50); // 50% for reversions (need room)
+                    break;
+                default:
+                    baseStopPercentage = BigDecimal.valueOf(0.40); // 40% default
+            }
+        } else {
+            // TIGHTER stops for counter-trend positions
+            baseStopPercentage = BigDecimal.valueOf(0.25); // 25% tight stop
+        }
+
+        // Adjust for volatility
+        if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
+            baseStopPercentage = baseStopPercentage.multiply(BigDecimal.valueOf(1.2)); // 20% wider in high vol
+        }
+
+        // Adjust for time of day
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isAfter(LocalTime.of(14, 30))) {
+            baseStopPercentage = baseStopPercentage.multiply(BigDecimal.valueOf(0.8)); // Tighter near close
+        }
+
+        BigDecimal stopLoss = entryPrice.multiply(BigDecimal.ONE.subtract(baseStopPercentage));
+
+        // Minimum stop of $0.05
+        if (stopLoss.compareTo(BigDecimal.valueOf(0.05)) < 0) {
+            stopLoss = BigDecimal.valueOf(0.05);
+        }
+
+        log.info("[STOP] {} position {} trend - Stop: {}% (${} -> ${})",
+                option.getType(),
+                isAligned ? "WITH" : "AGAINST",
+                baseStopPercentage.multiply(BigDecimal.valueOf(100)),
+                entryPrice, stopLoss);
+
+        return stopLoss.setScale(2, RoundingMode.HALF_UP);
     }
 
-    private BigDecimal calculateStopLoss(BigDecimal optionPrice, BigDecimal atr,
-                                         String strategy, TechnicalAnalysis ta) {
-        BigDecimal stopMultiplier = BigDecimal.valueOf(0.3);
-        BigDecimal stopMove = atr.multiply(stopMultiplier);
-        return optionPrice.subtract(stopMove).max(BigDecimal.valueOf(0.01));
+    // NEW DYNAMIC TARGET CALCULATION
+    private BigDecimal calculateDynamicTargetPrice(BigDecimal entryPrice, BigDecimal atr, String strategy,
+                                                   TechnicalAnalysis ta, String marketTrend, Option option) {
+        if (entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0) {
+            return BigDecimal.ZERO;
+        }
+
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+        boolean isAligned = (isPut && "DOWN".equals(marketTrend)) || (!isPut && "UP".equals(marketTrend));
+
+        // Base target multipliers
+        BigDecimal targetMultiplier;
+
+        if (isAligned) {
+            // BIGGER targets for trend-aligned positions
+            switch (strategy) {
+                case "0DTE_UNUSUAL_FLOW_CALL":
+                case "0DTE_UNUSUAL_FLOW_PUT":
+                    targetMultiplier = BigDecimal.valueOf(2.5); // 150% gain for unusual flow
+                    break;
+                case "0DTE_OPENING_DRIVE_CALL":
+                case "0DTE_OPENING_DRIVE_PUT":
+                    targetMultiplier = BigDecimal.valueOf(2.2); // 120% gain for opening drive
+                    break;
+                case "0DTE_VWAP_BREAKOUT_CALL":
+                case "0DTE_VWAP_BREAKOUT_PUT":
+                    targetMultiplier = BigDecimal.valueOf(2.0); // 100% gain for breakouts
+                    break;
+                case "0DTE_VOLUME_SPIKE_CALL":
+                case "0DTE_VOLUME_SPIKE_PUT":
+                    targetMultiplier = BigDecimal.valueOf(2.0); // 100% for volume spikes
+                    break;
+                case "0DTE_VWAP_REVERSION_CALL":
+                case "0DTE_VWAP_REVERSION_PUT":
+                    targetMultiplier = BigDecimal.valueOf(1.7); // 70% for reversions
+                    break;
+                default:
+                    targetMultiplier = BigDecimal.valueOf(1.8); // 80% default
+            }
+
+            // Extra boost for strong trends
+            if ("UP".equals(marketTrend) && ta.getMomentumStrength() > 0.7) {
+                targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(1.2));
+            } else if ("DOWN".equals(marketTrend) && ta.getMomentumStrength() < -0.7) {
+                targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(1.2));
+            }
+        } else {
+            // SMALLER targets for counter-trend positions
+            targetMultiplier = BigDecimal.valueOf(1.4); // 40% gain max
+        }
+
+        // Adjust for time decay
+        LocalTime now = LocalTime.now(ET_ZONE);
+        long minutesToClose = Duration.between(now, LocalTime.of(16, 0)).toMinutes();
+
+        if (minutesToClose < 120) { // Less than 2 hours
+            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(0.7)); // Reduce by 30%
+        } else if (minutesToClose < 180) { // Less than 3 hours
+            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(0.85)); // Reduce by 15%
+        }
+
+        // Adjust for volatility
+        if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
+            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(1.15)); // 15% higher in vol
+        }
+
+        BigDecimal targetPrice = entryPrice.multiply(targetMultiplier);
+
+        log.info("[TARGET] {} position {} trend - Target: {}% (${} -> ${})",
+                option.getType(),
+                isAligned ? "WITH" : "AGAINST",
+                targetMultiplier.subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)),
+                entryPrice, targetPrice);
+
+        return targetPrice.setScale(2, RoundingMode.HALF_UP);
     }
 
     private void analyzeUnusualFlow(Option option, TechnicalAnalysis ta,
-                                    List<Signal> signals, String analysisId) {
+                                    List<Signal> signals, String marketTrend, String analysisId) {
         if (!detectUnusualOptionsFlow(option, analysisId)) {
             return;
         }
+        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+            return;
+        }
 
-        // Create signal for unusual flow
-        double confidence = 0.85; // High base confidence for unusual flow
+        double confidence = 0.85;
 
-        // Boost for extreme volume
         BigDecimal premium = option.getMidPrice()
                 .multiply(BigDecimal.valueOf(option.getVolume()))
                 .multiply(BigDecimal.valueOf(100));
 
-        if (premium.compareTo(BigDecimal.valueOf(100000)) > 0) { // $100k+
+        if (premium.compareTo(BigDecimal.valueOf(100000)) > 0) {
             confidence = 0.90;
         }
 
+        String strategyName = "PUT".equalsIgnoreCase(option.getType()) ?
+                "0DTE_UNUSUAL_FLOW_PUT" : "0DTE_UNUSUAL_FLOW_CALL";
 
-        Signal signal = createSignal(option, ta, "BUY", "UNUSUAL_FLOW", confidence);
-        signal.setSignalType(option.getType());  // Direction in signalType
+        Signal signal = createSignal(option, ta, "BUY", strategyName, confidence, marketTrend);
         signal.setReason(String.format(
                 "🎯 Unusual flow detected - %s %s Vol: %d Premium: $%.0f (%.1fx OI)",
                 option.getType(), option.getStrikePrice(),
@@ -1355,6 +1425,86 @@ public class ZeroDTEStrategy {
 
         signals.add(signal);
         log.info("[v63][{}] ✅ Created {} signal - Confidence: {}%",
-                analysisId, "UNUSUAL_FLOW", (int)(confidence * 100));
+                analysisId, strategyName, (int)(confidence * 100));
+    }
+
+    // UPDATED TREND ALIGNMENT CHECK
+    private boolean isSignalAlignedWithTrend(Option option, TechnicalAnalysis ta,
+                                             String marketTrend, String analysisId) {
+        log.info("[{}] Market trend: {}, TA trend: {}, Price: ${}, VWAP: ${}",
+                analysisId, marketTrend, ta.getTrend(), ta.getCurrentPrice(), ta.getVwap());
+
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+
+        // STRICT RULE 1: Block ALL signals in NEUTRAL trend - NO EXCEPTIONS
+        if ("NEUTRAL".equals(marketTrend)) {
+            log.warn("[{}] ❌ BLOCKED: {} {} - Market is NEUTRAL (NO TRADES ALLOWED)",
+                    analysisId, option.getType(), option.getStrikePrice());
+            return false;
+        }
+
+        // STRICT RULE 2: Enforce trend alignment for ALL signals including unusual flow
+        boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
+
+        if (detectUnusualOptionsFlow(option, analysisId)) {
+            BigDecimal premium = option.getMidPrice()
+                    .multiply(BigDecimal.valueOf(option.getVolume()))
+                    .multiply(BigDecimal.valueOf(100));
+
+            if (!aligned) {
+                log.warn("[{}] ⚠️ UNUSUAL FLOW BLOCKED: {} {} with ${} premium - AGAINST {} trend",
+                        analysisId, option.getType(), option.getStrikePrice(), premium, marketTrend);
+
+                // Alert for massive blocked flows
+                if (premium.compareTo(BigDecimal.valueOf(1000000)) > 0) {
+                    telegramService.sendMessage(String.format(
+                            "🚫 MASSIVE FLOW BLOCKED\n" +
+                                    "Type: %s %s\n" +
+                                    "Premium: $%,.0f\n" +
+                                    "Reason: Against %s trend - STAYING DISCIPLINED!",
+                            option.getType(), option.getStrikePrice(),
+                            premium.doubleValue(), marketTrend
+                    ));
+                }
+                return false;
+            }
+        }
+
+        log.info(" Trend alignment check - {} option, {} trend: {}",
+                analysisId, option.getType(), marketTrend, aligned ? "PASS" : "FAIL");
+
+        return aligned;
+    }
+
+    private boolean quickSignalValidation(Option option, TechnicalAnalysis ta,
+                                          String marketTrend, String analysisId) {
+        // Ultra-fast pre-checks before creating signal
+
+        // 1. Neutral market - instant reject
+        if ("NEUTRAL".equals(marketTrend)) {
+            return false;
+        }
+
+        // 2. Option type alignment
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+        boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
+
+        if (!aligned && !detectUnusualOptionsFlow(option, analysisId)) {
+            return false; // Not aligned and not unusual flow
+        }
+
+        // 3. Minimum liquidity check
+        if (option.getVolume() < 50 && option.getOpenInterest() < 100) {
+            return false; // Too illiquid
+        }
+
+        // 4. Spread check
+        if (option.getSpreadPercentage() > 15.0) {
+            return false; // Spread too wide
+        }
+
+        return true;
     }
 }
