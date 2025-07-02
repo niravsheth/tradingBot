@@ -1,7 +1,5 @@
 package com.tradingBot.service;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingBot.entity.*;
 import com.tradingBot.model.*;
 import com.tradingBot.repository.*;
@@ -20,7 +18,6 @@ import java.time.LocalTime;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service

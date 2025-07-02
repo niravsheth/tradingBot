@@ -69,4 +69,23 @@ public class Signal {
     private BigDecimal originalOptionPrice;
     private String executionNotes;
 
+    @Column(name = "priority")
+    private Integer priority;
+
+    @Column(name = "generated_by")
+    private String generatedBy;
+
+    @Column(name = "notes")
+    private String notes;
+
+    // Add getters and setters
+    public Integer getPriority() { return priority; }
+    public void setPriority(Integer priority) { this.priority = priority; }
+
+    public String getGeneratedBy() { return generatedBy; }
+    public void setGeneratedBy(String generatedBy) { this.generatedBy = generatedBy; }
+
+    public String getNotes() { return notes; }
+    public void setNotes(String notes) { this.notes = notes; }
+
 }

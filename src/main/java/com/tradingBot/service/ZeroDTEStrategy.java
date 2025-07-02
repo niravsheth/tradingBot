@@ -2,7 +2,6 @@ package com.tradingBot.service;
 
 import com.tradingBot.entity.*;
 import com.tradingBot.model.*;
-import com.tradingBot.service.*;
 import com.tradingBot.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

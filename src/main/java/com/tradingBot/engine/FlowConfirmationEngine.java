@@ -14,17 +14,13 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 
-/**
- * Flow Confirmation Engine
- * Monitors unusual flow alerts and confirms them before generating signals
- */
 @Component
 @Slf4j
 @RequiredArgsConstructor
@@ -38,28 +34,28 @@ public class FlowConfirmationEngine {
 
     private final AtomicBoolean isRunning = new AtomicBoolean(false);
     private final Map<String, FlowTracker> activeFlows = new ConcurrentHashMap<>();
+    private final Map<String, List<FlowEvent>> flowHistory = new ConcurrentHashMap<>();
 
     private ExecutorService executorService;
 
-    // Confirmation parameters
-    private static final int SWEEP_WINDOW_MINUTES = 15;
-    private static final int BLOCK_WINDOW_MINUTES = 30;
-    private static final int STANDARD_WINDOW_MINUTES = 20;
+    // STRICTER confirmation parameters
+    private static final int MIN_FLOW_EVENTS = 3;  // Need at least 3 flow events
+    private static final int FLOW_WINDOW_MINUTES = 5;  // Within 5 minutes
+    private static final BigDecimal MIN_TOTAL_VOLUME = new BigDecimal("5000");  // Min 5000 contracts total
+    private static final double MIN_FLOW_RATIO = 0.70;  // 70% of flow must be in same direction
 
-    private static final double SWEEP_REQUIRED_MOVE = 0.3;
-    private static final double BLOCK_REQUIRED_MOVE = 0.5;
-    private static final double STANDARD_REQUIRED_MOVE = 0.4;
+    // Price movement requirements
+    private static final double MIN_UNDERLYING_MOVE = 0.15;  // 0.15% move in underlying
+    private static final double MIN_OPTION_MOVE = 5.0;  // 5% move in option price
+    private static final int PRICE_CONFIRMATION_MINUTES = 3;  // Wait 3 minutes for price confirmation
 
-    /**
-     * Start flow confirmation engine
-     */
     public void start() {
         if (isRunning.get()) {
             log.warn("Flow Confirmation Engine is already running");
             return;
         }
 
-        log.info("Starting Flow Confirmation Engine...");
+        log.info("Starting Flow Confirmation Engine with STRICT confirmation rules...");
         isRunning.set(true);
 
         executorService = Executors.newFixedThreadPool(2, r -> {
@@ -68,15 +64,10 @@ public class FlowConfirmationEngine {
             return t;
         });
 
-        // Load any pending flows from database
         loadPendingFlows();
-
         log.info("Flow Confirmation Engine started");
     }
 
-    /**
-     * Stop flow confirmation engine
-     */
     public void stop() {
         log.info("Stopping Flow Confirmation Engine...");
         isRunning.set(false);
@@ -86,99 +77,148 @@ public class FlowConfirmationEngine {
         }
 
         activeFlows.clear();
+        flowHistory.clear();
         log.info("Flow Confirmation Engine stopped");
     }
 
     /**
-     * Load pending flows from database
+     * Record new flow event (called by your flow detection logic)
      */
-    private void loadPendingFlows() {
-        try {
-            List<PendingFlow> pendingFlows = pendingFlowRepository.findByStatus("PENDING");
-            log.info("Loading {} pending flows from database", pendingFlows.size());
+    public void recordFlowEvent(String symbol, String optionSymbol,
+                                BigDecimal volume, String type,
+                                BigDecimal optionPrice, BigDecimal underlyingPrice,
+                                boolean isCall) {
 
-            for (PendingFlow flow : pendingFlows) {
-                FlowTracker tracker = new FlowTracker();
-                tracker.pendingFlow = flow;
-                tracker.detectedAt = flow.getDetectedAt();
-                tracker.expiresAt = flow.getDetectedAt().plusMinutes(flow.getConfirmationWindow());
-                activeFlows.put(flow.getOptionSymbol(), tracker);
-            }
+        log.info("[FLOW-EVENT] {} - {} contracts @ ${} ({})",
+                optionSymbol, volume, optionPrice, type);
 
-        } catch (Exception e) {
-            log.error("Error loading pending flows: {}", e.getMessage());
+        // Create flow event
+        FlowEvent event = new FlowEvent();
+        event.timestamp = LocalDateTime.now();
+        event.volume = volume;
+        event.type = type;
+        event.optionPrice = optionPrice;
+        event.underlyingPrice = underlyingPrice;
+        event.isCall = isCall;
+
+        // Add to history
+        flowHistory.computeIfAbsent(optionSymbol, k -> new ArrayList<>()).add(event);
+
+        // Clean old events
+        cleanOldFlowEvents(optionSymbol);
+
+        // Check if we should start tracking this option
+        checkForFlowPattern(symbol, optionSymbol);
+    }
+
+    /**
+     * Check if flow pattern warrants tracking
+     */
+    private void checkForFlowPattern(String symbol, String optionSymbol) {
+        List<FlowEvent> events = flowHistory.getOrDefault(optionSymbol, new ArrayList<>());
+
+        // Remove old events
+        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(FLOW_WINDOW_MINUTES);
+        events = events.stream()
+                .filter(e -> e.timestamp.isAfter(cutoff))
+                .collect(Collectors.toList());
+
+        if (events.size() < MIN_FLOW_EVENTS) {
+            log.debug("[FLOW-PATTERN] {} - Only {} events, need {}",
+                    optionSymbol, events.size(), MIN_FLOW_EVENTS);
+            return;
+        }
+
+        // Calculate total volume
+        BigDecimal totalVolume = events.stream()
+                .map(e -> e.volume)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        if (totalVolume.compareTo(MIN_TOTAL_VOLUME) < 0) {
+            log.debug("[FLOW-PATTERN] {} - Volume {} < minimum {}",
+                    optionSymbol, totalVolume, MIN_TOTAL_VOLUME);
+            return;
+        }
+
+        // Check flow consistency (are they mostly buys or mostly sells?)
+        long buyCount = events.stream()
+                .filter(e -> "BUY".equals(e.type) || "SWEEP".equals(e.type))
+                .count();
+        double buyRatio = (double) buyCount / events.size();
+
+        if (buyRatio < MIN_FLOW_RATIO && buyRatio > (1 - MIN_FLOW_RATIO)) {
+            log.info("[FLOW-PATTERN] {} - Mixed flow detected ({}% buys), skipping",
+                    optionSymbol, (int)(buyRatio * 100));
+            return;
+        }
+
+        // Determine flow direction
+        boolean isBullishFlow = buyRatio >= MIN_FLOW_RATIO;
+
+        // Verify flow matches option type
+        boolean isCall = events.get(0).isCall;
+        if ((isBullishFlow && !isCall) || (!isBullishFlow && isCall)) {
+            log.warn("[FLOW-PATTERN] {} - Flow direction mismatch! {} flow on {} option",
+                    optionSymbol, isBullishFlow ? "Bullish" : "Bearish", isCall ? "CALL" : "PUT");
+            return;
+        }
+
+        // Pattern detected! Start tracking
+        if (!activeFlows.containsKey(optionSymbol)) {
+            startTrackingFlow(symbol, optionSymbol, events, totalVolume, isBullishFlow);
         }
     }
 
     /**
-     * Create new flow alert
+     * Start tracking confirmed flow pattern
      */
-    public void createFlowAlert(String symbol, String optionSymbol,
-                                BigDecimal flowSize, String flowType,
-                                BigDecimal optionPrice, BigDecimal underlyingPrice) {
+    private void startTrackingFlow(String symbol, String optionSymbol,
+                                   List<FlowEvent> events, BigDecimal totalVolume,
+                                   boolean isBullishFlow) {
 
-        log.info("[FLOW-ALERT] Creating flow alert for {} - {} contracts",
-                optionSymbol, flowSize);
+        FlowEvent latestEvent = events.get(events.size() - 1);
 
-        // Check if we're already tracking this option
-        if (activeFlows.containsKey(optionSymbol)) {
-            log.info("[FLOW-ALERT] Already tracking {}, updating volume", optionSymbol);
-            FlowTracker existing = activeFlows.get(optionSymbol);
-            existing.additionalVolume = existing.additionalVolume.add(flowSize);
-            return;
-        }
-
-        // Create pending flow entity
+        // Create pending flow
         PendingFlow pendingFlow = new PendingFlow();
         pendingFlow.setSymbol(symbol);
         pendingFlow.setOptionSymbol(optionSymbol);
-        pendingFlow.setFlowSize(flowSize);
-        pendingFlow.setFlowType(flowType);
+        pendingFlow.setFlowSize(totalVolume);
+        pendingFlow.setFlowType(isBullishFlow ? "BULLISH_FLOW" : "BEARISH_FLOW");
         pendingFlow.setDetectedAt(LocalDateTime.now());
-        pendingFlow.setDetectionPrice(optionPrice);
-        pendingFlow.setUnderlyingPrice(underlyingPrice);
-        pendingFlow.setStatus("PENDING");
+        pendingFlow.setDetectionPrice(latestEvent.optionPrice);
+        pendingFlow.setUnderlyingPrice(latestEvent.underlyingPrice);
+        pendingFlow.setStatus("TRACKING");
+        pendingFlow.setConfirmationWindow(PRICE_CONFIRMATION_MINUTES);
+        pendingFlow.setRequiredMove(BigDecimal.valueOf(MIN_UNDERLYING_MOVE));
 
-        // Set confirmation parameters based on flow type
-        if ("SWEEP".equals(flowType)) {
-            pendingFlow.setConfirmationWindow(SWEEP_WINDOW_MINUTES);
-            pendingFlow.setRequiredMove(BigDecimal.valueOf(SWEEP_REQUIRED_MOVE));
-        } else if (flowSize.compareTo(BigDecimal.valueOf(1000)) > 0) {
-            pendingFlow.setConfirmationWindow(BLOCK_WINDOW_MINUTES);
-            pendingFlow.setRequiredMove(BigDecimal.valueOf(BLOCK_REQUIRED_MOVE));
-        } else {
-            pendingFlow.setConfirmationWindow(STANDARD_WINDOW_MINUTES);
-            pendingFlow.setRequiredMove(BigDecimal.valueOf(STANDARD_REQUIRED_MOVE));
-        }
-
-        // Save to database
         pendingFlowRepository.save(pendingFlow);
 
         // Create tracker
         FlowTracker tracker = new FlowTracker();
         tracker.pendingFlow = pendingFlow;
+        tracker.flowEvents = new ArrayList<>(events);
         tracker.detectedAt = LocalDateTime.now();
-        tracker.expiresAt = LocalDateTime.now().plusMinutes(pendingFlow.getConfirmationWindow());
-        tracker.initialPrice = optionPrice;
-        tracker.lowPrice = optionPrice;
-        tracker.highPrice = optionPrice;
+        tracker.expiresAt = LocalDateTime.now().plusMinutes(10);  // 10 minute total window
+        tracker.initialOptionPrice = latestEvent.optionPrice;
+        tracker.initialUnderlyingPrice = latestEvent.underlyingPrice;
+        tracker.isBullishFlow = isBullishFlow;
+        tracker.confirmationStartTime = LocalDateTime.now();
 
         activeFlows.put(optionSymbol, tracker);
 
-        // Send alert
-        sendFlowDetectionAlert(pendingFlow);
+        sendFlowPatternAlert(pendingFlow, events.size());
     }
 
     /**
-     * Check pending flows for confirmation (runs every minute)
+     * Monitor tracked flows for price confirmation
      */
-    @Scheduled(fixedDelay = 60000)
-    public void checkPendingFlows() {
+    @Scheduled(fixedDelay = 30000)  // Check every 30 seconds
+    public void checkTrackedFlows() {
         if (!isRunning.get() || activeFlows.isEmpty()) {
             return;
         }
 
-        log.debug("[FLOW-CHECK] Checking {} pending flows", activeFlows.size());
+        log.debug("[FLOW-CHECK] Monitoring {} active flow patterns", activeFlows.size());
 
         List<String> toRemove = new ArrayList<>();
 
@@ -186,15 +226,15 @@ public class FlowConfirmationEngine {
             String optionSymbol = entry.getKey();
             FlowTracker tracker = entry.getValue();
 
-            // Check in separate thread
-            executorService.submit(() -> checkFlow(optionSymbol, tracker, toRemove));
+            executorService.submit(() -> checkFlowConfirmation(optionSymbol, tracker, toRemove));
         }
 
-        // Remove expired/confirmed flows
+        // Clean up
         try {
-            Thread.sleep(5000); // Wait for checks to complete
+            Thread.sleep(5000);
             for (String symbol : toRemove) {
                 activeFlows.remove(symbol);
+                flowHistory.remove(symbol);  // Clean history too
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -202,17 +242,17 @@ public class FlowConfirmationEngine {
     }
 
     /**
-     * Check individual flow for confirmation
+     * Check if flow is confirmed by price action
      */
-    private void checkFlow(String optionSymbol, FlowTracker tracker, List<String> toRemove) {
+    private void checkFlowConfirmation(String optionSymbol, FlowTracker tracker, List<String> toRemove) {
         PendingFlow flow = tracker.pendingFlow;
 
         try {
-            // Check if expired
+            // Check expiration
             if (LocalDateTime.now().isAfter(tracker.expiresAt)) {
-                log.info("[FLOW-CHECK] {} expired without confirmation", optionSymbol);
+                log.info("[FLOW-CHECK] {} expired without sufficient confirmation", optionSymbol);
                 flow.setStatus("EXPIRED");
-                flow.setConfirmationReason("Monitoring window expired");
+                flow.setConfirmationReason("No sustained price movement");
                 pendingFlowRepository.save(flow);
                 toRemove.add(optionSymbol);
                 return;
@@ -231,12 +271,12 @@ public class FlowConfirmationEngine {
             BigDecimal currentOptionPrice = optionQuote.getQuote().getLast();
             BigDecimal currentUnderlyingPrice = underlyingQuote.getQuote().getLast();
 
-            // Update price tracking
-            tracker.updatePrices(currentOptionPrice);
+            // Check for additional flow
+            checkForAdditionalFlow(optionSymbol, tracker);
 
-            // Check for confirmation
-            ConfirmationResult result = evaluateConfirmation(
-                    flow, tracker, currentOptionPrice, currentUnderlyingPrice);
+            // Evaluate confirmation
+            ConfirmationResult result = evaluateStrictConfirmation(
+                    tracker, currentOptionPrice, currentUnderlyingPrice);
 
             if (result.isConfirmed) {
                 log.info("[FLOW-CHECK] ✅ {} CONFIRMED - {}", optionSymbol, result.reason);
@@ -251,11 +291,7 @@ public class FlowConfirmationEngine {
                 toRemove.add(optionSymbol);
 
             } else {
-                // Still monitoring
-                long minutesElapsed = java.time.Duration.between(
-                        tracker.detectedAt, LocalDateTime.now()).toMinutes();
-                log.debug("[FLOW-CHECK] {} monitoring {}/{} min - {}",
-                        optionSymbol, minutesElapsed, flow.getConfirmationWindow(), result.reason);
+                log.debug("[FLOW-CHECK] {} still tracking - {}", optionSymbol, result.reason);
             }
 
         } catch (Exception e) {
@@ -264,76 +300,105 @@ public class FlowConfirmationEngine {
     }
 
     /**
-     * Evaluate confirmation criteria
+     * Check for additional flow in same direction
      */
-    private ConfirmationResult evaluateConfirmation(PendingFlow flow, FlowTracker tracker,
-                                                    BigDecimal currentOptionPrice,
-                                                    BigDecimal currentUnderlyingPrice) {
+    private void checkForAdditionalFlow(String optionSymbol, FlowTracker tracker) {
+        List<FlowEvent> recentEvents = flowHistory.getOrDefault(optionSymbol, new ArrayList<>());
+
+        // Count events since we started tracking
+        long newEventCount = recentEvents.stream()
+                .filter(e -> e.timestamp.isAfter(tracker.confirmationStartTime))
+                .count();
+
+        tracker.additionalFlowCount = (int) newEventCount;
+
+        if (newEventCount > 0) {
+            BigDecimal additionalVolume = recentEvents.stream()
+                    .filter(e -> e.timestamp.isAfter(tracker.confirmationStartTime))
+                    .map(e -> e.volume)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+            tracker.additionalVolume = additionalVolume;
+            log.info("[FLOW-CHECK] {} - {} additional flow events, {} contracts",
+                    optionSymbol, newEventCount, additionalVolume);
+        }
+    }
+
+    /**
+     * Strict confirmation evaluation
+     */
+    private ConfirmationResult evaluateStrictConfirmation(FlowTracker tracker,
+                                                          BigDecimal currentOptionPrice,
+                                                          BigDecimal currentUnderlyingPrice) {
         ConfirmationResult result = new ConfirmationResult();
 
-        // Calculate underlying move
+        // Calculate price movements
         BigDecimal underlyingMove = currentUnderlyingPrice
-                .subtract(flow.getUnderlyingPrice())
-                .divide(flow.getUnderlyingPrice(), 4, RoundingMode.HALF_UP)
+                .subtract(tracker.initialUnderlyingPrice)
+                .divide(tracker.initialUnderlyingPrice, 4, RoundingMode.HALF_UP)
                 .multiply(BigDecimal.valueOf(100));
 
-        // Calculate option recovery from low
-        BigDecimal optionRecovery = currentOptionPrice
-                .subtract(tracker.lowPrice)
-                .divide(tracker.lowPrice, 4, RoundingMode.HALF_UP)
+        BigDecimal optionMove = currentOptionPrice
+                .subtract(tracker.initialOptionPrice)
+                .divide(tracker.initialOptionPrice, 4, RoundingMode.HALF_UP)
                 .multiply(BigDecimal.valueOf(100));
 
-        // Check direction
-        boolean isCall = flow.getOptionSymbol().contains("C");
-        boolean rightDirection = (isCall && underlyingMove.compareTo(BigDecimal.ZERO) > 0) ||
-                (!isCall && underlyingMove.compareTo(BigDecimal.ZERO) < 0);
+        // Check if moves are in expected direction
+        boolean correctDirection = tracker.isBullishFlow ?
+                (underlyingMove.doubleValue() > 0 && optionMove.doubleValue() > 0) :
+                (underlyingMove.doubleValue() < 0 && optionMove.doubleValue() < 0);
 
-        // Check if underlying moved enough
-        boolean sufficientMove = underlyingMove.abs()
-                .compareTo(flow.getRequiredMove()) >= 0;
+        // Time since detection
+        long minutesSinceDetection = java.time.Duration.between(
+                tracker.detectedAt, LocalDateTime.now()).toMinutes();
 
-        // Check if option recovered from reversal
-        boolean optionRecovered = currentOptionPrice
-                .compareTo(flow.getDetectionPrice().multiply(BigDecimal.valueOf(0.95))) > 0;
+        // STRICT CONFIRMATION CRITERIA
+        boolean sufficientUnderlyingMove = Math.abs(underlyingMove.doubleValue()) >= MIN_UNDERLYING_MOVE;
+        boolean sufficientOptionMove = Math.abs(optionMove.doubleValue()) >= MIN_OPTION_MOVE;
+        boolean hasAdditionalFlow = tracker.additionalFlowCount > 0;
+        boolean sufficientTime = minutesSinceDetection >= PRICE_CONFIRMATION_MINUTES;
 
-        // Check if reversal pattern completed (for large flows)
-        boolean reversalComplete = true;
-        if (flow.getFlowSize().compareTo(BigDecimal.valueOf(1000)) > 0) {
-            reversalComplete = tracker.hasCompletedReversal(currentOptionPrice);
-        }
+        // Need ALL conditions for confirmation
+        if (correctDirection && sufficientUnderlyingMove && sufficientOptionMove &&
+                hasAdditionalFlow && sufficientTime) {
 
-        // Evaluate confirmation
-        if (rightDirection && sufficientMove && optionRecovered && reversalComplete) {
             result.isConfirmed = true;
             result.reason = String.format(
-                    "Underlying moved %.2f%% in expected direction, option recovered %.1f%% from low",
-                    underlyingMove, optionRecovery);
+                    "Sustained flow confirmed: Underlying %.2f%%, Option %.2f%%, %d additional flows",
+                    underlyingMove, optionMove, tracker.additionalFlowCount);
 
-        } else if (!rightDirection && underlyingMove.abs().compareTo(BigDecimal.valueOf(0.5)) > 0) {
+        } else if (!correctDirection && Math.abs(underlyingMove.doubleValue()) > 0.2) {
             result.isInvalidated = true;
-            result.reason = "Underlying moved opposite to flow direction";
+            result.reason = "Price moved opposite to flow direction";
 
-        } else if (currentOptionPrice.compareTo(
-                flow.getDetectionPrice().multiply(BigDecimal.valueOf(0.70))) < 0) {
+        } else if (minutesSinceDetection > 5 && !hasAdditionalFlow) {
             result.isInvalidated = true;
-            result.reason = "Option price fell too much (-30%)";
+            result.reason = "No follow-through flow detected";
+
+        } else if (minutesSinceDetection > 7 && !sufficientOptionMove) {
+            result.isInvalidated = true;
+            result.reason = "Insufficient option price movement after 7 minutes";
 
         } else {
             // Still waiting
             List<String> waiting = new ArrayList<>();
-            if (!rightDirection) waiting.add("wrong direction");
-            if (!sufficientMove) waiting.add(String.format("need %.1f%% move",
-                    flow.getRequiredMove().subtract(underlyingMove.abs())));
-            if (!reversalComplete) waiting.add("reversal incomplete");
+            if (!correctDirection) waiting.add("waiting for direction");
+            if (!sufficientUnderlyingMove) waiting.add(String.format("need %.2f%% underlying move",
+                    MIN_UNDERLYING_MOVE - Math.abs(underlyingMove.doubleValue())));
+            if (!sufficientOptionMove) waiting.add(String.format("need %.0f%% option move",
+                    MIN_OPTION_MOVE - Math.abs(optionMove.doubleValue())));
+            if (!hasAdditionalFlow) waiting.add("waiting for additional flow");
+            if (!sufficientTime) waiting.add(String.format("wait %d more minutes",
+                    PRICE_CONFIRMATION_MINUTES - minutesSinceDetection));
 
-            result.reason = "Waiting: " + String.join(", ", waiting);
+            result.reason = "Tracking: " + String.join(", ", waiting);
         }
 
         return result;
     }
 
     /**
-     * Handle confirmed flow
+     * Handle confirmed flow with conservative signal generation
      */
     private void handleConfirmedFlow(PendingFlow flow, FlowTracker tracker,
                                      BigDecimal currentOptionPrice,
@@ -342,10 +407,10 @@ public class FlowConfirmationEngine {
         flow.setStatus("CONFIRMED");
         flow.setConfirmedAt(LocalDateTime.now());
         flow.setConfirmationPrice(currentOptionPrice);
-        flow.setConfirmationReason("Price action confirmed flow direction");
+        flow.setConfirmationReason("Sustained flow with price confirmation");
         pendingFlowRepository.save(flow);
 
-        // Create trading signal
+        // Create trading signal with CONSERVATIVE parameters
         Signal signal = new Signal();
         signal.setSymbol(flow.getSymbol());
         signal.setOptionSymbol(flow.getOptionSymbol());
@@ -354,83 +419,67 @@ public class FlowConfirmationEngine {
         signal.setOriginalOptionPrice(currentOptionPrice);
         signal.setEntryAssumptionPrice(currentUnderlyingPrice);
 
-        // Calculate confidence based on confirmation strength
-        BigDecimal maxDrawdown = flow.getDetectionPrice()
-                .subtract(tracker.lowPrice)
-                .divide(flow.getDetectionPrice(), 4, RoundingMode.HALF_UP)
-                .multiply(BigDecimal.valueOf(100));
+        // Conservative confidence based on confirmation strength
+        double confidence = 0.70;  // Base confidence
+        if (tracker.additionalFlowCount >= 3) confidence += 0.10;
+        if (tracker.additionalVolume.compareTo(new BigDecimal("10000")) > 0) confidence += 0.05;
 
-        // Set confidence and exits based on drawdown
-        if (maxDrawdown.compareTo(BigDecimal.valueOf(10)) < 0) {
-            // Minimal reversal - very strong signal
-            signal.setConfidence(0.92);
-            signal.setStopLoss(currentOptionPrice.multiply(BigDecimal.valueOf(0.80)));
-            signal.setTargetPrice(currentOptionPrice.multiply(BigDecimal.valueOf(1.70)));
+        signal.setConfidence(Math.min(confidence, 0.85));  // Cap at 85%
 
-        } else if (maxDrawdown.compareTo(BigDecimal.valueOf(20)) < 0) {
-            // Moderate reversal
-            signal.setConfidence(0.87);
-            signal.setStopLoss(currentOptionPrice.multiply(BigDecimal.valueOf(0.75)));
-            signal.setTargetPrice(currentOptionPrice.multiply(BigDecimal.valueOf(1.55)));
+        // TIGHTER stops and CONSERVATIVE targets
+        signal.setStopLoss(currentOptionPrice.multiply(BigDecimal.valueOf(0.85)));  // 15% stop
+        signal.setTargetPrice(currentOptionPrice.multiply(BigDecimal.valueOf(1.30)));  // 30% target
 
-        } else {
-            // Large reversal completed
-            signal.setConfidence(0.82);
-            signal.setStopLoss(currentOptionPrice.multiply(BigDecimal.valueOf(0.70)));
-            signal.setTargetPrice(currentOptionPrice.multiply(BigDecimal.valueOf(1.45)));
-        }
-
-        // Set notes
+        // Detailed notes
         signal.setNotes(String.format(
-                "Flow confirmed after %.0f min. Original: %s contracts @ $%.2f. Max drawdown: %.1f%%",
-                java.time.Duration.between(flow.getDetectedAt(), LocalDateTime.now()).toMinutes(),
+                "Confirmed after %d flow events, %.0f total contracts. Additional flow: %d events, %s contracts",
+                tracker.flowEvents.size(),
                 flow.getFlowSize(),
-                flow.getDetectionPrice(),
-                maxDrawdown
+                tracker.additionalFlowCount,
+                tracker.additionalVolume
         ));
 
         signal.setReason(String.format(
-                "Unusual %s flow of %s contracts confirmed by price action",
-                flow.getFlowType(), flow.getFlowSize()
+                "Sustained %s unusual flow pattern confirmed by price action",
+                tracker.isBullishFlow ? "bullish" : "bearish"
         ));
 
-        // Short expiration since we already waited
+        // Very short expiration - enter quickly or skip
         signal.setCreatedAt(LocalDateTime.now());
-        signal.setExpirationTime(LocalDateTime.now().plusMinutes(10));
-        signal.setPriority(95); // High priority
-        signal.setGeneratedBy("FLOW_CONFIRMATION");
+        signal.setExpirationTime(LocalDateTime.now().plusMinutes(5));
+        signal.setStatus("PENDING");
+        signal.setExecuted(false);
 
         signalRepository.save(signal);
 
-        // Send confirmation alert
         sendConfirmationAlert(flow, signal, tracker);
 
-        log.info("[FLOW-CONFIRM] Signal created for {} with {}% confidence",
+        log.info("[FLOW-CONFIRM] Conservative signal created for {} with {}% confidence",
                 signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
     }
 
     /**
-     * Send flow detection alert
+     * Send flow pattern detection alert
      */
-    private void sendFlowDetectionAlert(PendingFlow flow) {
+    private void sendFlowPatternAlert(PendingFlow flow, int eventCount) {
         String message = String.format(
-                "🔍 <b>UNUSUAL FLOW DETECTED</b>\n" +
+                "🔍 <b>FLOW PATTERN DETECTED</b>\n" +
                         "Option: %s\n" +
-                        "Type: %s flow\n" +
-                        "Size: %s contracts\n" +
-                        "Price: $%.2f\n" +
+                        "Pattern: %s\n" +
+                        "Events: %d in %d minutes\n" +
+                        "Total Volume: %s contracts\n" +
+                        "Initial Price: $%.2f\n" +
                         "Underlying: %s @ $%.2f\n" +
-                        "Action: Monitoring for %d minutes\n" +
-                        "Required Move: %.1f%%\n" +
-                        "Status: Waiting for confirmation...",
+                        "Status: Monitoring for price confirmation...\n" +
+                        "⚠️ Waiting for sustained movement and additional flow",
                 flow.getOptionSymbol(),
                 flow.getFlowType(),
+                eventCount,
+                FLOW_WINDOW_MINUTES,
                 flow.getFlowSize(),
                 flow.getDetectionPrice(),
                 flow.getSymbol(),
-                flow.getUnderlyingPrice(),
-                flow.getConfirmationWindow(),
-                flow.getRequiredMove()
+                flow.getUnderlyingPrice()
         );
 
         telegramService.sendMessage(message);
@@ -443,117 +492,75 @@ public class FlowConfirmationEngine {
         long monitoringMinutes = java.time.Duration.between(
                 flow.getDetectedAt(), LocalDateTime.now()).toMinutes();
 
-        BigDecimal maxDrawdown = flow.getDetectionPrice()
-                .subtract(tracker.lowPrice)
-                .divide(flow.getDetectionPrice(), 4, RoundingMode.HALF_UP)
-                .multiply(BigDecimal.valueOf(100));
-
         String message = String.format(
                 "✅ <b>FLOW CONFIRMED - SIGNAL GENERATED</b>\n" +
                         "Option: %s\n" +
-                        "Original Flow: %s contracts @ $%.2f\n" +
-                        "Monitoring: %d minutes\n" +
-                        "Max Drawdown: %.1f%% (Low: $%.2f)\n" +
-                        "Entry Price: $%.2f\n" +
-                        "Stop Loss: $%.2f (-%.0f%%)\n" +
-                        "Target: $%.2f (+%.0f%%)\n" +
+                        "Initial Flow: %d events, %s contracts\n" +
+                        "Additional Flow: %d events, %s contracts\n" +
+                        "Monitoring Time: %d minutes\n" +
+                        "Entry: $%.2f\n" +
+                        "Stop: $%.2f (-15%%)\n" +
+                        "Target: $%.2f (+30%%)\n" +
                         "Confidence: %d%%\n" +
-                        "Additional Volume: %s contracts",
+                        "⚠️ Conservative position sizing recommended",
                 signal.getOptionSymbol(),
+                tracker.flowEvents.size(),
                 flow.getFlowSize(),
-                flow.getDetectionPrice(),
+                tracker.additionalFlowCount,
+                tracker.additionalVolume,
                 monitoringMinutes,
-                maxDrawdown,
-                tracker.lowPrice,
                 signal.getOriginalOptionPrice(),
                 signal.getStopLoss(),
-                (1 - signal.getStopLoss().divide(signal.getOriginalOptionPrice(),
-                        4, RoundingMode.HALF_UP).doubleValue()) * 100,
                 signal.getTargetPrice(),
-                (signal.getTargetPrice().divide(signal.getOriginalOptionPrice(),
-                        4, RoundingMode.HALF_UP).doubleValue() - 1) * 100,
-                (int)(signal.getConfidence() * 100),
-                tracker.additionalVolume
+                (int)(signal.getConfidence() * 100)
         );
 
         telegramService.sendMessage(message);
     }
 
     /**
-     * Get active flow summary
+     * Clean old flow events
      */
-    public String getActiveFlowSummary() {
-        if (activeFlows.isEmpty()) {
-            return "No active flow alerts";
+    private void cleanOldFlowEvents(String optionSymbol) {
+        LocalDateTime cutoff = LocalDateTime.now().minusMinutes(30);  // Keep 30 minutes of history
+
+        List<FlowEvent> events = flowHistory.get(optionSymbol);
+        if (events != null) {
+            events.removeIf(e -> e.timestamp.isBefore(cutoff));
+            if (events.isEmpty()) {
+                flowHistory.remove(optionSymbol);
+            }
         }
-
-        StringBuilder summary = new StringBuilder();
-        summary.append("📊 <b>ACTIVE FLOW ALERTS</b>\n\n");
-
-        for (Map.Entry<String, FlowTracker> entry : activeFlows.entrySet()) {
-            FlowTracker tracker = entry.getValue();
-            PendingFlow flow = tracker.pendingFlow;
-
-            long elapsed = java.time.Duration.between(
-                    tracker.detectedAt, LocalDateTime.now()).toMinutes();
-            long remaining = flow.getConfirmationWindow() - elapsed;
-
-            summary.append(String.format(
-                    "%s - %s contracts\n" +
-                            "⏱ %d/%d min | Expires in %d min\n" +
-                            "📉 Low: $%.2f | Current: tracking...\n\n",
-                    flow.getOptionSymbol(),
-                    flow.getFlowSize(),
-                    elapsed,
-                    flow.getConfirmationWindow(),
-                    remaining,
-                    tracker.lowPrice
-            ));
-        }
-
-        return summary.toString();
     }
 
     /**
-     * Flow tracker
+     * Flow event data
+     */
+    @Data
+    private static class FlowEvent {
+        LocalDateTime timestamp;
+        BigDecimal volume;
+        String type;  // BUY, SELL, SWEEP
+        BigDecimal optionPrice;
+        BigDecimal underlyingPrice;
+        boolean isCall;
+    }
+
+    /**
+     * Enhanced flow tracker
      */
     @Data
     private static class FlowTracker {
         PendingFlow pendingFlow;
+        List<FlowEvent> flowEvents;
         LocalDateTime detectedAt;
         LocalDateTime expiresAt;
-        BigDecimal initialPrice;
-        BigDecimal lowPrice;
-        BigDecimal highPrice;
+        LocalDateTime confirmationStartTime;
+        BigDecimal initialOptionPrice;
+        BigDecimal initialUnderlyingPrice;
+        boolean isBullishFlow;
+        int additionalFlowCount = 0;
         BigDecimal additionalVolume = BigDecimal.ZERO;
-        boolean hasReversed = false;
-
-        void updatePrices(BigDecimal currentPrice) {
-            if (currentPrice.compareTo(lowPrice) < 0) {
-                lowPrice = currentPrice;
-                hasReversed = true;
-            }
-            if (currentPrice.compareTo(highPrice) > 0) {
-                highPrice = currentPrice;
-            }
-        }
-
-        boolean hasCompletedReversal(BigDecimal currentPrice) {
-            if (!hasReversed) {
-                return true;
-            }
-
-            // Consider reversal complete if recovered 50% from low
-            BigDecimal recovery = currentPrice.subtract(lowPrice);
-            BigDecimal totalDrop = initialPrice.subtract(lowPrice);
-
-            if (totalDrop.compareTo(BigDecimal.ZERO) <= 0) {
-                return true;
-            }
-
-            BigDecimal recoveryPercent = recovery.divide(totalDrop, 2, RoundingMode.HALF_UP);
-            return recoveryPercent.compareTo(BigDecimal.valueOf(0.50)) >= 0;
-        }
     }
 
     /**
@@ -564,5 +571,84 @@ public class FlowConfirmationEngine {
         boolean isConfirmed = false;
         boolean isInvalidated = false;
         String reason;
+    }
+
+    /**
+     * Get active flow summary
+     */
+    public String getActiveFlowSummary() {
+        if (activeFlows.isEmpty()) {
+            return "No active flow patterns being tracked";
+        }
+
+        StringBuilder summary = new StringBuilder();
+        summary.append("📊 <b>ACTIVE FLOW TRACKING</b>\n\n");
+
+        for (Map.Entry<String, FlowTracker> entry : activeFlows.entrySet()) {
+            FlowTracker tracker = entry.getValue();
+            PendingFlow flow = tracker.pendingFlow;
+
+            long elapsed = java.time.Duration.between(
+                    tracker.detectedAt, LocalDateTime.now()).toMinutes();
+
+            summary.append(String.format(
+                    "%s - %s flow\n" +
+                            "Events: %d initial + %d additional\n" +
+                            "Volume: %s + %s contracts\n" +
+                            "Tracking: %d minutes\n\n",
+                    flow.getOptionSymbol(),
+                    tracker.isBullishFlow ? "BULLISH" : "BEARISH",
+                    tracker.flowEvents.size(),
+                    tracker.additionalFlowCount,
+                    flow.getFlowSize(),
+                    tracker.additionalVolume,
+                    elapsed
+            ));
+        }
+
+        return summary.toString();
+    }
+
+    /**
+     * Load pending flows from database on startup
+     */
+    private void loadPendingFlows() {
+        try {
+            // Load flows that are still in TRACKING status
+            List<PendingFlow> pendingFlows = pendingFlowRepository.findByStatus("TRACKING");
+            log.info("Loading {} pending flows from database", pendingFlows.size());
+
+            for (PendingFlow flow : pendingFlows) {
+                // Check if flow is still valid (not too old)
+                if (flow.getDetectedAt().isAfter(LocalDateTime.now().minusMinutes(30))) {
+                    // Recreate tracker
+                    FlowTracker tracker = new FlowTracker();
+                    tracker.pendingFlow = flow;
+                    tracker.detectedAt = flow.getDetectedAt();
+                    tracker.expiresAt = flow.getDetectedAt().plusMinutes(10);
+                    tracker.initialOptionPrice = flow.getDetectionPrice();
+                    tracker.initialUnderlyingPrice = flow.getUnderlyingPrice();
+                    tracker.confirmationStartTime = flow.getDetectedAt();
+                    tracker.isBullishFlow = "BULLISH_FLOW".equals(flow.getFlowType());
+                    tracker.flowEvents = new ArrayList<>(); // We lost the detailed events, but can continue tracking
+
+                    activeFlows.put(flow.getOptionSymbol(), tracker);
+
+                    log.info("Resumed tracking for {} detected at {}",
+                            flow.getOptionSymbol(), flow.getDetectedAt());
+                } else {
+                    // Expire old flows
+                    flow.setStatus("EXPIRED");
+                    flow.setConfirmationReason("System restart - flow too old");
+                    pendingFlowRepository.save(flow);
+
+                    log.info("Expired old flow {} from {}",
+                            flow.getOptionSymbol(), flow.getDetectedAt());
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("Error loading pending flows: {}", e.getMessage());
+        }
     }
 }
