@@ -1,6 +1,7 @@
 package com.tradingBot.service;
 
 import com.tradingBot.entity.*;
+import com.tradingBot.ml.SignalMLScorer;
 import com.tradingBot.model.*;
 import com.tradingBot.repository.*;
 import com.tradingBot.service.PositionSyncService.BrokerPosition;
@@ -27,6 +28,8 @@ public class TradingService {
     private final TradierService tradierService;
     private final TelegramService telegramService;
     private final TradeRepository tradeRepository;
+    private final SignalMLScorer signalMLScorer;
+
     private final SignalRepository signalRepository;
     private final SafetyService safetyService;
     private final MarketDataRepository marketDataRepository;
@@ -91,7 +94,27 @@ public class TradingService {
     private void executeSignal(Signal signal, String executionId) {
         log.info("[v62][{}] Executing signal for {} with confidence {}%",
                 executionId, signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
+        if (signalMLScorer != null) {
+            double mlScore = signalMLScorer.scoreSignal(signal);
+            log.info("[v62][{}] ML Score: {} (original confidence: {}%)",
+                    executionId, String.format("%.3f", mlScore),
+                    (int)(signal.getConfidence() * 100));
 
+            // Adjust confidence based on ML score
+            double adjustedConfidence = (signal.getConfidence() * 0.7) + (mlScore * 0.3);
+            signal.setConfidence(adjustedConfidence);
+
+            // Reject if ML score is too low
+            if (mlScore < 0.5) {
+                log.warn("[v62][{}] ML Score {} too low - rejecting signal",
+                        executionId, String.format("%.3f", mlScore));
+                signal.setStatus("ML_REJECTED");
+                signal.setExecuted(true);
+                signal.setExecutionNotes(String.format("ML score %.3f below threshold", mlScore));
+                signalRepository.save(signal);
+                return;
+            }
+        }
         // Check signal age
         LocalDateTime now = LocalDateTime.now();
 

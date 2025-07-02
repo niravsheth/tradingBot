@@ -4,6 +4,7 @@ import com.tradingBot.entity.MarketData;
 import com.tradingBot.model.*;
 import com.tradingBot.service.*;
 import com.tradingBot.repository.MarketDataRepository;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -16,6 +17,8 @@ import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
@@ -34,7 +37,33 @@ public class TechnicalAnalysisService {
     private static final double STD_DEV_MULTIPLIER = 2.0;
     private static final int LOOKBACK_CANDLES = 5;
     private static final int SUPPORT_RESISTANCE_LOOKBACK = 50;
+
+    // Add these fields for VWAP optimization
+    private final Map<String, VWAPState> vwapStateCache = new ConcurrentHashMap<>();
+    private static final long VWAP_CACHE_TTL = 60000; // 1 minute
+
     private static final ZoneId ET_ZONE = ZoneId.of("America/New_York");
+
+    @Data
+    private static class VWAPState {
+        private BigDecimal cumulativePriceVolume = BigDecimal.ZERO;
+        private BigDecimal cumulativeVolume = BigDecimal.ZERO;
+        private BigDecimal vwap = BigDecimal.ZERO;
+        private BigDecimal sumSquaredDeviations = BigDecimal.ZERO;
+        private int dataPointCount = 0;
+        private LocalDateTime lastUpdate;
+        private LocalDateTime sessionStart;
+
+        public boolean isStale() {
+            return lastUpdate == null ||
+                    LocalDateTime.now().isAfter(lastUpdate.plusSeconds(60));
+        }
+
+        public boolean isNewSession(LocalDateTime marketOpen) {
+            return sessionStart == null ||
+                    !sessionStart.toLocalDate().equals(marketOpen.toLocalDate());
+        }
+    }
 
     public TechnicalAnalysis analyze(String symbol) {
         log.info("[TA] Starting technical analysis for {}", symbol);
@@ -136,75 +165,185 @@ public class TechnicalAnalysisService {
             return;
         }
 
-        // Calculate VWAP
-        BigDecimal cumulativePriceVolume = BigDecimal.ZERO;
-        BigDecimal cumulativeVolume = BigDecimal.ZERO;
-        List<BigDecimal> typicalPrices = new ArrayList<>();
+        String symbol = ta.getSymbol();
+        LocalDateTime marketOpen = LocalDateTime.now().withHour(9).withMinute(30).withSecond(0).withNano(0);
 
-        for (MarketData md : data) {
-            BigDecimal high = md.getHigh() != null ? md.getHigh() : md.getPrice();
-            BigDecimal low = md.getLow() != null ? md.getLow() : md.getPrice();
-            BigDecimal close = md.getPrice();
-            BigDecimal typicalPrice = high.add(low).add(close).divide(BigDecimal.valueOf(3), 4, RoundingMode.HALF_UP);
-            long volume = md.getVolume() != null ? md.getVolume() : 0;
+        // Get or create VWAP state
+        VWAPState state = vwapStateCache.computeIfAbsent(symbol, k -> new VWAPState());
 
-            typicalPrices.add(typicalPrice);
-            cumulativePriceVolume = cumulativePriceVolume.add(typicalPrice.multiply(BigDecimal.valueOf(volume)));
-            cumulativeVolume = cumulativeVolume.add(BigDecimal.valueOf(volume));
+        // Check if we need to reset (new session)
+        if (state.isNewSession(marketOpen)) {
+            state = new VWAPState();
+            state.setSessionStart(marketOpen);
+            vwapStateCache.put(symbol, state);
         }
 
-        BigDecimal vwap = cumulativeVolume.compareTo(BigDecimal.ZERO) > 0 ?
-                cumulativePriceVolume.divide(cumulativeVolume, 2, RoundingMode.HALF_UP) : BigDecimal.ZERO;
-        ta.setVwap(vwap);
+        // Incremental VWAP calculation
+        if (!state.isStale() && state.getDataPointCount() > 0) {
+            // Incremental update - only process new data points
+            int startIndex = Math.max(0, state.getDataPointCount());
 
-        // Calculate standard deviation for bands
-        if (data.size() >= VWAP_PERIOD) {
-            List<MarketData> recentData = data.subList(Math.max(0, data.size() - VWAP_PERIOD), data.size());
-            BigDecimal sumSquaredDiff = BigDecimal.ZERO;
+            for (int i = startIndex; i < data.size(); i++) {
+                MarketData md = data.get(i);
+                updateVWAPIncremental(state, md);
+            }
+        } else {
+            // Full recalculation (only on startup or after gap)
+            state = new VWAPState();
+            state.setSessionStart(marketOpen);
 
-            // Recalculate typical prices for just the recent data
-            int startIdx = Math.max(0, data.size() - VWAP_PERIOD);
-            for (int i = 0; i < recentData.size(); i++) {
-                BigDecimal typicalPrice = typicalPrices.get(startIdx + i);
-                BigDecimal diff = typicalPrice.subtract(vwap);
-                sumSquaredDiff = sumSquaredDiff.add(diff.multiply(diff));
+            for (MarketData md : data) {
+                updateVWAPIncremental(state, md);
             }
 
-            BigDecimal variance = sumSquaredDiff.divide(BigDecimal.valueOf(recentData.size()), 10, RoundingMode.HALF_UP);
-            BigDecimal stdDev = BigDecimal.valueOf(Math.sqrt(variance.doubleValue()));
-
-            ta.setVwapUpperBand(vwap.add(stdDev.multiply(BigDecimal.valueOf(STD_DEV_MULTIPLIER))));
-            ta.setVwapLowerBand(vwap.subtract(stdDev.multiply(BigDecimal.valueOf(STD_DEV_MULTIPLIER))));
-            ta.setVwapStandardDeviation(stdDev);
-        } else {
-            // Not enough data for bands, use simple percentage
-            BigDecimal bandWidth = vwap.multiply(BigDecimal.valueOf(0.005)); // 0.5%
-            ta.setVwapUpperBand(vwap.add(bandWidth));
-            ta.setVwapLowerBand(vwap.subtract(bandWidth));
-            ta.setVwapStandardDeviation(bandWidth.divide(BigDecimal.valueOf(STD_DEV_MULTIPLIER), 4, RoundingMode.HALF_UP));
+            vwapStateCache.put(symbol, state);
         }
+
+        // Set calculated values
+        ta.setVwap(state.getVwap());
+
+        // Calculate bands using Welford's algorithm for variance
+        BigDecimal variance = calculateIncrementalVariance(state);
+        BigDecimal stdDev = BigDecimal.valueOf(Math.sqrt(variance.doubleValue()));
+
+        ta.setVwapUpperBand(state.getVwap().add(stdDev.multiply(BigDecimal.valueOf(STD_DEV_MULTIPLIER))));
+        ta.setVwapLowerBand(state.getVwap().subtract(stdDev.multiply(BigDecimal.valueOf(STD_DEV_MULTIPLIER))));
+        ta.setVwapStandardDeviation(stdDev);
 
         // Check for breakout
         BigDecimal currentPrice = ta.getCurrentPrice();
         ta.setVwapBreakout(currentPrice.compareTo(ta.getVwapUpperBand()) > 0 ||
                 currentPrice.compareTo(ta.getVwapLowerBand()) < 0);
 
-        // Determine VWAP trend
-        if (data.size() >= 5) {
-            BigDecimal oldVwap = calculateVWAPAtIndex(data, data.size() - 5);
-            if (vwap.compareTo(oldVwap) > 0) {
-                ta.setVwapTrend("BULLISH");
-            } else if (vwap.compareTo(oldVwap) < 0) {
-                ta.setVwapTrend("BEARISH");
-            } else {
-                ta.setVwapTrend("NEUTRAL");
+        // VWAP trend using exponential smoothing
+        ta.setVwapTrend(calculateVWAPTrend(state, ta.getCurrentPrice()));
+
+        // Support/Resistance with proper statistical methods
+        checkVWAPSupportResistanceOptimized(data.subList(Math.max(0, data.size() - 20), data.size()),
+                state.getVwap(), ta);
+    }
+
+    private void updateVWAPIncremental(VWAPState state, MarketData md) {
+        BigDecimal high = md.getHigh() != null ? md.getHigh() : md.getPrice();
+        BigDecimal low = md.getLow() != null ? md.getLow() : md.getPrice();
+        BigDecimal close = md.getPrice();
+        BigDecimal typicalPrice = high.add(low).add(close).divide(BigDecimal.valueOf(3), 6, RoundingMode.HALF_UP);
+        long volume = md.getVolume() != null ? md.getVolume() : 0;
+
+        if (volume > 0) {
+            // Update cumulative values
+            state.setCumulativePriceVolume(
+                    state.getCumulativePriceVolume().add(typicalPrice.multiply(BigDecimal.valueOf(volume)))
+            );
+            state.setCumulativeVolume(
+                    state.getCumulativeVolume().add(BigDecimal.valueOf(volume))
+            );
+
+            // Update VWAP
+            if (state.getCumulativeVolume().compareTo(BigDecimal.ZERO) > 0) {
+                state.setVwap(
+                        state.getCumulativePriceVolume().divide(state.getCumulativeVolume(), 6, RoundingMode.HALF_UP)
+                );
             }
-        } else {
-            ta.setVwapTrend("NEUTRAL");
+
+            // Update variance using Welford's online algorithm
+            BigDecimal deviation = typicalPrice.subtract(state.getVwap());
+            state.setSumSquaredDeviations(
+                    state.getSumSquaredDeviations().add(
+                            deviation.multiply(deviation).multiply(BigDecimal.valueOf(volume))
+                    )
+            );
+
+            state.setDataPointCount(state.getDataPointCount() + 1);
+            state.setLastUpdate(LocalDateTime.now());
+        }
+    }
+
+    private BigDecimal calculateIncrementalVariance(VWAPState state) {
+        if (state.getCumulativeVolume().compareTo(BigDecimal.ZERO) <= 0) {
+            return BigDecimal.ZERO;
         }
 
-        // Check if VWAP is acting as support/resistance
-        checkVWAPSupportResistance(data, vwap, ta);
+        return state.getSumSquaredDeviations().divide(state.getCumulativeVolume(), 10, RoundingMode.HALF_UP);
+    }
+
+    private String calculateVWAPTrend(VWAPState state, BigDecimal currentPrice) {
+        // Use EMA of VWAP to determine trend
+        String key = state.getVwap().toString() + "_trend";
+        BigDecimal emaVwap = getEMAValue(key, state.getVwap(), 0.1);
+
+        if (state.getVwap().compareTo(emaVwap) > 0 && currentPrice.compareTo(state.getVwap()) > 0) {
+            return "BULLISH";
+        } else if (state.getVwap().compareTo(emaVwap) < 0 && currentPrice.compareTo(state.getVwap()) < 0) {
+            return "BEARISH";
+        }
+        return "NEUTRAL";
+    }
+
+    private final Map<String, BigDecimal> emaCache = new ConcurrentHashMap<>();
+
+    private BigDecimal getEMAValue(String key, BigDecimal newValue, double alpha) {
+        BigDecimal previousEMA = emaCache.get(key);
+        if (previousEMA == null) {
+            emaCache.put(key, newValue);
+            return newValue;
+        }
+
+        BigDecimal ema = newValue.multiply(BigDecimal.valueOf(alpha))
+                .add(previousEMA.multiply(BigDecimal.valueOf(1 - alpha)));
+        emaCache.put(key, ema);
+        return ema;
+    }
+
+    private void checkVWAPSupportResistanceOptimized(List<MarketData> recentData,
+                                                     BigDecimal vwap, TechnicalAnalysis ta) {
+        if (recentData.size() < 5) {
+            ta.setVwapAsSupport(false);
+            ta.setVwapAsResistance(false);
+            return;
+        }
+
+        int touchesAbove = 0;
+        int touchesBelow = 0;
+        int rejections = 0;
+
+        BigDecimal vwapThreshold = vwap.multiply(BigDecimal.valueOf(0.0015)); // 0.15% threshold
+
+        for (int i = 1; i < recentData.size(); i++) {
+            MarketData current = recentData.get(i);
+            MarketData previous = recentData.get(i - 1);
+
+            BigDecimal low = current.getLow() != null ? current.getLow() : current.getPrice();
+            BigDecimal high = current.getHigh() != null ? current.getHigh() : current.getPrice();
+
+            // Check if candle crossed VWAP
+            boolean crossedVwap = (previous.getPrice().compareTo(vwap) < 0 && high.compareTo(vwap) >= 0) ||
+                    (previous.getPrice().compareTo(vwap) > 0 && low.compareTo(vwap) <= 0);
+
+            if (crossedVwap) {
+                // Check rejection
+                if (current.getPrice().compareTo(vwap) > 0 &&
+                        low.subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
+                    touchesAbove++;
+                } else if (current.getPrice().compareTo(vwap) < 0 &&
+                        vwap.subtract(high).abs().compareTo(vwapThreshold) <= 0) {
+                    touchesBelow++;
+                }
+
+                // Check if it was rejected
+                if (i + 1 < recentData.size()) {
+                    MarketData next = recentData.get(i + 1);
+                    if ((current.getPrice().compareTo(vwap) > 0 && next.getPrice().compareTo(current.getPrice()) > 0) ||
+                            (current.getPrice().compareTo(vwap) < 0 && next.getPrice().compareTo(current.getPrice()) < 0)) {
+                        rejections++;
+                    }
+                }
+            }
+        }
+
+        // Statistical significance test
+        ta.setVwapAsSupport(touchesAbove >= 2 && rejections < touchesAbove / 2);
+        ta.setVwapAsResistance(touchesBelow >= 2 && rejections < touchesBelow / 2);
     }
 
     private BigDecimal calculateVWAPAtIndex(List<MarketData> data, int endIndex) {

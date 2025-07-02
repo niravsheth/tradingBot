@@ -474,15 +474,16 @@ public class ZeroDTEStrategy {
     private void analyzeOptionWithStrategies(Option option, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend, String analysisId) {
 
-        if (detectUnusualOptionsFlow(option, analysisId)) {
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        if (hasUnusualFlow) {
             analyzeUnusualFlow(option, ta, signals, marketTrend, analysisId);
-            return;
         }
 
+        // Continue checking other strategies regardless of unusual flow
         LocalTime now = LocalTime.now(ET_ZONE);
+
         if (now.isBefore(LocalTime.of(10, 0))) {
             analyzeOpeningDriveStrategy(option, ta, signals, marketTrend, analysisId);
-            return;
         }
 
         if (now.isAfter(LocalTime.of(9, 45))) {

@@ -560,201 +560,80 @@ public class TradingScheduler {
         }
     }
 
+//    public String getQQQTrend() {
+//        try {
+//            QuoteResponse response = tradierService.getQuote("QQQ");
+//            if (response == null || response.getQuote() == null) {
+//                return "NEUTRAL";
+//            }
+//
+//            Quote quote = response.getQuote();
+//            BigDecimal currentPrice = quote.getLast();
+//
+//            // Simple but effective trend detection
+//            double trendScore = 0.0;
+//
+//            // 1. Immediate price action (most weight)
+//            List<MarketData> recentData = marketDataRepository.findRecentData("QQQ", 10);
+//            if (recentData.size() >= 3) {
+//                BigDecimal price3MinAgo = recentData.get(recentData.size() - 3).getPrice();
+//                BigDecimal priceChange = currentPrice.subtract(price3MinAgo)
+//                        .divide(price3MinAgo, 4, RoundingMode.HALF_UP);
+//
+//                // Much more sensitive - 0.1% = 10 basis points
+//                if (priceChange.compareTo(BigDecimal.valueOf(0.001)) > 0) {
+//                    trendScore += 3.0; // Strong weight for recent move
+//                } else if (priceChange.compareTo(BigDecimal.valueOf(-0.001)) < 0) {
+//                    trendScore -= 3.0;
+//                }
+//            }
+//
+//            // 2. Day's trend (less weight)
+//            BigDecimal dayChange = currentPrice.subtract(quote.getPreviousClose())
+//                    .divide(quote.getPreviousClose(), 4, RoundingMode.HALF_UP);
+//
+//            if (dayChange.compareTo(BigDecimal.valueOf(0.002)) > 0) {
+//                trendScore += 1.0;
+//            } else if (dayChange.compareTo(BigDecimal.valueOf(-0.002)) < 0) {
+//                trendScore -= 1.0;
+//            }
+//
+//            // 3. Position in day's range
+//            if (quote.getHigh() != null && quote.getLow() != null) {
+//                BigDecimal range = quote.getHigh().subtract(quote.getLow());
+//                if (range.compareTo(BigDecimal.ZERO) > 0) {
+//                    BigDecimal position = currentPrice.subtract(quote.getLow())
+//                            .divide(range, 2, RoundingMode.HALF_UP);
+//
+//                    if (position.compareTo(BigDecimal.valueOf(0.7)) > 0) {
+//                        trendScore += 1.5;
+//                    } else if (position.compareTo(BigDecimal.valueOf(0.3)) < 0) {
+//                        trendScore -= 1.5;
+//                    }
+//                }
+//            }
+//
+//            // Simple thresholds
+//            String trend;
+//            if (trendScore >= 2.0) {
+//                trend = "UP";
+//            } else if (trendScore <= -2.0) {
+//                trend = "DOWN";
+//            } else {
+//                trend = "NEUTRAL";
+//            }
+//
+//            log.info("[TREND] QQQ Trend: {} (Score: {})", trend, String.format("%.1f", trendScore));
+//            return trend;
+//
+//        } catch (Exception e) {
+//            log.error("Error determining trend: {}", e.getMessage());
+//            return "NEUTRAL";
+//        }
+//    }
+    private final AdvancedTrendDetector advancedTrendDetector;
     public String getQQQTrend() {
-        try {
-            QuoteResponse response = tradierService.getQuote("QQQ");
-            if (response == null || response.getQuote() == null) {
-                return "NEUTRAL";
-            }
-
-            Quote quote = response.getQuote();
-            BigDecimal currentPrice = quote.getLast();
-            BigDecimal previousClose = quote.getPreviousClose();
-
-            if (currentPrice == null || previousClose == null) {
-                return "NEUTRAL";
-            }
-
-            double trendScore = 0.0;
-
-            MarketInternals internals = getMarketInternals();
-            double volatilityAdjustment = getVolatilityAdjustment();
-
-            List<MarketData> recentData = marketDataRepository.findRecentData("QQQ", 20);
-
-            int upMoves = 0;
-            int downMoves = 0;
-
-            if (recentData.size() >= 5) {
-                for (int i = 1; i < Math.min(recentData.size(), 10); i++) {
-                    BigDecimal prevPrice = recentData.get(i-1).getPrice();
-                    BigDecimal currPrice = recentData.get(i).getPrice();
-
-                    if (currPrice.compareTo(prevPrice) > 0) {
-                        upMoves++;
-                    } else if (currPrice.compareTo(prevPrice) < 0) {
-                        downMoves++;
-                    }
-                }
-
-                if (upMoves > downMoves * 2) {
-                    log.info("[TREND] Strong UP trend detected - Up moves: {}, Down moves: {}", upMoves, downMoves);
-                    trendScore += 3.0;
-                } else if (downMoves > upMoves * 2) {
-                    log.info("[TREND] Strong DOWN trend detected - Down moves: {}, Up moves: {}", downMoves, upMoves);
-                    trendScore -= 3.0;
-                }
-            }
-
-            BigDecimal price5MinAgo = getPriceMinutesAgo(recentData, 5);
-            BigDecimal price10MinAgo = getPriceMinutesAgo(recentData, 10);
-            BigDecimal price15MinAgo = getPriceMinutesAgo(recentData, 15);
-
-            if (price5MinAgo != null) {
-                if (currentPrice.compareTo(price5MinAgo) > 0) {
-                    trendScore += 1.5;
-                } else if (currentPrice.compareTo(price5MinAgo) < 0) {
-                    trendScore -= 1.5;
-                }
-            }
-
-            if (price10MinAgo != null) {
-                if (currentPrice.compareTo(price10MinAgo) > 0) {
-                    trendScore += 1.0;
-                } else if (currentPrice.compareTo(price10MinAgo) < 0) {
-                    trendScore -= 1.0;
-                }
-            }
-
-            if (price15MinAgo != null) {
-                if (currentPrice.compareTo(price15MinAgo) > 0) {
-                    trendScore += 0.5;
-                } else if (currentPrice.compareTo(price15MinAgo) < 0) {
-                    trendScore -= 0.5;
-                }
-            }
-
-            BigDecimal dayChange = currentPrice.subtract(previousClose)
-                    .divide(previousClose, 4, RoundingMode.HALF_UP);
-
-            if (dayChange.compareTo(BigDecimal.valueOf(0.002)) > 0) {
-                trendScore += 1.0;
-            } else if (dayChange.compareTo(BigDecimal.valueOf(-0.002)) < 0) {
-                trendScore -= 1.0;
-            }
-
-            try {
-                BigDecimal vwap = calculateCurrentVWAP();
-                if (vwap != null && currentPrice.compareTo(vwap) > 0) {
-                    trendScore += 0.5;
-                } else if (vwap != null && currentPrice.compareTo(vwap) < 0) {
-                    trendScore -= 0.5;
-                }
-            } catch (Exception e) {
-                log.debug("VWAP calculation skipped: {}", e.getMessage());
-            }
-
-            try {
-                double volumeRatio = calculateVolumeRatio(recentData);
-                if (volumeRatio > 1.5) {
-                    if (trendScore > 0) {
-                        trendScore += 1.0;
-                    } else if (trendScore < 0) {
-                        trendScore -= 1.0;
-                    }
-                }
-            } catch (Exception e) {
-                log.debug("Volume ratio calculation skipped: {}", e.getMessage());
-            }
-
-            double componentScore = analyzeQQQComponentsCached();
-            trendScore += componentScore;
-
-            if (internals != null) {
-                trendScore += internals.getTrendBias();
-            }
-
-            BigDecimal positionPercent = null;
-            BigDecimal dayHigh = quote.getHigh();
-            BigDecimal dayLow = quote.getLow();
-
-            if (dayHigh != null && dayLow != null && !dayHigh.equals(dayLow)) {
-                BigDecimal range = dayHigh.subtract(dayLow);
-                BigDecimal fromLow = currentPrice.subtract(dayLow);
-                positionPercent = fromLow.divide(range, 3, BigDecimal.ROUND_HALF_UP);
-
-                if (positionPercent.compareTo(BigDecimal.valueOf(0.8)) > 0) {
-                    trendScore += 3.0;
-                    log.info("[TREND] Price at {}% of day's range - BULLISH",
-                            positionPercent.multiply(BigDecimal.valueOf(100)));
-                } else if (positionPercent.compareTo(BigDecimal.valueOf(0.2)) < 0) {
-                    trendScore -= 3.0;
-                    log.info("[TREND] Price at {}% of day's range - BEARISH",
-                            positionPercent.multiply(BigDecimal.valueOf(100)));
-                }
-            }
-
-            log.info("[TREND] QQQ Trend Analysis - Current: ${}, 5min ago: ${}, 10min ago: ${}, Base Score: {}",
-                    currentPrice, price5MinAgo, price10MinAgo, trendScore);
-
-            log.info("[TREND] Debug - Up moves: {}, Down moves: {}, " +
-                            "5min: {}, 10min: {}, 15min: {}, Day: {}, " +
-                            "Component Score: {}, VIX adj: {}, Internals: {}, Final Score: {}",
-                    upMoves, downMoves,
-                    (price5MinAgo != null ? (currentPrice.compareTo(price5MinAgo) > 0 ? "+1.5" : "-1.5") : "0"),
-                    (price10MinAgo != null ? (currentPrice.compareTo(price10MinAgo) > 0 ? "+1.0" : "-1.0") : "0"),
-                    (price15MinAgo != null ? (currentPrice.compareTo(price15MinAgo) > 0 ? "+0.5" : "-0.5") : "0"),
-                    dayChange.compareTo(BigDecimal.valueOf(0.002)) > 0 ? "+1" :
-                            (dayChange.compareTo(BigDecimal.valueOf(-0.002)) < 0 ? "-1" : "0"),
-                    String.format("%.2f", componentScore),
-                    String.format("%.2f", volatilityAdjustment),
-                    String.format("%.2f", internals != null ? internals.getTrendBias() : 0.0),
-                    String.format("%.2f", trendScore));
-
-            double volatilityFactor = 1.0;
-            if (dayHigh != null && dayLow != null && currentPrice.compareTo(BigDecimal.ZERO) > 0) {
-                BigDecimal dayRange = dayHigh.subtract(dayLow);
-                double rangePercent = dayRange.divide(currentPrice, 4, BigDecimal.ROUND_HALF_UP)
-                        .multiply(BigDecimal.valueOf(100)).doubleValue();
-
-                if (rangePercent > 1.5) {
-                    volatilityFactor = 1.3;
-                } else if (rangePercent < 0.5) {
-                    volatilityFactor = 0.8;
-                }
-            }
-
-            double upThreshold = 3.0 * volatilityFactor;
-            double downThreshold = -3.0 * volatilityFactor;
-
-            String trend;
-            if (trendScore >= upThreshold) {
-                trend = "UP";
-            } else if (trendScore <= downThreshold) {
-                trend = "DOWN";
-            } else {
-                trend = "NEUTRAL";
-            }
-
-            if (Math.abs(trendScore) < upThreshold * 1.2 && positionPercent != null) {
-                if (positionPercent.compareTo(BigDecimal.valueOf(0.9)) > 0) {
-                    trend = "UP";
-                    log.warn("[TREND] Borderline score {} but at day's high - calling UP", String.format("%.2f", trendScore));
-                } else if (positionPercent.compareTo(BigDecimal.valueOf(0.1)) < 0) {
-                    trend = "DOWN";
-                    log.warn("[TREND] Borderline score {} but at day's low - calling DOWN", String.format("%.2f", trendScore));
-                }
-            }
-
-            log.info("[TREND] Final QQQ Trend: {} (Score: {}, Thresholds: ±{})",
-                    trend, String.format("%.2f", trendScore), String.format("%.1f", upThreshold));
-
-            return trend;
-
-        } catch (Exception e) {
-            log.error("Error determining trend: {}", e.getMessage());
-            return "NEUTRAL";
-        }
+        return advancedTrendDetector.detectTrend("QQQ");
     }
 
     private double analyzeQQQComponentsCached() {
