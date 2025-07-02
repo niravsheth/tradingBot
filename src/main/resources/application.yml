@@ -55,7 +55,7 @@ telegram:
 # Trading configuration - ADD ALL THESE MISSING PROPERTIES
 trading:
   symbol: QQQ
-  total-capital: 2000
+  total-capital: 5000
   max-position-percentage: 50
   min-position-size: 0
   max-position-size: 1000
@@ -163,8 +163,8 @@ safety:
   trading-enabled: true
   paper-mode: false
   max-daily-loss: 300
-  max-position-value: 500
-  max-open-positions: 3
+  max-position-value: 1000
+  max-open-positions: 10
   emergency-contacts:
     - YOUR_PHONE_NUMBER
 
@@ -198,7 +198,7 @@ tradingbot:
 
     # Position sizing
     default-position-size: 1
-    max-positions: 3
+    max-positions: 10
     max-position-value: 1000
 
     # Risk Management
