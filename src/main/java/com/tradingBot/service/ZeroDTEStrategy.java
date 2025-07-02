@@ -1,5 +1,6 @@
 package com.tradingBot.service;
 
+import com.tradingBot.analytics.AdvancedUnusualFlowDetector;
 import com.tradingBot.entity.*;
 import com.tradingBot.model.*;
 import com.tradingBot.repository.*;
@@ -23,6 +24,8 @@ public class ZeroDTEStrategy {
     private final TechnicalAnalysisService technicalAnalysisService;
     private final SignalRepository signalRepository;
     private final SignalOrchestrator signalOrchestrator;
+
+    private final AdvancedUnusualFlowDetector flowDetector;
 
     @Value("${trading.min-volume:50}")
     private int minVolume;
@@ -137,7 +140,7 @@ public class ZeroDTEStrategy {
 
             // Analyze each option against strategies - PASS MARKET TREND
             for (Option option : filteredOptions) {
-                analyzeOptionWithStrategies(option, ta, rawSignals, marketTrend, analysisId);
+                analyzeOptionWithStrategies(option, ta, rawSignals, marketTrend, analysisId, filteredOptions);
             }
 
             // Use orchestrator to process signals intelligently
@@ -168,6 +171,92 @@ public class ZeroDTEStrategy {
             log.error("[v63][{}] ERROR in analyzeOptions: {}", analysisId, e.getMessage(), e);
             return new ArrayList<>();
         }
+    }
+
+    private boolean isFlowSignalValid(Signal signal, Option option, List<Option> allOptions, String analysisId) {
+        if (!signal.getStrategy().contains("UNUSUAL_FLOW")) {
+            return true; // Not a flow signal, use regular validation
+        }
+
+        // Re-validate the flow in case market conditions changed
+        AdvancedUnusualFlowDetector.FlowAnalysis analysis =
+                flowDetector.analyzeFlow(option, signal.getSymbol(), allOptions, analysisId);
+
+        if (!analysis.isUnusualFlow()) {
+            log.warn("[v63][{}] Flow signal invalidated - {} Reason: {}",
+                    analysisId, signal.getOptionSymbol(), analysis.getReasoning());
+            return false;
+        }
+
+        // Additional validation for flow signals
+        if (analysis.getHedgingProbability() > 0.4) {
+            log.warn("[v63][{}] Flow signal rejected - High hedging probability: {}%",
+                    analysisId, (int)(analysis.getHedgingProbability() * 100));
+            return false;
+        }
+
+        return true;
+    }
+
+
+    private double adjustFlowConfidence(Signal signal, Option option, List<Option> allOptions) {
+        if (!signal.getStrategy().contains("UNUSUAL_FLOW")) {
+            return signal.getConfidence(); // Not a flow signal
+        }
+
+        AdvancedUnusualFlowDetector.FlowAnalysis analysis =
+                flowDetector.analyzeFlow(option, signal.getSymbol(), allOptions, "confidence-adj");
+
+        double baseConfidence = signal.getConfidence();
+
+        // Boost for smart money
+        if (analysis.isSmartMoney()) {
+            baseConfidence = Math.min(baseConfidence * 1.2, 0.95);
+        }
+
+        // Boost for high aggressiveness
+        if (analysis.getAggressiveness() > 0.8) {
+            baseConfidence = Math.min(baseConfidence * 1.1, 0.93);
+        }
+
+        // Reduce for any hedging probability
+        if (analysis.getHedgingProbability() > 0.1) {
+            baseConfidence *= (1 - analysis.getHedgingProbability() * 0.5);
+        }
+
+        return baseConfidence;
+    }
+
+    private void logFlowAnalysisSummary(List<Option> options, String analysisId) {
+        log.info("[v63][{}] === FLOW ANALYSIS SUMMARY ===", analysisId);
+
+        int totalFlows = 0;
+        int filteredAsHedging = 0;
+        int confirmedDirectional = 0;
+        int smartMoneyFlows = 0;
+
+        for (Option option : options) {
+            if (option.getVolume() > 1000) { // Only analyze significant volume
+                AdvancedUnusualFlowDetector.FlowAnalysis analysis =
+                        flowDetector.analyzeFlow(option, "QQQ", options, analysisId);
+
+                totalFlows++;
+
+                if (analysis.getHedgingProbability() > 0.3) {
+                    filteredAsHedging++;
+                }
+
+                if (analysis.isUnusualFlow()) {
+                    confirmedDirectional++;
+                    if (analysis.isSmartMoney()) {
+                        smartMoneyFlows++;
+                    }
+                }
+            }
+        }
+
+        log.info("[v63][{}] Flow Summary - Total: {}, Hedging: {}, Directional: {}, Smart Money: {}",
+                analysisId, totalFlows, filteredAsHedging, confirmedDirectional, smartMoneyFlows);
     }
 
     // OVERLOADED METHOD FOR BACKWARD COMPATIBILITY
@@ -269,24 +358,61 @@ public class ZeroDTEStrategy {
         return BigDecimal.ZERO;
     }
 
-    private boolean detectUnusualOptionsFlow(Option option, String analysisId) {
-        if (option.getVolume() > UNUSUAL_VOLUME_MIN &&
-                option.getOpenInterest() > 0 &&
-                option.getVolume() > option.getOpenInterest() * 2) {
+    private boolean detectUnusualOptionsFlow(Option option, List<Option> allOptions, String analysisId) {
+        try {
+            AdvancedUnusualFlowDetector.FlowAnalysis analysis =
+                    flowDetector.analyzeFlow(option, "QQQ", allOptions, analysisId);
 
-            BigDecimal premium = option.getMidPrice()
-                    .multiply(BigDecimal.valueOf(option.getVolume()))
-                    .multiply(BigDecimal.valueOf(100));
-
-            if (premium.compareTo(BigDecimal.valueOf(SMART_MONEY_THRESHOLD)) > 0) {
-                log.info("[v63][{}] 🎯 UNUSUAL FLOW DETECTED - {} {} Vol: {} Premium: ${}",
+            if (analysis.isUnusualFlow()) {
+                log.info("[v63][{}] ✅ CONFIRMED UNUSUAL FLOW - {} {} Premium: ${} Type: {} Confidence: {}%",
                         analysisId, option.getType(), option.getStrikePrice(),
-                        option.getVolume(), premium);
+                        option.getMidPrice().multiply(BigDecimal.valueOf(option.getVolume() * 100)),
+                        analysis.getFlowType(), (int)(analysis.getConfidence() * 100));
+
+                // Alert for smart money flows
+                if (analysis.isSmartMoney()) {
+                    telegramService.sendMessage(String.format(
+                            "🎯 <b>SMART MONEY FLOW DETECTED</b>\n" +
+                                    "Option: %s %s\n" +
+                                    "Volume: %,d contracts\n" +
+                                    "Premium: $%,.0f\n" +
+                                    "Type: %s\n" +
+                                    "Confidence: %.0f%%\n" +
+                                    "Aggressiveness: %.0f%%",
+                            option.getType(), option.getStrikePrice(),
+                            option.getVolume(),
+                            option.getMidPrice().multiply(BigDecimal.valueOf(option.getVolume() * 100)).doubleValue(),
+                            analysis.getFlowType(),
+                            analysis.getConfidence() * 100,
+                            analysis.getAggressiveness() * 100
+                    ));
+                }
+
                 return true;
+            } else {
+                // Log why it was filtered out
+                log.debug("[v63][{}] ❌ Flow filtered out - {} {} Reason: {}",
+                        analysisId, option.getType(), option.getStrikePrice(), analysis.getReasoning());
+
+                // Alert for large flows that were filtered (might be interesting)
+                BigDecimal premium = option.getMidPrice()
+                        .multiply(BigDecimal.valueOf(option.getVolume()))
+                        .multiply(BigDecimal.valueOf(100));
+
+                if (premium.compareTo(BigDecimal.valueOf(2000000)) > 0) { // >$2M flows that were filtered
+                    log.warn("[v63][{}] 🚫 LARGE FLOW FILTERED - {} {} Premium: ${} Reason: {}",
+                            analysisId, option.getType(), option.getStrikePrice(),
+                            premium, analysis.getReasoning());
+                }
+
+                return false;
             }
+        } catch (Exception e) {
+            log.error("[v63][{}] Error in enhanced flow detection: {}", analysisId, e.getMessage());
+            return false; // Fail safe - don't trade on errors
         }
-        return false;
     }
+
 
     private double getTimeWindowMultiplier(LocalTime now) {
         if ((now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END))) {
@@ -472,51 +598,52 @@ public class ZeroDTEStrategy {
 
     // UPDATED METHOD SIGNATURE
     private void analyzeOptionWithStrategies(Option option, TechnicalAnalysis ta,
-                                             List<Signal> signals, String marketTrend, String analysisId) {
+                                             List<Signal> signals, String marketTrend,
+                                             String analysisId, List<Option> allOptions){
 
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, allOptions, analysisId);
         if (hasUnusualFlow) {
-            analyzeUnusualFlow(option, ta, signals, marketTrend, analysisId);
+            analyzeUnusualFlow(option, allOptions,ta, signals, marketTrend, analysisId);
         }
 
         // Continue checking other strategies regardless of unusual flow
         LocalTime now = LocalTime.now(ET_ZONE);
 
         if (now.isBefore(LocalTime.of(10, 0))) {
-            analyzeOpeningDriveStrategy(option, ta, signals, marketTrend, analysisId);
+            analyzeOpeningDriveStrategy(option,allOptions, ta, signals, marketTrend, analysisId);
         }
 
         if (now.isAfter(LocalTime.of(9, 45))) {
-            analyzeOpeningRangeBreakout(option, ta, signals, marketTrend, analysisId);
+            analyzeOpeningRangeBreakout(option,allOptions, ta, signals, marketTrend, analysisId);
         }
 
         if (ta.getVolumeRatio() > 1.5) {
-            analyzeVolumeSpikeStrategy(option, ta, signals, marketTrend, analysisId);
+            analyzeVolumeSpikeStrategy(option,allOptions, ta, signals, marketTrend, analysisId);
         }
 
         if (ta.isVwapBreakout() && ta.getVolumeRatio() > 1.5) {
-            analyzeVWAPBreakout(option, ta, signals, marketTrend, analysisId);
+            analyzeVWAPBreakout(option,allOptions, ta, signals, marketTrend, analysisId);
         } else if (ta.isExtendedFromVwap() && (ta.getRsi() > 70 || ta.getRsi() < 30)) {
-            analyzeVWAPDeviationReversion(option, ta, signals, marketTrend, analysisId);
+            analyzeVWAPDeviationReversion(option,allOptions, ta, signals, marketTrend, analysisId);
         } else if (ta.isVwapAsSupport() || ta.isVwapAsResistance()) {
-            analyzeVWAPSupportResistance(option, ta, signals, marketTrend, analysisId);
+            analyzeVWAPSupportResistance(option,allOptions, ta, signals, marketTrend, analysisId);
         } else if (Math.abs(ta.getPriceToVwapRatio() - 1.0) < 0.005) {
-            analyzeVWAPBounce(option, ta, signals, marketTrend, analysisId);
+            analyzeVWAPBounce(option,allOptions, ta, signals, marketTrend, analysisId);
         }
     }
 
     // UPDATE ALL STRATEGY METHODS TO ACCEPT MARKET TREND
-    private void analyzeOpeningDriveStrategy(Option option, TechnicalAnalysis ta,
+    private void analyzeOpeningDriveStrategy(Option option,List<Option> allOptions, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend, String analysisId) {
         if (!detectOpeningDrive(ta, analysisId)) {
             return;
         }
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
 
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
         BigDecimal gap = calculatePremarketGap(ta);
         boolean isCallOption = "CALL".equalsIgnoreCase(option.getType());
         boolean isPutOption = "PUT".equalsIgnoreCase(option.getType());
@@ -533,7 +660,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.70) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_OPENING_DRIVE_CALL", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_OPENING_DRIVE_CALL", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Opening drive +%.2f%% gap with %.1fx volume - momentum continuation%s",
                         gap.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -558,7 +685,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.70) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_OPENING_DRIVE_PUT", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_OPENING_DRIVE_PUT", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Opening drive %.2f%% gap down with %.1fx volume - momentum continuation%s",
                         gap.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -572,17 +699,17 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeOpeningRangeBreakout(Option option, TechnicalAnalysis ta,
+    private void analyzeOpeningRangeBreakout(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend, String analysisId) {
         if (ta.getOpeningRangeHigh() == null || ta.getOpeningRangeLow() == null) {
             return;
         }
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
 
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal orHigh = ta.getOpeningRangeHigh();
         BigDecimal orLow = ta.getOpeningRangeLow();
@@ -601,7 +728,7 @@ public class ZeroDTEStrategy {
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_ORB_CALL", confidence, marketTrend);
+                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_ORB_CALL", confidence, marketTrend);
                     signal.setReason(String.format(
                             "Opening range breakout above $%.2f with %.1fx volume%s",
                             orHigh, ta.getVolumeRatio(),
@@ -625,7 +752,7 @@ public class ZeroDTEStrategy {
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_ORB_PUT", confidence, marketTrend);
+                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_ORB_PUT", confidence, marketTrend);
                     signal.setReason(String.format(
                             "Opening range breakdown below $%.2f with %.1fx volume%s",
                             orLow, ta.getVolumeRatio(),
@@ -639,10 +766,10 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeVWAPBreakout(Option option, TechnicalAnalysis ta,
+    private void analyzeVWAPBreakout(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                      List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
+        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
@@ -674,7 +801,7 @@ public class ZeroDTEStrategy {
                     }
 
                     if (confidence >= 0.60) {
-                        Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BREAKOUT_CALL", confidence, marketTrend);
+                        Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_BREAKOUT_CALL", confidence, marketTrend);
                         signal.setReason(String.format(
                                 "VWAP breakout %.2f%% above upper band with %.1fx volume%s",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -708,7 +835,7 @@ public class ZeroDTEStrategy {
                     }
 
                     if (confidence >= 0.60) {
-                        Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BREAKOUT_PUT", confidence, marketTrend);
+                        Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_BREAKOUT_PUT", confidence, marketTrend);
                         signal.setReason(String.format(
                                 "VWAP breakout %.2f%% below lower band with %.1fx volume%s",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
@@ -724,18 +851,18 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeVWAPDeviationReversion(Option option, TechnicalAnalysis ta,
+    private void analyzeVWAPDeviationReversion(Option option,List<Option> allOptions, TechnicalAnalysis ta,
                                                List<Signal> signals, String marketTrend, String analysisId) {
         if (!ta.isExtendedFromVwap() || ta.getVwapStandardDeviation() == null ||
                 ta.getVwapStandardDeviation().compareTo(BigDecimal.ZERO) == 0) {
             return;
         }
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
 
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions,analysisId);
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal vwap = ta.getVwap();
         double priceRatio = ta.getPriceToVwapRatio();
@@ -753,7 +880,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_REVERSION_PUT", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_REVERSION_PUT", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Extended %.2f%% above VWAP with RSI %.1f - mean reversion setup%s",
                         (priceRatio - 1) * 100, ta.getRsi(),
@@ -773,7 +900,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_REVERSION_CALL", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_REVERSION_CALL", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Extended %.2f%% below VWAP with RSI %.1f - mean reversion setup%s",
                         (1 - priceRatio) * 100, ta.getRsi(),
@@ -786,10 +913,10 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeVolumeSpikeStrategy(Option option, TechnicalAnalysis ta,
+    private void analyzeVolumeSpikeStrategy(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                             List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, allOptions,analysisId);
+        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
@@ -818,7 +945,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VOLUME_SPIKE_CALL", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VOLUME_SPIKE_CALL", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Volume spike %.1fx with bullish momentum - continuation play%s",
                         ta.getVolumeRatio(),
@@ -841,7 +968,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VOLUME_SPIKE_PUT", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VOLUME_SPIKE_PUT", confidence, marketTrend);
                 signal.setReason(String.format(
                         "Volume spike %.1fx with bearish momentum - continuation play%s",
                         ta.getVolumeRatio(),
@@ -854,10 +981,10 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeVWAPSupportResistance(Option option, TechnicalAnalysis ta,
+    private void analyzeVWAPSupportResistance(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                               List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
+        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
@@ -878,7 +1005,7 @@ public class ZeroDTEStrategy {
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_SUPPORT_CALL", confidence, marketTrend);
+                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_SUPPORT_CALL", confidence, marketTrend);
                     signal.setReason(String.format(
                             "VWAP support at $%.2f held with %d touches%s",
                             vwap, 3,
@@ -904,7 +1031,7 @@ public class ZeroDTEStrategy {
                 }
 
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_RESISTANCE_PUT", confidence, marketTrend);
+                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_RESISTANCE_PUT", confidence, marketTrend);
                     signal.setReason(String.format(
                             "VWAP resistance at $%.2f rejected with %d touches%s",
                             vwap, 3,
@@ -918,10 +1045,10 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeVWAPBounce(Option option, TechnicalAnalysis ta,
+    private void analyzeVWAPBounce(Option option,List<Option> allOptions, TechnicalAnalysis ta,
                                    List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, analysisId);
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions,analysisId);
+        if (!isSignalAlignedWithTrend(option,allOptions,ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
@@ -948,7 +1075,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.60) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BOUNCE_CALL", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_BOUNCE_CALL", confidence, marketTrend);
                 signal.setReason(String.format("VWAP bounce with neutral RSI and volume confirmation%s",
                         hasUnusualFlow ? " (Unusual Flow)" : ""));
                 signals.add(signal);
@@ -966,7 +1093,7 @@ public class ZeroDTEStrategy {
             }
 
             if (confidence >= 0.60) {
-                Signal signal = createSignal(option, ta, "BUY", "0DTE_VWAP_BOUNCE_PUT", confidence, marketTrend);
+                Signal signal = createSignal(option,allOptions, ta, "BUY", "0DTE_VWAP_BOUNCE_PUT", confidence, marketTrend);
                 signal.setReason(String.format("VWAP rejection with neutral RSI and volume confirmation%s",
                         hasUnusualFlow ? " (Unusual Flow)" : ""));
                 signals.add(signal);
@@ -1193,13 +1320,13 @@ public class ZeroDTEStrategy {
     }
 
     // UPDATED createSignal METHOD WITH MARKET TREND
-    private Signal createSignal(Option option, TechnicalAnalysis ta, String signalType,
+    private Signal createSignal(Option option,List<Option> allOptions, TechnicalAnalysis ta, String signalType,
                                 String strategy, double confidence, String marketTrend) {
         if (option == null || ta == null || signalType == null || strategy == null) {
             log.error("Cannot create signal with null parameters");
             return null;
         }
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, "signal-creation")) {
+        if (!isSignalAlignedWithTrend(option, allOptions,ta, marketTrend, "signal-creation")) {
             log.info("[BLOCKED] {} {} not aligned with {} trend",
                     option.getType(), option.getStrikePrice(), marketTrend);
             return null;
@@ -1392,12 +1519,12 @@ public class ZeroDTEStrategy {
         return targetPrice.setScale(2, RoundingMode.HALF_UP);
     }
 
-    private void analyzeUnusualFlow(Option option, TechnicalAnalysis ta,
+    private void analyzeUnusualFlow(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                     List<Signal> signals, String marketTrend, String analysisId) {
-        if (!detectUnusualOptionsFlow(option, analysisId)) {
+        if (!detectUnusualOptionsFlow(option,allOptions,analysisId)) {
             return;
         }
-        if (!isSignalAlignedWithTrend(option, ta, marketTrend, analysisId)) {
+        if (!isSignalAlignedWithTrend(option, allOptions,ta, marketTrend, analysisId)) {
             log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
             return;
         }
@@ -1415,7 +1542,7 @@ public class ZeroDTEStrategy {
         String strategyName = "PUT".equalsIgnoreCase(option.getType()) ?
                 "0DTE_UNUSUAL_FLOW_PUT" : "0DTE_UNUSUAL_FLOW_CALL";
 
-        Signal signal = createSignal(option, ta, "BUY", strategyName, confidence, marketTrend);
+        Signal signal = createSignal(option, allOptions,ta, "BUY", strategyName, confidence, marketTrend);
         signal.setReason(String.format(
                 "🎯 Unusual flow detected - %s %s Vol: %d Premium: $%.0f (%.1fx OI)",
                 option.getType(), option.getStrikePrice(),
@@ -1429,7 +1556,7 @@ public class ZeroDTEStrategy {
     }
 
     // UPDATED TREND ALIGNMENT CHECK
-    private boolean isSignalAlignedWithTrend(Option option, TechnicalAnalysis ta,
+    private boolean isSignalAlignedWithTrend(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                              String marketTrend, String analysisId) {
         log.info("[{}] Market trend: {}, TA trend: {}, Price: ${}, VWAP: ${}",
                 analysisId, marketTrend, ta.getTrend(), ta.getCurrentPrice(), ta.getVwap());
@@ -1447,7 +1574,7 @@ public class ZeroDTEStrategy {
         // STRICT RULE 2: Enforce trend alignment for ALL signals including unusual flow
         boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
 
-        if (detectUnusualOptionsFlow(option, analysisId)) {
+        if (detectUnusualOptionsFlow(option, allOptions,analysisId)) {
             BigDecimal premium = option.getMidPrice()
                     .multiply(BigDecimal.valueOf(option.getVolume()))
                     .multiply(BigDecimal.valueOf(100));
@@ -1477,7 +1604,7 @@ public class ZeroDTEStrategy {
         return aligned;
     }
 
-    private boolean quickSignalValidation(Option option, TechnicalAnalysis ta,
+    private boolean quickSignalValidation(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                           String marketTrend, String analysisId) {
         // Ultra-fast pre-checks before creating signal
 
@@ -1491,7 +1618,7 @@ public class ZeroDTEStrategy {
         boolean isCall = "CALL".equalsIgnoreCase(option.getType());
         boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
 
-        if (!aligned && !detectUnusualOptionsFlow(option, analysisId)) {
+        if (!aligned && !detectUnusualOptionsFlow(option, allOptions,analysisId)) {
             return false; // Not aligned and not unusual flow
         }
 
