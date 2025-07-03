@@ -55,7 +55,7 @@ telegram:
 # Trading configuration - ADD ALL THESE MISSING PROPERTIES
 trading:
   symbol: QQQ
-  total-capital: 2000
+  total-capital: 5000
   max-position-percentage: 50
   min-position-size: 0
   max-position-size: 1000
@@ -151,20 +151,41 @@ trading:
     against-trend-max: 0
 
   trend-detection:
-    weights:
-      immediate: 2.0
-      short-term: 1.0
-      medium-term: 0.5
-    reversal:
+    statistical:
       enabled: true
+      z-score-window: 30
+      bollinger-period: 20
+      bollinger-std-dev: 2.0
+
+    ml:
+      enabled: true
+      prediction-horizon: 5
+      model-timeout-seconds: 2
+      ensemble-weights:
+        lstm: 0.6
+        hmm: 0.4
+
+    integration:
+      weights:
+        statistical: 0.40
+        advanced: 0.35
+        ml: 0.25
+
+      confidence-thresholds:
+        high: 0.85
+        medium: 0.70
+        low: 0.50
+
+      extreme-z-score: 3.0
+      agreement-bonus: 0.10
 
 # Safety Features
 safety:
   trading-enabled: true
   paper-mode: false
   max-daily-loss: 300
-  max-position-value: 500
-  max-open-positions: 3
+  max-position-value: 1000
+  max-open-positions: 10
   emergency-contacts:
     - YOUR_PHONE_NUMBER
 
@@ -198,7 +219,7 @@ tradingbot:
 
     # Position sizing
     default-position-size: 1
-    max-positions: 3
+    max-positions: 10
     max-position-value: 1000
 
     # Risk Management

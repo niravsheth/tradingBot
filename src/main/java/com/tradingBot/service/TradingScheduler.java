@@ -632,8 +632,43 @@ public class TradingScheduler {
 //        }
 //    }
     private final AdvancedTrendDetector advancedTrendDetector;
+    // Add to TradingScheduler class fields
+    private final IntegratedTrendService integratedTrendService;
+
+    // Replace getQQQTrend() method
     public String getQQQTrend() {
-        return advancedTrendDetector.detectTrend("QQQ");
+        try {
+            IntegratedTrendService.IntegratedTrendAnalysis analysis =
+                    integratedTrendService.getComprehensiveTrend("QQQ");
+
+            log.info("[TREND] Integrated Analysis - Final: {} ({}%), Statistical: {} (z={}), ML: {}",
+                    analysis.getFinalTrend(),
+                    (int)(analysis.getConfidence() * 100),
+                    analysis.getStatisticalTrend(),
+                    String.format("%.2f", analysis.getZScore()),
+                    analysis.getMlPrediction());
+
+            // Add Telegram alert for extreme z-scores
+            if (Math.abs(analysis.getZScore()) > 3.0) {
+                telegramService.sendMessage(String.format(
+                        "🎯 EXTREME TREND SIGNAL\n" +
+                                "Trend: %s\n" +
+                                "Z-Score: %.2f (3σ event)\n" +
+                                "Confidence: %d%%\n" +
+                                "Regime: %s",
+                        analysis.getFinalTrend(),
+                        analysis.getZScore(),
+                        (int)(analysis.getConfidence() * 100),
+                        analysis.getMarketRegime()
+                ));
+            }
+
+            return analysis.getFinalTrend();
+
+        } catch (Exception e) {
+            log.error("Error in integrated trend detection, falling back to advanced detector: {}", e.getMessage());
+            return advancedTrendDetector.detectTrend("QQQ");
+        }
     }
 
     private double analyzeQQQComponentsCached() {
