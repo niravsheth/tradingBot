@@ -53,133 +53,8 @@ telegram:
     chat-id: 1368492647
 
 # Trading configuration - ADD ALL THESE MISSING PROPERTIES
-trading:
-  symbol: QQQ
-  total-capital: 5000
-  max-position-percentage: 50
-  min-position-size: 0
-  max-position-size: 1000
-
-  # ADD THIS - Capital allocation by confidence level
-  confidence-allocation:
-    high: 0.60    # 60% of available capital for high confidence (>0.8)
-    medium: 0.20  # 20% of available capital for medium confidence (0.6-0.8)
-    low: 0.10     # 10% of available capital for low confidence (<0.6)
-
-  risk-percentage: 2.0
-  min-volume: 10
-  min-iv: 0.15
-  max-spread-percentage: 10.0
-  start-hour: 10
-  start-minute: 0
-  end-hour: 15
-  end-minute: 30
-  signal-expiration-minutes: 5
-  min-volume-ratio: 1.0
-
-  # Trend filtering
-  trend-filter:
-    enabled: true
-    strict-mode: true
-    neutral-allows-all: false
-
-  # Signal timing
-  signal-expiration:
-    unusual-flow: 2
-    scalp: 4
-    breakout: 5
-    default: 4
-    near-close: 1
-    high-confidence: 3
-
-  # Execution frequency
-  execution:
-    frequency-seconds: 5
-    high-priority-threshold: 0.85
-
-  # Late session rules
-  late-session:
-    start-time: "15:30"
-    min-confidence: 0.90
-
-  # Price movement limits
-  price-movement:
-    max-option-price-change: 0.15
-    max-underlying-change: 0.01
-
-  # Neutral market
-  neutral-market:
-    allow-trades: false
-    allow-unusual-flow: false
-
-  # Position monitoring
-  monitoring:
-    frequency-seconds: 10
-
-  # Trailing stops
-  trailing-stop:
-    enabled: true
-    start-profit: 0.02
-    breakeven-profit: 0.05
-    levels:
-      - profit: 0.02
-        stop: 0.98
-      - profit: 0.05
-        stop: 1.02
-      - profit: 0.10
-        stop: 0.75
-      - profit: 0.20
-        stop: 0.80
-      - profit: 0.30
-        stop: 0.85
-      - profit: 0.50
-        stop: 0.90
-
-  # Strategies
-  strategies:
-    enabled:
-      - UNUSUAL_FLOW
-      - OPENING_DRIVE
-      - VWAP_BREAKOUT
-      - VWAP_REVERSION
-    max-concurrent: 2
-
-  # Position limits by trend
-  trend-based-limits:
-    enabled: true
-    with-trend-max: 3
-    against-trend-max: 0
-
-  trend-detection:
-    statistical:
-      enabled: true
-      z-score-window: 30
-      bollinger-period: 20
-      bollinger-std-dev: 2.0
-
-    ml:
-      enabled: true
-      prediction-horizon: 5
-      model-timeout-seconds: 2
-      ensemble-weights:
-        lstm: 0.6
-        hmm: 0.4
-
-    integration:
-      weights:
-        statistical: 0.40
-        advanced: 0.35
-        ml: 0.25
-
-      confidence-thresholds:
-        high: 0.85
-        medium: 0.70
-        low: 0.50
-
-      extreme-z-score: 3.0
-      agreement-bonus: 0.10
-
 # Safety Features
+
 safety:
   trading-enabled: true
   paper-mode: false
@@ -188,8 +63,8 @@ safety:
   max-open-positions: 10
   emergency-contacts:
     - YOUR_PHONE_NUMBER
-
 # NEW STRUCTURE - Keep for newer components
+
 tradingbot:
   # Thread Pool Settings
   thread-pools:
@@ -246,8 +121,149 @@ tradingbot:
   telegram:
     bot-token: 7074621534:AAEUOUplsrPrpZgG0ghx7EU5efrHFdkkRbs
     chat-id: 1368492647
-
 # Logging Configuration
+
+# Trading configuration - CONSOLIDATED ALL SETTINGS HERE
+trading:
+  # Core trading settings
+  symbol: QQQ
+  total-capital: 5000
+  max-position-size: 1000
+  max-position-percentage: 50
+  min-position-size: 0
+
+  # Risk management (consolidated from safety and risk sections)
+  max-daily-loss: 300        # Maximum daily loss allowed
+  max-open-positions: 10     # Maximum concurrent positions
+  risk-percentage: 2.0       # Risk per trade
+  max-position-loss: 300     # Maximum loss per position
+
+  # Capital allocation by confidence level
+  confidence-allocation:
+    high: 0.60    # 60% of available capital for high confidence (>0.8)
+    medium: 0.20  # 20% of available capital for medium confidence (0.6-0.8)
+    low: 0.10     # 10% of available capital for low confidence (<0.6)
+
+  # Option filtering
+  min-volume: 10
+  min-iv: 0.15
+  max-spread-percentage: 10.0
+
+  # Trading hours
+  start-hour: 10
+  start-minute: 0
+  end-hour: 15
+  end-minute: 30
+
+  # Signal settings
+  signal-expiration-minutes: 5
+  min-volume-ratio: 1.0
+
+  # Trend filtering
+  trend-filter:
+    enabled: true
+    strict-mode: true
+    neutral-allows-all: false
+
+  # Signal timing
+  signal-expiration:
+    unusual-flow: 2
+    scalp: 4
+    breakout: 5
+    default: 4
+    near-close: 1
+    high-confidence: 3
+
+  # Execution frequency
+  execution:
+    frequency-seconds: 5
+    high-priority-threshold: 0.85
+
+  # Late session rules
+  late-session:
+    start-time: "15:30"
+    min-confidence: 0.90
+
+  # Price movement limits
+  price-movement:
+    max-option-price-change: 0.15
+    max-underlying-change: 0.01
+
+  # Neutral market
+  neutral-market:
+    allow-trades: false
+    allow-unusual-flow: false
+
+  # Position monitoring
+  monitoring:
+    frequency-seconds: 10
+
+  # Trailing stops
+  trailing-stop:
+    enabled: true
+    start-profit: 0.02
+    breakeven-profit: 0.05
+    activation: 0.05      # Start trailing after 5% profit
+    distance: 0.10        # Trail by 10% from high
+    levels:
+      - profit: 0.02
+        stop: 0.98
+      - profit: 0.05
+        stop: 1.02
+      - profit: 0.10
+        stop: 0.75
+      - profit: 0.20
+        stop: 0.80
+      - profit: 0.30
+        stop: 0.85
+      - profit: 0.50
+        stop: 0.90
+
+  # Strategies
+  strategies:
+    enabled:
+      - UNUSUAL_FLOW
+      - OPENING_DRIVE
+      - VWAP_BREAKOUT
+      - VWAP_REVERSION
+    max-concurrent: 2
+
+  # Position limits by trend
+  trend-based-limits:
+    enabled: true
+    with-trend-max: 3
+    against-trend-max: 0
+
+  # Trend detection
+  trend-detection:
+    statistical:
+      enabled: true
+      z-score-window: 30
+      bollinger-period: 20
+      bollinger-std-dev: 2.0
+
+    ml:
+      enabled: true
+      prediction-horizon: 5
+      model-timeout-seconds: 2
+      ensemble-weights:
+        lstm: 0.6
+        hmm: 0.4
+
+    integration:
+      weights:
+        statistical: 0.40
+        advanced: 0.35
+        ml: 0.25
+
+      confidence-thresholds:
+        high: 0.85
+        medium: 0.70
+        low: 0.50
+
+      extreme-z-score: 3.0
+      agreement-bonus: 0.10
+
 logging:
   level:
     root: INFO

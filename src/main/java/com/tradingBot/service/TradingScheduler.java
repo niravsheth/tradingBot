@@ -47,7 +47,7 @@ public class TradingScheduler {
     @Value("${trading.symbol}")
     private String tradingSymbol;
 
-    @Scheduled(cron = "0 * 9-16 * * MON-FRI")
+    @Scheduled(cron = "*/15 * 9-16 * * MON-FRI")
     public void analyzeMarketAndGenerateSignals() {
         String requestId = UUID.randomUUID().toString().substring(0, 8);
         LocalTime now = LocalTime.now();
