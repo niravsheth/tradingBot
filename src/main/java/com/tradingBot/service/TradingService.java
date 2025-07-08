@@ -16,6 +16,7 @@ import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -50,11 +51,26 @@ public class TradingService {
         String executionId = UUID.randomUUID().toString().substring(0, 8);
         log.info("[v62][{}] === SIGNAL EXECUTION START ===", executionId);
 
-        // Get fresh signals prioritized by confidence and age
+        // Use the repository method
         List<Signal> signals = signalRepository
-                .findFreshUnexecutedSignalsPrioritized(LocalDateTime.now());
+                .findByStatusAndExpirationTimeAfter("PENDING", LocalDateTime.now());
 
-        log.info("[v62][{}] Found {} fresh unexecuted signals", executionId, signals.size());
+        // Additional filtering if needed
+        signals = signals.stream()
+                .filter(s -> !s.getExecuted())
+                .sorted(Comparator.comparing(Signal::getConfidence).reversed())
+                .collect(Collectors.toList());
+
+        log.info("[v62][{}] Found {} confirmed signals ready for execution", executionId, signals.size());
+
+
+
+
+//        // Get fresh signals prioritized by confidence and age
+//        List<Signal> signals = signalRepository
+//                .findFreshUnexecutedSignalsPrioritized(LocalDateTime.now());
+//
+//        log.info("[v62][{}] Found {} fresh unexecuted signals", executionId, signals.size());
 
         if (!signals.isEmpty()) {
             // Log signal details

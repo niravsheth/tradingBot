@@ -1,15 +1,13 @@
 package com.tradingBot.ml;
 
-import com.tradingBot.entity.Signal;
 import com.tradingBot.analytics.MarketMicrostructureAnalyzer;
+import com.tradingBot.entity.Signal;
 import com.tradingBot.analytics.MarketRegimeDetector;
-import com.tradingBot.entity.MarketMicrostructureData;
 import com.tradingBot.model.MarketRegime;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
-import java.time.LocalTime;
 import java.util.HashMap;
 import java.util.Map;
 

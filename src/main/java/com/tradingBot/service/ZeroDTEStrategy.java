@@ -52,7 +52,7 @@ public class ZeroDTEStrategy {
     private static final LocalTime OPENING_RANGE_END = LocalTime.of(9, 45);
     private static final LocalTime MORNING_SESSION_END = LocalTime.of(11, 30);
     private static final LocalTime PRIME_WINDOW_1_START = LocalTime.of(9, 45);
-    private static final LocalTime PRIME_WINDOW_1_END = LocalTime.of(10, 15);
+    private static final LocalTime PRIME_WINDOW_1_END = LocalTime.of(10, 30);
     private static final LocalTime PRIME_WINDOW_2_START = LocalTime.of(10, 30);
     private static final LocalTime PRIME_WINDOW_2_END = LocalTime.of(12, 00);
     private static final LocalTime PRIME_WINDOW_3_START = LocalTime.of(13, 00);
@@ -331,9 +331,9 @@ public class ZeroDTEStrategy {
     private boolean detectOpeningDrive(TechnicalAnalysis ta, String analysisId) {
         LocalTime now = LocalTime.now(ET_ZONE);
 
-        if (!now.isAfter(LocalTime.of(9, 30)) || !now.isBefore(LocalTime.of(10, 00))) {
-            return false;
-        }
+//        if (!now.isAfter(LocalTime.of(9, 30)) || !now.isBefore(LocalTime.of(10, 00))) {
+//            return false;
+//        }
 
         BigDecimal gap = calculatePremarketGap(ta);
         boolean hasGap = gap.abs().compareTo(BigDecimal.valueOf(0.005)) > 0;
@@ -509,59 +509,48 @@ public class ZeroDTEStrategy {
                                                            String analysisId) {
         BigDecimal currentPrice = ta.getCurrentPrice();
 
-        // GET ACTUAL STRIKE INTERVALS
-        Set<BigDecimal> strikes = options.stream()
-                .map(Option::getStrikePrice)
-                .collect(Collectors.toCollection(TreeSet::new));
+        log.info("[v63][{}] Current QQQ price: ${}", analysisId, currentPrice);
 
-        // Find the ATM strike
-        BigDecimal atmStrike = findATMStrike(strikes, currentPrice);
-
-        // Determine strike interval (usually $1 for QQQ)
-        BigDecimal strikeInterval = determineStrikeInterval(strikes);
-
-        log.info("[v63][{}] Current price: ${}, ATM strike: ${}, Interval: ${}",
-                analysisId, currentPrice, atmStrike, strikeInterval);
-
-        // FILTER TO ONLY ATM AND 1 STRIKE OTM
+        // For 0DTE, we want ATM and 1 strike OTM only
         List<Option> filtered = options.stream()
                 .filter(option -> {
                     BigDecimal strike = option.getStrikePrice();
-                    BigDecimal strikesAway = strike.subtract(atmStrike)
-                            .divide(strikeInterval, 0, RoundingMode.HALF_UP).abs();
-
-                    // For 0DTE, we want ONLY:
-                    // - ATM (0 strikes away)
-                    // - 1 strike OTM
-                    // NO ITM OPTIONS for 0DTE
+                    BigDecimal distance = currentPrice.subtract(strike).abs();
 
                     boolean isCall = "CALL".equalsIgnoreCase(option.getType());
                     boolean isPut = "PUT".equalsIgnoreCase(option.getType());
 
                     if (isCall) {
-                        // For calls: ATM or 1 strike above
-                        boolean isATM = strike.equals(atmStrike);
-                        boolean is1OTM = strike.equals(atmStrike.add(strikeInterval));
-                        return isATM || is1OTM;
+                        // For calls: ATM or 1-2 strikes above current price
+                        // If QQQ = 553.30, accept 554, 555
+                        return strike.compareTo(currentPrice) >= 0 &&
+                                strike.compareTo(currentPrice.add(BigDecimal.valueOf(2))) <= 0;
                     } else if (isPut) {
-                        // For puts: ATM or 1 strike below
-                        boolean isATM = strike.equals(atmStrike);
-                        boolean is1OTM = strike.equals(atmStrike.subtract(strikeInterval));
-                        return isATM || is1OTM;
+                        // For puts: ATM or 1-2 strikes below current price
+                        // If QQQ = 553.30, accept 553, 552
+                        return strike.compareTo(currentPrice.subtract(BigDecimal.valueOf(2))) >= 0 &&
+                                strike.compareTo(currentPrice) <= 0;
                     }
 
                     return false;
                 })
+                .sorted((o1, o2) -> {
+                    // Sort by distance from current price (closest first)
+                    BigDecimal dist1 = o1.getStrikePrice().subtract(currentPrice).abs();
+                    BigDecimal dist2 = o2.getStrikePrice().subtract(currentPrice).abs();
+                    return dist1.compareTo(dist2);
+                })
                 .collect(Collectors.toList());
 
-        log.info("[v63][{}] Strike filtering: {} options -> {} (ATM + 1 OTM only)",
-                analysisId, options.size(), filtered.size());
-
         // Log selected strikes
+        log.info("[v63][{}] Strike filtering for price ${}: Found {} options",
+                analysisId, currentPrice, filtered.size());
+
         filtered.forEach(opt -> {
-            log.info("[v63][{}] Selected: {} {} - {} strikes from ATM",
+            BigDecimal distance = opt.getStrikePrice().subtract(currentPrice);
+            log.info("[v63][{}] Selected: {} ${} (${} from current)",
                     analysisId, opt.getType(), opt.getStrikePrice(),
-                    opt.getStrikePrice().subtract(atmStrike).divide(strikeInterval, 0, RoundingMode.HALF_UP).abs());
+                    distance.compareTo(BigDecimal.ZERO) > 0 ? "+" + distance : distance);
         });
 
         return filtered;
@@ -1106,45 +1095,40 @@ public class ZeroDTEStrategy {
 
     private void saveSignals(List<Signal> signals, TechnicalAnalysis ta, String marketTrend, String analysisId) {
         for (Signal signal : signals) {
-            // Dynamic expiration based on strategy and market conditions
-            int expirationMinutes = calculateDynamicExpiration(signal, ta);
-            LocalDateTime expirationTime = LocalDateTime.now().plusMinutes(expirationMinutes);
-
-            signal.setExpirationTime(expirationTime);
-            signal.setStatus("PENDING");
-            signal.setCreatedAt(LocalDateTime.now()); // Track exact creation time
+            // Set initial status to TRACKING instead of PENDING
+            signal.setStatus("TRACKING"); // <-- KEY CHANGE
+            signal.setCreatedAt(LocalDateTime.now());
             signal.setEntryAssumptionPrice(ta.getCurrentPrice());
             signal.setMarketTrend(marketTrend);
-
-            // Store current option price for validation
             signal.setOriginalOptionPrice(signal.getEntryPrice());
+
+            // Set expiration to longer time since we need confirmation time
+            LocalDateTime expirationTime = LocalDateTime.now().plusMinutes(10); // 10 minutes instead of 5
+            signal.setExpirationTime(expirationTime);
 
             signalRepository.save(signal);
 
-            log.info("[v63][{}] SAVED {} - {} {}, Confidence: {}%, Expires in {} min at {}",
+            log.info("[v63][{}] TRACKING {} - {} {}, Confidence: {}%, Awaiting confirmation",
                     analysisId, signal.getStrategy(), signal.getSignalType(),
-                    signal.getOptionSymbol(), (int)(signal.getConfidence() * 100),
-                    expirationMinutes, expirationTime.toLocalTime());
+                    signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
 
             // Alert for high-priority signals
             if (signal.getConfidence() >= 0.85 || signal.getStrategy().contains("UNUSUAL_FLOW")) {
                 telegramService.sendMessage(String.format(
-                        "🚨 HIGH PRIORITY SIGNAL\n" +
+                        "🔍 TRACKING HIGH PRIORITY SIGNAL\n" +
                                 "Strategy: %s\n" +
                                 "Option: %s\n" +
                                 "Confidence: %d%%\n" +
                                 "Entry: $%.2f\n" +
-                                "Expires: %d minutes",
+                                "Status: Awaiting confirmation...",
                         signal.getStrategy(),
                         signal.getOptionSymbol(),
                         (int)(signal.getConfidence() * 100),
-                        signal.getEntryPrice(),
-                        expirationMinutes
+                        signal.getEntryPrice()
                 ));
             }
         }
     }
-
     private int calculateDynamicExpiration(Signal signal, TechnicalAnalysis ta) {
         String strategy = signal.getStrategy();
         LocalTime now = LocalTime.now(ET_ZONE);

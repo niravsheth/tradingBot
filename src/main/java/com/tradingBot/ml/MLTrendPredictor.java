@@ -2,7 +2,6 @@ package com.tradingBot.ml;
 
 import com.tradingBot.entity.MarketData;
 import com.tradingBot.repository.MarketDataRepository;
-import com.tradingBot.service.StatisticalTrendDetector.TrendAnalysis;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

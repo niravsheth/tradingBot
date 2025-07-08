@@ -17,7 +17,6 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 @RequiredArgsConstructor
 public class SignalOrchestrator {
-    private final OrchestratorMonitoringService monitoringService;
     private static final ZoneId ET_ZONE = ZoneId.of("America/New_York");
 
     // FIXED: Updated strategy priorities to include 0DTE strategies properly
@@ -69,8 +68,6 @@ public class SignalOrchestrator {
                 ta.getMarketRegime(),
                 regimeFiltered.size() - conflictResolved.size(),
                 conflictResolved.size() - rateLimited.size());
-
-        monitoringService.logOrchestratorDecision(analysisId, rawSignals, finalSignals, reason);
 
         log.info("[ORCHESTRATOR][{}] Final signals: {} (reduced from {})",
                 analysisId, finalSignals.size(), rawSignals.size());

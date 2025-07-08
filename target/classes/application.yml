@@ -94,12 +94,12 @@ tradingbot:
 
     # Position sizing
     default-position-size: 1
-    max-positions: 10
+    max-positions: 100
     max-position-value: 1000
 
     # Risk Management
     risk:
-      max-daily-loss: 2000
+      max-daily-loss: 1000
       max-position-loss: 300
       trailing-stop-activation: 0.05
       trailing-stop-distance: 0.10
@@ -127,7 +127,7 @@ tradingbot:
 trading:
   # Core trading settings
   symbol: QQQ
-  total-capital: 5000
+  total-capital: 1000
   max-position-size: 1000
   max-position-percentage: 50
   min-position-size: 0
@@ -263,6 +263,14 @@ trading:
 
       extreme-z-score: 3.0
       agreement-bonus: 0.10
+
+  confirmation:
+    enabled: true
+    breakout-hold-candles: 2
+    pullback-required: true
+    volume-surge-multiplier: 1.5
+    max-tracking-minutes: 5
+    reversion-pullback-percent: 0.2
 
 logging:
   level:
