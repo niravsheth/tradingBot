@@ -1,7 +1,7 @@
 # Application Configuration
 spring:
   application:
-    name: TradingBot
+    name: QQQTradingBot
 
   # Database Configuration
   datasource:
@@ -37,13 +37,12 @@ spring:
         max-size: 20
         queue-capacity: 100
 
-# OLD STRUCTURE - For existing @Value annotations
+# API Configuration
 tradier:
   api:
     key: h3zGBQqRK3OSrA5wKQYQi2I6FfUI
     base-url: https://api.tradier.com/v1
     sandbox-url: https://sandbox.tradier.com/v1
-    sandbox: false
     account-id: 6YB56930
     use-sandbox: false
 
@@ -52,19 +51,181 @@ telegram:
     token: 7074621534:AAEUOUplsrPrpZgG0ghx7EU5efrHFdkkRbs
     chat-id: 1368492647
 
-# Trading configuration - ADD ALL THESE MISSING PROPERTIES
-# Safety Features
-
+# Safety Configuration
 safety:
   trading-enabled: true
   paper-mode: false
-  max-daily-loss: 300
-  max-position-value: 1000
+  max-daily-loss: 1000
+  max-position-value: 500
   max-open-positions: 10
-  emergency-contacts:
-    - YOUR_PHONE_NUMBER
-# NEW STRUCTURE - Keep for newer components
 
+# Trading Configuration
+trading:
+  # Core settings
+  symbol: QQQ
+  total-capital: 1000
+  max-position-size: 1000
+  max-position-percentage: 50
+  min-position-size: 0
+  risk-percentage: 2.0
+
+  # Option filtering
+  min-volume: 10
+  min-iv: 0.15
+  max-spread-percentage: 10.0
+
+  # Trading hours
+  start-hour: 10
+  start-minute: 0
+  end-hour: 15
+  end-minute: 30
+
+  # Signal settings
+  signal-expiration-minutes: 5
+  min-volume-ratio: 1.0
+
+  # Capital allocation by confidence
+  confidence-allocation:
+    high: 0.60      # 60% for confidence > 0.8
+    medium: 0.20    # 20% for confidence 0.6-0.8
+    low: 0.10       # 10% for confidence < 0.6
+
+  # Execution settings
+  execution:
+    frequency-seconds: 5
+    high-priority-threshold: 0.85
+    ml-threshold: 0.65
+    account-value: 100000
+
+  # Position monitoring
+  monitoring:
+    frequency-seconds: 10
+    check-interval-ms: 30000
+    trend-update-interval: 60000
+    health-check-interval: 300000
+
+  # Trailing stop configuration
+  trailing-stop:
+    enabled: true
+    trigger-profit: 0.30    # Start trailing after 30% profit
+    distance: 0.20          # Trail by 20% from high
+    activation: 0.05        # Alternative: start at 5% profit
+    levels:
+      - profit: 0.02
+        stop: 0.98
+      - profit: 0.05
+        stop: 1.02
+      - profit: 0.10
+        stop: 0.75
+      - profit: 0.20
+        stop: 0.80
+      - profit: 0.30
+        stop: 0.85
+      - profit: 0.50
+        stop: 0.90
+
+  # Late session rules
+  late-session:
+    start-time: "15:30"
+    min-confidence: 0.90
+
+  # Price movement limits
+  price-movement:
+    max-option-price-change: 0.15    # 15% max
+    max-underlying-change: 0.01      # 1% max
+
+  # Neutral market handling
+  neutral-market:
+    allow-trades: false
+    allow-unusual-flow: false
+
+  # Signal confirmation
+  confirmation:
+    enabled: true
+    breakout-hold-candles: 2
+    pullback-required: true
+    volume-surge-multiplier: 1.5
+    max-tracking-minutes: 5
+    reversion-pullback-percent: 0.2
+
+  # Enhanced trend detection configuration
+  trend-detection:
+    # Choose service: enhanced (recommended), simple, or integrated
+    service-type: enhanced
+
+    # Enhanced trend service settings
+    enhanced:
+      enabled: true
+      cache-ttl-seconds: 10
+
+      # ML configuration
+      ml:
+        enabled: true
+        timeout-ms: 500          # Fast timeout to prevent delays
+        weight: 0.25             # ML influence on final trend
+        min-confidence-to-override: 0.8
+
+      # Component weights (should sum to ~1.0)
+      weights:
+        momentum: 0.35      # Short-term price movement
+        volume: 0.20        # Volume analysis
+        microstructure: 0.15 # Bid/ask imbalance
+        regime: 0.15        # Market regime alignment
+        statistical: 0.15   # Z-score and Bollinger
+
+      # Base trend thresholds
+      base-trend:
+        momentum-3min: 8     # 0.08% for 3-minute
+        momentum-5min: 15    # 0.15% for 5-minute
+        momentum-day: 25     # 0.25% for daily
+        up-threshold: 4.0
+        down-threshold: -4.0
+        strong-threshold: 8.0
+
+      # Statistical factors
+      statistical:
+        enabled: true
+        z-score-boost-threshold: 2.5
+        bollinger-period: 20
+
+      # Volume analysis
+      volume:
+        enabled: true
+        surge-threshold: 1.5
+        confirmation-boost: 2.0
+
+      # Microstructure analysis
+      microstructure:
+        enabled: true
+        imbalance-threshold: 0.65
+        confidence-boost: 1.1
+
+      # Market regime adjustments
+      regime:
+        enabled: true
+        trending-boost: 1.15
+        choppy-penalty: 0.7
+        high-vol-penalty: 0.85
+
+      # Alert thresholds
+      alerts:
+        extreme-z-score: 3.0
+        ml-confirmation: 0.8
+        min-confidence: 0.75
+
+    # Performance monitoring
+    performance:
+      log-detailed-analysis: true
+      log-interval-seconds: 60
+      track-calculation-time: true
+      warn-if-slower-than-ms: 100
+
+    # Fallback settings
+    fallback:
+      on-ml-timeout: use-base
+      on-calculation-error: neutral
+
+# TradingBot Configuration
 tradingbot:
   # Thread Pool Settings
   thread-pools:
@@ -104,180 +265,66 @@ tradingbot:
       trailing-stop-activation: 0.05
       trailing-stop-distance: 0.10
 
-  # Monitoring Settings
-  monitoring:
-    position-check-interval: 30000
-    trend-update-interval: 60000
-    health-check-interval: 300000
+    execution-mode: INSTITUTIONAL
+    max-execution-latency-ms: 500
 
-  # API Configuration
-  tradier:
-    base-url: https://api.tradier.com/v1
-    sandbox-url: https://sandbox.tradier.com/v1
-    use-sandbox: false
-    api-key: h3zGBQqRK3OSrA5wKQYQi2I6FfUI
-    account-id: 6YB56930
+    pre-trade:
+      max-vix: 35
+      min-market-breadth: 0.3
+      max-daily-trades: 20
+      max-position-risk: 1000
 
-  telegram:
-    bot-token: 7074621534:AAEUOUplsrPrpZgG0ghx7EU5efrHFdkkRbs
-    chat-id: 1368492647
+    kelly:
+      fraction: 0.25  # 1/4 Kelly
+      min-trades: 20  # Minimum history needed
+      max-position-percentage: 5
+      min-contracts: 1
+      max-contracts: 20
+
+    # Update existing
+    signal-expiration-minutes: 0.5  # 30 seconds
+
 # Logging Configuration
-
-# Trading configuration - CONSOLIDATED ALL SETTINGS HERE
-trading:
-  # Core trading settings
-  symbol: QQQ
-  total-capital: 1000
-  max-position-size: 1000
-  max-position-percentage: 50
-  min-position-size: 0
-
-  # Risk management (consolidated from safety and risk sections)
-  max-daily-loss: 300        # Maximum daily loss allowed
-  max-open-positions: 10     # Maximum concurrent positions
-  risk-percentage: 2.0       # Risk per trade
-  max-position-loss: 300     # Maximum loss per position
-
-  # Capital allocation by confidence level
-  confidence-allocation:
-    high: 0.60    # 60% of available capital for high confidence (>0.8)
-    medium: 0.20  # 20% of available capital for medium confidence (0.6-0.8)
-    low: 0.10     # 10% of available capital for low confidence (<0.6)
-
-  # Option filtering
-  min-volume: 10
-  min-iv: 0.15
-  max-spread-percentage: 10.0
-
-  # Trading hours
-  start-hour: 10
-  start-minute: 0
-  end-hour: 15
-  end-minute: 30
-
-  # Signal settings
-  signal-expiration-minutes: 5
-  min-volume-ratio: 1.0
-
-  # Trend filtering
-  trend-filter:
-    enabled: true
-    strict-mode: true
-    neutral-allows-all: false
-
-  # Signal timing
-  signal-expiration:
-    unusual-flow: 2
-    scalp: 4
-    breakout: 5
-    default: 4
-    near-close: 1
-    high-confidence: 3
-
-  # Execution frequency
-  execution:
-    frequency-seconds: 5
-    high-priority-threshold: 0.85
-
-  # Late session rules
-  late-session:
-    start-time: "15:30"
-    min-confidence: 0.90
-
-  # Price movement limits
-  price-movement:
-    max-option-price-change: 0.15
-    max-underlying-change: 0.01
-
-  # Neutral market
-  neutral-market:
-    allow-trades: false
-    allow-unusual-flow: false
-
-  # Position monitoring
-  monitoring:
-    frequency-seconds: 10
-
-  # Trailing stops
-  trailing-stop:
-    enabled: true
-    start-profit: 0.02
-    breakeven-profit: 0.05
-    activation: 0.05      # Start trailing after 5% profit
-    distance: 0.10        # Trail by 10% from high
-    levels:
-      - profit: 0.02
-        stop: 0.98
-      - profit: 0.05
-        stop: 1.02
-      - profit: 0.10
-        stop: 0.75
-      - profit: 0.20
-        stop: 0.80
-      - profit: 0.30
-        stop: 0.85
-      - profit: 0.50
-        stop: 0.90
-
-  # Strategies
-  strategies:
-    enabled:
-      - UNUSUAL_FLOW
-      - OPENING_DRIVE
-      - VWAP_BREAKOUT
-      - VWAP_REVERSION
-    max-concurrent: 2
-
-  # Position limits by trend
-  trend-based-limits:
-    enabled: true
-    with-trend-max: 3
-    against-trend-max: 0
-
-  # Trend detection
-  trend-detection:
-    statistical:
-      enabled: true
-      z-score-window: 30
-      bollinger-period: 20
-      bollinger-std-dev: 2.0
-
-    ml:
-      enabled: true
-      prediction-horizon: 5
-      model-timeout-seconds: 2
-      ensemble-weights:
-        lstm: 0.6
-        hmm: 0.4
-
-    integration:
-      weights:
-        statistical: 0.40
-        advanced: 0.35
-        ml: 0.25
-
-      confidence-thresholds:
-        high: 0.85
-        medium: 0.70
-        low: 0.50
-
-      extreme-z-score: 3.0
-      agreement-bonus: 0.10
-
-  confirmation:
-    enabled: true
-    breakout-hold-candles: 2
-    pullback-required: true
-    volume-surge-multiplier: 1.5
-    max-tracking-minutes: 5
-    reversion-pullback-percent: 0.2
-
 logging:
   level:
     root: INFO
     com.tradingBot: DEBUG
     org.springframework.web: INFO
     org.hibernate: WARN
+    com.tradingBot.ml: INFO
+    com.tradingBot.analytics: INFO
+    com.tradingBot.service.EnhancedTrendService: DEBUG
   pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
     file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+# ML Model Configuration (for MLTrendPredictor)
+ml:
+  models:
+    lstm:
+      enabled: true
+      weight: 0.6
+
+    hmm:
+      enabled: true
+      weight: 0.4
+
+  # Feature extraction
+  features:
+    lookback-periods: [5, 10, 20, 30]
+
+  # Prediction settings
+  prediction:
+    horizon-minutes: 5
+    min-data-points: 10
+
+# Performance Settings
+performance:
+  cache:
+    quote-ttl-seconds: 10
+    vwap-ttl-seconds: 60
+    component-quote-ttl-seconds: 30
+
+  monitoring:
+    metrics-enabled: true
+    slow-query-threshold-ms: 1000

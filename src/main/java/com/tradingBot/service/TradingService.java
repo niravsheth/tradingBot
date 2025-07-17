@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 @Service
@@ -32,6 +33,10 @@ public class TradingService {
     private final SignalMLScorer signalMLScorer;
 
     private final SignalRepository signalRepository;
+
+    private final ExecutionPipeline executionPipeline;
+    private final PreTradeRiskEngine preTradeRiskEngine;
+
     private final SafetyService safetyService;
     private final MarketDataRepository marketDataRepository;
     private final CapitalAllocationService capitalAllocationService;
@@ -49,62 +54,83 @@ public class TradingService {
     @Transactional
     public void executeSignals() {
         String executionId = UUID.randomUUID().toString().substring(0, 8);
-        log.info("[v62][{}] === SIGNAL EXECUTION START ===", executionId);
+        log.info("[INST][{}] === INSTITUTIONAL EXECUTION START ===", executionId);
 
-        // Use the repository method
+        // Get pending signals - NO tracking status anymore
         List<Signal> signals = signalRepository
-                .findByStatusAndExpirationTimeAfter("PENDING", LocalDateTime.now());
-
-        // Additional filtering if needed
-        signals = signals.stream()
+                .findByStatusAndExpirationTimeAfter("PENDING", LocalDateTime.now())
+                .stream()
                 .filter(s -> !s.getExecuted())
-                .sorted(Comparator.comparing(Signal::getConfidence).reversed())
+                .sorted((s1, s2) -> {
+                    // Priority: Unusual flow first, then by confidence
+                    if (s1.getStrategy().contains("UNUSUAL_FLOW") &&
+                            !s2.getStrategy().contains("UNUSUAL_FLOW")) {
+                        return -1;
+                    }
+                    if (!s1.getStrategy().contains("UNUSUAL_FLOW") &&
+                            s2.getStrategy().contains("UNUSUAL_FLOW")) {
+                        return 1;
+                    }
+                    return Double.compare(s2.getConfidence(), s1.getConfidence());
+                })
                 .collect(Collectors.toList());
 
-        log.info("[v62][{}] Found {} confirmed signals ready for execution", executionId, signals.size());
-
-
-
-
-//        // Get fresh signals prioritized by confidence and age
-//        List<Signal> signals = signalRepository
-//                .findFreshUnexecutedSignalsPrioritized(LocalDateTime.now());
-//
-//        log.info("[v62][{}] Found {} fresh unexecuted signals", executionId, signals.size());
+        log.info("[INST][{}] Found {} signals ready for immediate execution",
+                executionId, signals.size());
 
         if (!signals.isEmpty()) {
-            // Log signal details
-            for (Signal signal : signals) {
-                long secondsToExpiration = Duration.between(
-                        LocalDateTime.now(), signal.getExpirationTime()).getSeconds();
-                log.info("[v62][{}] Pending: {} - Confidence: {}%, Expires in {}s",
-                        executionId, signal.getOptionSymbol(),
-                        (int)(signal.getConfidence() * 100), secondsToExpiration);
+            // Check if market is suitable ONCE
+            if (!preTradeRiskEngine.isMarketSuitable()) {
+                log.warn("[INST][{}] Market conditions unsuitable - blocking all executions",
+                        executionId);
+
+                // Mark all signals as blocked
+                signals.forEach(signal -> {
+                    signal.setStatus("MARKET_UNSUITABLE");
+                    signal.setExecuted(true);
+                    signalRepository.save(signal);
+                });
+                return;
+            }
+
+            // Execute high priority signals immediately
+            List<Signal> urgentSignals = signals.stream()
+                    .filter(s -> s.getStrategy().contains("UNUSUAL_FLOW") ||
+                            s.getConfidence() >= 0.85)
+                    .limit(3) // Max 3 simultaneous executions
+                    .collect(Collectors.toList());
+
+            if (!urgentSignals.isEmpty()) {
+                log.info("[INST][{}] Executing {} URGENT signals immediately",
+                        executionId, urgentSignals.size());
+
+                // Execute in parallel for speed
+                List<CompletableFuture<Trade>> futures = urgentSignals.stream()
+                        .map(signal -> executionPipeline.executeImmediately(signal))
+                        .collect(Collectors.toList());
+
+                // Wait for all to complete
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                        .join();
+            }
+
+            // Execute remaining signals sequentially
+            List<Signal> remainingSignals = signals.stream()
+                    .filter(s -> !urgentSignals.contains(s))
+                    .collect(Collectors.toList());
+
+            for (Signal signal : remainingSignals) {
+                if (!safetyService.canTrade()) {
+                    log.warn("[INST][{}] Safety limit reached - stopping execution",
+                            executionId);
+                    break;
+                }
+
+                executionPipeline.executeImmediately(signal).join();
             }
         }
 
-        // Execute high priority signals first
-        List<Signal> highPrioritySignals = signals.stream()
-                .filter(s -> s.getConfidence() >= 0.85 ||
-                        s.getStrategy().contains("UNUSUAL_FLOW"))
-                .collect(Collectors.toList());
-
-        if (!highPrioritySignals.isEmpty()) {
-            log.info("[v62][{}] Executing {} HIGH PRIORITY signals first",
-                    executionId, highPrioritySignals.size());
-        }
-
-        // Process high priority first, then others
-        for (Signal signal : highPrioritySignals) {
-            executeSignal(signal, executionId);
-        }
-
-        // Then process remaining signals
-        for (Signal signal : signals) {
-            if (!highPrioritySignals.contains(signal)) {
-                executeSignal(signal, executionId);
-            }
-        }
+        log.info("[INST][{}] === INSTITUTIONAL EXECUTION COMPLETE ===", executionId);
     }
 
     private void executeSignal(Signal signal, String executionId) {

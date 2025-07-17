@@ -1,6 +1,7 @@
 package com.tradingBot.service;
 
 import com.tradingBot.entity.MarketData;
+import com.tradingBot.model.Quote;
 import com.tradingBot.model.QuoteResponse;
 import com.tradingBot.repository.MarketDataRepository;
 import lombok.Data;
@@ -9,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -25,10 +27,23 @@ public class AdvancedTrendDetector {
     private final AtomicReference<String> currentTrend = new AtomicReference<>("NEUTRAL");
     private final ConcurrentHashMap<String, String> symbolTrends = new ConcurrentHashMap<>();
 
+    private final Map<String, CachedQuote> quoteCache = new ConcurrentHashMap<>();
+    private static final long CACHE_TTL = 5000; // 5 seconds
+
+    @Data
+    private static class CachedQuote {
+        Quote quote;
+        long timestamp;
+
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > CACHE_TTL;
+        }
+    }
+
     public String detectTrend(String symbol) {
         try {
             // 1. Get market internals (with fallback if not available)
-            MarketInternals internals = getMarketInternals();
+           // MarketInternals internals = getMarketInternals();
 
             // 2. Volume-confirmed price action
             VolumeProfile volumeProfile = analyzeVolumeProfile(symbol);
@@ -39,32 +54,37 @@ public class AdvancedTrendDetector {
             // 4. Smart money flow
             double smartMoneyFlow = calculateSmartMoneyFlow(symbol);
 
-            // 5. Smoothed trend score
+            // 5. BIG TECH COMPONENTS ANALYSIS (NEW)
+            double bigTechScore = analyzeBigTechComponents();
+
+            // 6. Smoothed trend score
             double rawScore = 0.0;
 
-            // Market internals (25% weight) - only if available
-            if (internals.hasValidData()) {
-                if (internals.getAdvanceDeclineRatio() > 2.0) rawScore += 2.5;
-                else if (internals.getAdvanceDeclineRatio() < 0.5) rawScore -= 2.5;
+            // Market internals (20% weight) - reduced from 25%
+//            if (internals.hasValidData()) {
+//                if (internals.getAdvanceDeclineRatio() > 2.0) rawScore += 2.0;
+//                else if (internals.getAdvanceDeclineRatio() < 0.5) rawScore -= 2.0;
+//
+//                if (internals.getUpVolume() > internals.getDownVolume() * 1.5) rawScore += 1.5;
+//                else if (internals.getDownVolume() > internals.getUpVolume() * 1.5) rawScore -= 1.5;
+//            } else {
+                rawScore *= 1.25; // Compensate for missing weight
+ //           }
 
-                if (internals.getUpVolume() > internals.getDownVolume() * 1.5) rawScore += 2.0;
-                else if (internals.getDownVolume() > internals.getUpVolume() * 1.5) rawScore -= 2.0;
-            } else {
-                // If no internals, give more weight to other factors
-                rawScore *= 1.33; // Compensate for missing 25% weight
-            }
+            // Volume profile (20% weight) - reduced from 25%
+            if (volumeProfile.isBullishVolume()) rawScore += 2.0;
+            else if (volumeProfile.isBearishVolume()) rawScore -= 2.0;
 
-            // Volume profile (25% weight)
-            if (volumeProfile.isBullishVolume()) rawScore += 2.5;
-            else if (volumeProfile.isBearishVolume()) rawScore -= 2.5;
+            // A/D Line (20% weight) - reduced from 25%
+            if (adLine > 0.5) rawScore += 2.0;
+            else if (adLine < -0.5) rawScore -= 2.0;
 
-            // A/D Line (25% weight)
-            if (adLine > 0.5) rawScore += 2.5;
-            else if (adLine < -0.5) rawScore -= 2.5;
+            // Smart money (20% weight) - reduced from 25%
+            if (smartMoneyFlow > 0.3) rawScore += 2.0;
+            else if (smartMoneyFlow < -0.3) rawScore -= 2.0;
 
-            // Smart money (25% weight)
-            if (smartMoneyFlow > 0.3) rawScore += 2.5;
-            else if (smartMoneyFlow < -0.3) rawScore -= 2.5;
+            // BIG TECH COMPONENTS (20% weight) - NEW
+            rawScore += bigTechScore * 2.0;
 
             // Apply EMA smoothing to reduce noise
             String key = symbol + "_trend";
@@ -92,8 +112,8 @@ public class AdvancedTrendDetector {
                 newTrend = smoothedScore > 3.0 ? "UP" : (smoothedScore < -3.0 ? "DOWN" : "NEUTRAL");
             }
 
-            log.info("[TREND] {} - Raw: {:.1f}, Smoothed: {:.1f}, Trend: {} -> {}",
-                    symbol, rawScore, smoothedScore, previousTrend, newTrend);
+            log.info("[TREND] {} - Raw: {:.1f}, Smoothed: {:.1f}, BigTech: {:.2f}, Trend: {} -> {}",
+                    symbol, rawScore, smoothedScore, bigTechScore, previousTrend, newTrend);
 
             // Store the trend
             symbolTrends.put(symbol, newTrend);
@@ -107,65 +127,139 @@ public class AdvancedTrendDetector {
         }
     }
 
-    private MarketInternals getMarketInternals() {
-        MarketInternals internals = new MarketInternals();
-
+    // NEW METHOD: Analyze Big Tech Components
+    private double analyzeBigTechComponents() {
         try {
-            // Try to get TICK - but handle if not available
-            try {
-                QuoteResponse tickResponse = tradierService.getQuote("$TICK");
-                if (tickResponse != null && tickResponse.getQuote() != null && tickResponse.getQuote().getLast() != null) {
-                    internals.setTick(tickResponse.getQuote().getLast().intValue());
-                    internals.setHasData(true);
+            // Define weights based on actual QQQ composition
+            Map<String, Double> techWeights = new HashMap<>();
+            techWeights.put("MSFT", 0.125);  // ~12.5% of QQQ
+            techWeights.put("AAPL", 0.115);  // ~11.5% of QQQ
+            techWeights.put("NVDA", 0.075);  // ~7.5% of QQQ
+            techWeights.put("TSLA", 0.035);  // ~3.5% of QQQ
+
+            // Batch fetch quotes for efficiency
+            String symbols = String.join(",", techWeights.keySet());
+            Map<String, Quote> quotes = tradierService.getMultipleQuotes(symbols);
+
+            double componentScore = 0.0;
+            double totalWeight = 0.0;
+
+            for (Map.Entry<String, Double> entry : techWeights.entrySet()) {
+                String symbol = entry.getKey();
+                Double weight = entry.getValue();
+
+                Quote quote = quotes.get(symbol);
+                if (quote != null && quote.getLast() != null && quote.getPreviousClose() != null) {
+                    // Calculate price change
+                    BigDecimal change = quote.getLast().subtract(quote.getPreviousClose())
+                            .divide(quote.getPreviousClose(), 4, RoundingMode.HALF_UP);
+
+                    // Score based on movement strength
+                    double symbolScore = 0.0;
+                    if (change.compareTo(BigDecimal.valueOf(0.015)) > 0) {
+                        symbolScore = 1.0;  // Strong bullish (>1.5%)
+                    } else if (change.compareTo(BigDecimal.valueOf(0.005)) > 0) {
+                        symbolScore = 0.5;  // Moderate bullish (>0.5%)
+                    } else if (change.compareTo(BigDecimal.valueOf(-0.005)) < 0) {
+                        symbolScore = -0.5; // Moderate bearish (<-0.5%)
+                    } else if (change.compareTo(BigDecimal.valueOf(-0.015)) < 0) {
+                        symbolScore = -1.0; // Strong bearish (<-1.5%)
+                    }
+
+                    // Check volume confirmation
+                    if (quote.getVolume() != null && quote.getAverageVolume() != null) {
+                        double volumeRatio = quote.getVolume().doubleValue() / quote.getAverageVolume().doubleValue();
+                        if (volumeRatio > 1.2) {
+                            symbolScore *= 1.2; // Boost for high volume
+                        }
+                    }
+
+                    componentScore += symbolScore * weight;
+                    totalWeight += weight;
+
+                    if (Math.abs(symbolScore) > 0) {
+                        log.debug("[BIG TECH] {} change: {}% score: {} weight: {}",
+                                symbol, change.multiply(BigDecimal.valueOf(100)),
+                                symbolScore, weight);
+                    }
                 }
-            } catch (Exception e) {
-                log.debug("TICK data not available: {}", e.getMessage());
             }
 
-            // Try to get advance/decline - but handle if not available
-            try {
-                QuoteResponse addResponse = tradierService.getQuote("$ADD");
-                if (addResponse != null && addResponse.getQuote() != null && addResponse.getQuote().getLast() != null) {
-                    internals.setAdvanceDecline(addResponse.getQuote().getLast().intValue());
-                    internals.setHasData(true);
-                }
-            } catch (Exception e) {
-                log.debug("ADD data not available: {}", e.getMessage());
+            // Normalize by total weight
+            if (totalWeight > 0) {
+                componentScore = componentScore / totalWeight;
             }
 
-            // Try to get up/down volume - but handle if not available
-            try {
-                QuoteResponse voldResponse = tradierService.getQuote("$VOLD");
-                if (voldResponse != null && voldResponse.getQuote() != null && voldResponse.getQuote().getLast() != null) {
-                    internals.setDownVolume(voldResponse.getQuote().getLast().longValue());
-                    internals.setHasData(true);
-                }
-            } catch (Exception e) {
-                log.debug("VOLD data not available: {}", e.getMessage());
-            }
+            log.info("[BIG TECH] Component analysis score: {} (MSFT/AAPL/NVDA/TSLA weighted)",
+                    String.format("%.2f", componentScore));
 
-            try {
-                QuoteResponse voluResponse = tradierService.getQuote("$VOLU");
-                if (voluResponse != null && voluResponse.getQuote() != null && voluResponse.getQuote().getLast() != null) {
-                    internals.setUpVolume(voluResponse.getQuote().getLast().longValue());
-                    internals.setHasData(true);
-                }
-            } catch (Exception e) {
-                log.debug("VOLU data not available: {}", e.getMessage());
-            }
-
-            // If we couldn't get market internals, try to infer from SPY/QQQ breadth
-            if (!internals.hasValidData()) {
-                log.debug("Market internals not available from standard symbols, using fallback method");
-                internals = inferMarketInternalsFromETFs();
-            }
+            return componentScore;
 
         } catch (Exception e) {
-            log.debug("Market internals fetch failed: {}", e.getMessage());
+            log.error("Error analyzing big tech components: {}", e.getMessage());
+            return 0.0; // Neutral on error
         }
-
-        return internals;
     }
+
+//    private MarketInternals getMarketInternals() {
+//        MarketInternals internals = new MarketInternals();
+//
+//        try {
+//            // Try to get TICK - but handle if not available
+////            try {
+////                QuoteResponse tickResponse = tradierService.getQuote("$TICK");
+////                if (tickResponse != null && tickResponse.getQuote() != null && tickResponse.getQuote().getLast() != null) {
+////                    internals.setTick(tickResponse.getQuote().getLast().intValue());
+////                    internals.setHasData(true);
+////                }
+////            } catch (Exception e) {
+////                log.debug("TICK data not available: {}", e.getMessage());
+////            }
+//
+//            // Try to get advance/decline - but handle if not available
+////            try {
+////                QuoteResponse addResponse = tradierService.getQuote("$ADD");
+////                if (addResponse != null && addResponse.getQuote() != null && addResponse.getQuote().getLast() != null) {
+////                    internals.setAdvanceDecline(addResponse.getQuote().getLast().intValue());
+////                    internals.setHasData(true);
+////                }
+////            } catch (Exception e) {
+////                log.debug("ADD data not available: {}", e.getMessage());
+////            }
+//
+//            // Try to get up/down volume - but handle if not available
+////            try {
+////                QuoteResponse voldResponse = tradierService.getQuote("$VOLD");
+////                if (voldResponse != null && voldResponse.getQuote() != null && voldResponse.getQuote().getLast() != null) {
+////                    internals.setDownVolume(voldResponse.getQuote().getLast().longValue());
+////                    internals.setHasData(true);
+////                }
+////            } catch (Exception e) {
+////                log.debug("VOLD data not available: {}", e.getMessage());
+////            }
+//
+////            try {
+////                QuoteResponse voluResponse = tradierService.getQuote("$VOLU");
+////                if (voluResponse != null && voluResponse.getQuote() != null && voluResponse.getQuote().getLast() != null) {
+////                    internals.setUpVolume(voluResponse.getQuote().getLast().longValue());
+////                    internals.setHasData(true);
+////                }
+////            } catch (Exception e) {
+////                log.debug("VOLU data not available: {}", e.getMessage());
+////            }
+//
+//            // If we couldn't get market internals, try to infer from SPY/QQQ breadth
+//            if (!internals.hasValidData()) {
+//                log.debug("Market internals not available from standard symbols, using fallback method");
+//                internals = inferMarketInternalsFromETFs();
+//            }
+//
+//        } catch (Exception e) {
+//            log.debug("Market internals fetch failed: {}", e.getMessage());
+//        }
+//
+//        return internals;
+//    }
 
     private MarketInternals inferMarketInternalsFromETFs() {
         MarketInternals internals = new MarketInternals();

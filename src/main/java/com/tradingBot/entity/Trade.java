@@ -31,6 +31,15 @@ public class Trade {
     private BigDecimal delta;
     private BigDecimal gamma;
     private BigDecimal theta;
+    // Add tracking fields
+    private Double marketBreadthAtEntry;
+    private Double marketBreadthAtExit;
+    private Boolean wasPrematureStop;
+    private BigDecimal highAfterEntry; // Track max price reached
+    private BigDecimal lowAfterEntry;  // Track min price reached
+
+    // Link to original signal
+    private Long signalId;
     @Column(name = "target_price")
     private BigDecimal targetPrice;
 
@@ -44,10 +53,6 @@ public class Trade {
     private String exitStrategy;
 
     // Add these fields to your existing Trade.java entity
-
-    // Link to original signal
-    @Column(name = "signal_id")
-    private Long signalId;
 
     // Track broker order ID
     @Column(name = "order_id")

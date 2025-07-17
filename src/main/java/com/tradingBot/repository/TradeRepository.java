@@ -51,5 +51,13 @@ public interface TradeRepository extends JpaRepository<Trade, Long> {
     @Query("SELECT SUM(t.realizedPnl) FROM Trade t WHERE t.status = 'CLOSED' AND t.exitTime >= :startTime")
     BigDecimal calculatePnLSince(@Param("startTime") LocalDateTime startTime);
 
+    // Add these methods to your existing TradeRepository interface
+
+    @Query("SELECT COUNT(t) FROM Trade t WHERE t.status = 'OPEN' AND t.entryTime >= :startTime")
+    int countExecutedSignalsSince(@Param("startTime") LocalDateTime startTime);
+
+    @Query("SELECT t FROM Trade t WHERE t.strategy = :strategy AND t.entryTime >= :after ORDER BY t.entryTime DESC")
+    List<Trade> findByStrategyAndCreatedAtAfter(@Param("strategy") String strategy, @Param("after") LocalDateTime after);
+
 
 }

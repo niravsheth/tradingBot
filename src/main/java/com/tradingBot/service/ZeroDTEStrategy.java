@@ -24,8 +24,8 @@ public class ZeroDTEStrategy {
     private final TechnicalAnalysisService technicalAnalysisService;
     private final SignalRepository signalRepository;
     private final SignalOrchestrator signalOrchestrator;
-
     private final AdvancedUnusualFlowDetector flowDetector;
+    private final PreTradeRiskEngine preTradeRiskEngine;  // Add this field
 
     @Value("${trading.min-volume:50}")
     private int minVolume;
@@ -38,6 +38,8 @@ public class ZeroDTEStrategy {
 
     @Value("${trading.signal-expiration-minutes:5}")
     private int signalExpirationMinutes;
+
+
 
     // Timezone
     private static final ZoneId ET_ZONE = ZoneId.of("America/New_York");
@@ -56,9 +58,10 @@ public class ZeroDTEStrategy {
     private static final LocalTime PRIME_WINDOW_2_START = LocalTime.of(10, 30);
     private static final LocalTime PRIME_WINDOW_2_END = LocalTime.of(12, 00);
     private static final LocalTime PRIME_WINDOW_3_START = LocalTime.of(13, 00);
-    private static final LocalTime PRIME_WINDOW_3_END = LocalTime.of(14, 30);
+    private static final LocalTime PRIME_WINDOW_3_END = LocalTime.of(15, 00);
     private static final LocalTime FINAL_WINDOW_START = LocalTime.of(15, 00);
     private static final LocalTime FINAL_WINDOW_END = LocalTime.of(15, 55);
+
 
     // Flow detection thresholds
     private static final double UNUSUAL_VOLUME_RATIO = 5.0;
@@ -68,43 +71,50 @@ public class ZeroDTEStrategy {
     // UPDATED METHOD SIGNATURE TO ACCEPT MARKET TREND
     public List<Signal> analyzeOptions(String symbol, String marketTrend) {
         String analysisId = UUID.randomUUID().toString().substring(0, 8);
-        log.info("[v63][{}] ========== STARTING 0DTE ANALYSIS FOR {} ==========", analysisId, symbol);
-        log.info("[v63][{}] Market trend: {}", analysisId, marketTrend);
+        log.info("[INST][{}] ========== INSTITUTIONAL ANALYSIS START ==========", analysisId);
+        log.info("[INST][{}] Market trend: {}", analysisId, marketTrend);
 
         List<Signal> rawSignals = new ArrayList<>();
 
         try {
-            // Time check - avoid unsuitable times
+            // PRE-TRADE MARKET CHECKS
+            if (!preTradeRiskEngine.isMarketSuitable()) {
+                log.warn("[INST][{}] Market unsuitable for trading - aborting analysis", analysisId);
+                return Collections.emptyList();
+            }
+
+            // Time check
             LocalTime now = LocalTime.now(ET_ZONE);
-            // STRICT TIME CHECK - After 3:30 PM, only high confidence trades
             boolean isLateSession = now.isAfter(LocalTime.of(15, 30));
             if (isLateSession) {
-                log.warn("[v63][{}] LATE SESSION MODE - Only 90%+ confidence signals allowed", analysisId);
+                log.warn("[INST][{}] LATE SESSION MODE - Only 90%+ confidence signals allowed", analysisId);
             }
 
             // Block analysis in neutral market
             if ("NEUTRAL".equals(marketTrend)) {
-                log.warn("[v63][{}] MARKET IS NEUTRAL - NO SIGNALS WILL BE GENERATED", analysisId);
-                return rawSignals;
+                log.warn("[INST][{}] MARKET IS NEUTRAL - NO SIGNALS WILL BE GENERATED", analysisId);
+                return Collections.emptyList();
             }
+
             if (!isGoodTradingTime(now)) {
-                log.warn("[v63][{}] Not a good time for 0DTE trading: {}", analysisId, now);
-                return rawSignals;
+                log.warn("[INST][{}] Not a good time for 0DTE trading: {}", analysisId, now);
+                return Collections.emptyList();
             }
 
             // Get technical analysis
             TechnicalAnalysis ta = technicalAnalysisService.analyze(symbol);
             if (ta == null) {
-                log.error("[v63][{}] Technical analysis failed", analysisId);
-                return rawSignals;
+                log.error("[INST][{}] Technical analysis failed", analysisId);
+                return Collections.emptyList();
             }
 
             logTechnicalAnalysis(ta, analysisId);
 
+            // Check market conditions
             MarketConditions marketConditions = getMarketConditions();
             if (!signalOrchestrator.shouldAnalyze(symbol, marketConditions)) {
-                log.info("[v64][{}] Orchestrator vetoed analysis - unfavorable conditions", analysisId);
-                return rawSignals;
+                log.info("[INST][{}] Orchestrator vetoed analysis - unfavorable conditions", analysisId);
+                return Collections.emptyList();
             }
 
             // Check for today's expiration
@@ -112,64 +122,222 @@ public class ZeroDTEStrategy {
             List<LocalDate> expirations = tradierService.getExpirations(symbol);
 
             if (!expirations.contains(today)) {
-                log.warn("[v63][{}] No 0DTE options available today", analysisId);
-                return rawSignals;
+                log.warn("[INST][{}] No 0DTE options available today", analysisId);
+                return Collections.emptyList();
             }
 
             // Get option chain
             OptionChainResponse chainResponse = tradierService.getOptionChain(symbol, today);
 
             if (chainResponse == null || !chainResponse.hasOptions()) {
-                log.error("[v63][{}] No option chain data available", analysisId);
-                return rawSignals;
+                log.error("[INST][{}] No option chain data available", analysisId);
+                return Collections.emptyList();
             }
 
             List<Option> options = chainResponse.getOptionsList();
-            log.info("[v63][{}] Retrieved {} options", analysisId, options.size());
+            log.info("[INST][{}] Retrieved {} options", analysisId, options.size());
 
             // Apply filtering based on market regime
             List<Option> filteredOptions = filterOptionsByMarketRegime(options, ta, analysisId);
 
-            // Add confidence pre-filtering based on market conditions
-            double expectedMaxConfidence = estimateMaxConfidence(ta);
-            filteredOptions = filterByConfidenceAdjustedStrikes(filteredOptions, ta,
-                    expectedMaxConfidence, analysisId);
+            // PRE-TRADE STRIKE QUALIFICATION
+            List<Option> qualifiedOptions = filteredOptions.stream()
+                    .filter(option -> preTradeRiskEngine.isStrikeSuitable(option))
+                    .collect(Collectors.toList());
 
-            log.info("[v63][{}] Analyzing {} filtered options after confidence adjustment",
-                    analysisId, filteredOptions.size());
+            log.info("[INST][{}] {} options passed pre-trade qualification (from {} filtered)",
+                    analysisId, qualifiedOptions.size(), filteredOptions.size());
 
-            // Analyze each option against strategies - PASS MARKET TREND
-            for (Option option : filteredOptions) {
-                analyzeOptionWithStrategies(option, ta, rawSignals, marketTrend, analysisId, filteredOptions);
+            // Apply dynamic strike selection based on volatility
+            List<Option> selectedStrikes = selectStrikesBasedOnVolatility(qualifiedOptions, ta, analysisId);
+
+            log.info("[INST][{}] Analyzing {} selected strikes", analysisId, selectedStrikes.size());
+
+            // Log flow analysis summary first
+            logFlowAnalysisSummary(selectedStrikes, analysisId);
+
+            // Analyze each option against strategies
+            for (Option option : selectedStrikes) {
+                // Quick pre-validation
+                if (!quickSignalValidation(option, selectedStrikes, ta, marketTrend, analysisId)) {
+                    continue;
+                }
+
+                analyzeOptionWithStrategies(option, ta, rawSignals, marketTrend, analysisId, selectedStrikes);
             }
+
+            log.info("[INST][{}] Generated {} raw signals", analysisId, rawSignals.size());
+
+            // Validate and adjust flow signals
+            List<Signal> validatedSignals = rawSignals.stream()
+                    .filter(signal -> isFlowSignalValid(signal, getOptionFromSignal(signal, selectedStrikes), selectedStrikes, analysisId))
+                    .map(signal -> {
+                        Option option = getOptionFromSignal(signal, selectedStrikes);
+                        if (option != null) {
+                            double adjustedConfidence = adjustFlowConfidence(signal, option, selectedStrikes);
+                            signal.setConfidence(adjustedConfidence);
+                        }
+                        return signal;
+                    })
+                    .collect(Collectors.toList());
 
             // Use orchestrator to process signals intelligently
             List<Signal> orchestratedSignals = signalOrchestrator.orchestrateSignals(
-                    rawSignals, ta, analysisId);
+                    validatedSignals, ta, analysisId);
 
-            // After getting orchestrated signals, filter by time
+            // Late session filter
             if (isLateSession && !orchestratedSignals.isEmpty()) {
                 List<Signal> highConfidenceOnly = orchestratedSignals.stream()
                         .filter(s -> s.getConfidence() >= 0.90)
                         .collect(Collectors.toList());
 
-                log.info("[v63][{}] Late session filter: {} signals -> {} (90%+ only)",
+                log.info("[INST][{}] Late session filter: {} signals -> {} (90%+ only)",
                         analysisId, orchestratedSignals.size(), highConfidenceOnly.size());
 
                 orchestratedSignals = highConfidenceOnly;
             }
 
-            // Save signals with proper expiration
-            saveSignals(orchestratedSignals, ta, marketTrend, analysisId);
+            // Save signals for IMMEDIATE execution
+            saveSignalsImmediate(orchestratedSignals, ta, marketTrend, analysisId);
 
-            log.info("[v64][{}] ========== ANALYSIS COMPLETE - {} SIGNALS (from {} raw) ==========",
-                    analysisId, orchestratedSignals.size(), rawSignals.size());
+            log.info("[INST][{}] ========== ANALYSIS COMPLETE - {} SIGNALS ==========",
+                    analysisId, orchestratedSignals.size());
 
             return orchestratedSignals;
 
         } catch (Exception e) {
-            log.error("[v63][{}] ERROR in analyzeOptions: {}", analysisId, e.getMessage(), e);
+            log.error("[INST][{}] ERROR in analyzeOptions: {}", analysisId, e.getMessage(), e);
             return new ArrayList<>();
+        }
+    }
+
+    // Helper method to get Option from Signal
+    private Option getOptionFromSignal(Signal signal, List<Option> options) {
+        return options.stream()
+                .filter(opt -> opt.getSymbol().equals(signal.getOptionSymbol()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    // New method for dynamic strike selection
+    private List<Option> selectStrikesBasedOnVolatility(List<Option> options, TechnicalAnalysis ta, String analysisId) {
+        BigDecimal currentPrice = ta.getCurrentPrice();
+        BigDecimal dayRange = BigDecimal.ZERO;
+
+        // Calculate day's range
+        QuoteResponse qqqQuote = tradierService.getQuote("QQQ");
+        if (qqqQuote != null && qqqQuote.getQuote() != null) {
+            Quote quote = qqqQuote.getQuote();
+            if (quote.getHigh() != null && quote.getLow() != null) {
+                dayRange = quote.getHigh().subtract(quote.getLow());
+            }
+        }
+
+        // Calculate price movement percentage
+        BigDecimal priceMove = BigDecimal.ZERO;
+        if (ta.getPreviousClose() != null && ta.getPreviousClose().compareTo(BigDecimal.ZERO) > 0) {
+            priceMove = currentPrice.subtract(ta.getPreviousClose())
+                    .abs()
+                    .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP);
+        }
+
+        // Determine strike range based on volatility
+        int strikesFromATM;
+        if (priceMove.compareTo(BigDecimal.valueOf(0.005)) > 0 || // >0.5% move
+                dayRange.compareTo(currentPrice.multiply(BigDecimal.valueOf(0.01))) > 0) { // >1% range
+            strikesFromATM = 4; // High volatility - wider strikes
+            log.info("[INST][{}] High volatility detected - selecting up to {} strikes from ATM",
+                    analysisId, strikesFromATM);
+        } else {
+            strikesFromATM = 2; // Normal volatility - tighter strikes
+            log.info("[INST][{}] Normal volatility - selecting up to {} strikes from ATM",
+                    analysisId, strikesFromATM);
+        }
+
+        // Filter options by strike distance
+        List<Option> selected = options.stream()
+                .filter(option -> {
+                    BigDecimal strike = option.getStrikePrice();
+                    BigDecimal distance = strike.subtract(currentPrice).abs();
+
+                    boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+                    boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+
+                    if (isCall) {
+                        // For calls: ATM to X strikes above
+                        return strike.compareTo(currentPrice) >= 0 &&
+                                strike.compareTo(currentPrice.add(BigDecimal.valueOf(strikesFromATM))) <= 0;
+                    } else if (isPut) {
+                        // For puts: ATM to X strikes below
+                        return strike.compareTo(currentPrice.subtract(BigDecimal.valueOf(strikesFromATM))) >= 0 &&
+                                strike.compareTo(currentPrice) <= 0;
+                    }
+                    return false;
+                })
+                .sorted((o1, o2) -> {
+                    // Sort by distance from current price (closest first)
+                    BigDecimal dist1 = o1.getStrikePrice().subtract(currentPrice).abs();
+                    BigDecimal dist2 = o2.getStrikePrice().subtract(currentPrice).abs();
+                    return dist1.compareTo(dist2);
+                })
+                .collect(Collectors.toList());
+
+        // Log selected strikes
+        selected.forEach(opt -> {
+            BigDecimal distance = opt.getStrikePrice().subtract(currentPrice);
+            log.info("[INST][{}] Selected: {} ${} (${} from current, Vol: {}, OI: {})",
+                    analysisId, opt.getType(), opt.getStrikePrice(),
+                    distance.compareTo(BigDecimal.ZERO) > 0 ? "+" + distance : distance,
+                    opt.getVolume(), opt.getOpenInterest());
+        });
+
+        return selected;
+    }
+
+    // New method to save signals for immediate execution
+    private void saveSignalsImmediate(List<Signal> signals, TechnicalAnalysis ta,
+                                      String marketTrend, String analysisId) {
+        for (Signal signal : signals) {
+            // ALL signals go directly to PENDING for immediate execution
+            signal.setStatus("PENDING");
+            signal.setCreatedAt(LocalDateTime.now());
+            signal.setEntryAssumptionPrice(ta.getCurrentPrice());
+            signal.setMarketTrend(marketTrend);
+            signal.setOriginalOptionPrice(signal.getEntryPrice());
+
+            // Very short expiration - 30 seconds
+            LocalDateTime expirationTime = LocalDateTime.now().plusSeconds(30);
+            signal.setExpirationTime(expirationTime);
+
+            signalRepository.save(signal);
+
+            log.info("[INST][{}] IMMEDIATE {} - {} {}, Confidence: {}%, Executing in <500ms",
+                    analysisId, signal.getStrategy(), signal.getSignalType(),
+                    signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
+
+            // Alert for all signals
+            if (signal.getConfidence() >= 0.70) {
+                String urgency = signal.getStrategy().contains("UNUSUAL_FLOW") ? "URGENT" : "IMMEDIATE";
+                telegramService.sendMessage(String.format(
+                        "⚡ %s EXECUTION SIGNAL\n" +
+                                "Strategy: %s\n" +
+                                "Option: %s\n" +
+                                "Confidence: %d%%\n" +
+                                "Entry: $%.2f\n" +
+                                "Target: $%.2f (+%.0f%%)\n" +
+                                "Stop: $%.2f (-%.0f%%)\n" +
+                                "Executing NOW...",
+                        urgency,
+                        signal.getStrategy(),
+                        signal.getOptionSymbol(),
+                        (int)(signal.getConfidence() * 100),
+                        signal.getEntryPrice(),
+                        signal.getTargetPrice(),
+                        ((signal.getTargetPrice().doubleValue() / signal.getEntryPrice().doubleValue() - 1) * 100),
+                        signal.getStopLoss(),
+                        ((1 - signal.getStopLoss().doubleValue() / signal.getEntryPrice().doubleValue()) * 100)
+                ));
+            }
         }
     }
 
@@ -585,10 +753,28 @@ public class ZeroDTEStrategy {
                 .orElse(BigDecimal.ONE);
     }
 
+    private TradingAnalysisService analysisService;
+
     // UPDATED METHOD SIGNATURE
     private void analyzeOptionWithStrategies(Option option, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend,
                                              String analysisId, List<Option> allOptions){
+        // When blocking due to neutral market
+//        if ("NEUTRAL".equals(marketTrend)) {
+//            // Check if this would have been a signal
+//            if (wouldGenerateSignal(option, ta)) {
+//                analysisService.recordBlockedSignal(
+//                        option.getSymbol(),
+//                        "POTENTIAL_SIGNAL",
+//                        0.75, // estimated confidence
+//                        "MARKET_NEUTRAL",
+//                        option.getMidPrice(),
+//                        getCurrentMarketBreadth(),
+//                        marketTrend
+//                );
+//            }
+//            return;
+//        }
 
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option, allOptions, analysisId);
         if (hasUnusualFlow) {
@@ -620,7 +806,18 @@ public class ZeroDTEStrategy {
             analyzeVWAPBounce(option,allOptions, ta, signals, marketTrend, analysisId);
         }
     }
-
+    // In PreTradeRiskEngine.java - Track breadth blocks
+//    public boolean isMarketSuitable() {
+//        if (marketBreadth < MIN_MARKET_BREADTH) {
+//            // Track this block
+//            applicationEventPublisher.publishEvent(
+//                    new MarketBreadthBlockEvent(marketBreadth)
+//            );
+//            log.warn("Market breadth too low: {} < {}", marketBreadth, MIN_MARKET_BREADTH);
+//            return false;
+//        }
+//        return true;
+//    }
     // UPDATE ALL STRATEGY METHODS TO ACCEPT MARKET TREND
     private void analyzeOpeningDriveStrategy(Option option,List<Option> allOptions, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend, String analysisId) {
@@ -1093,34 +1290,36 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void saveSignals(List<Signal> signals, TechnicalAnalysis ta, String marketTrend, String analysisId) {
+    // Update saveSignals() method
+    private void saveSignals(List<Signal> signals, TechnicalAnalysis ta,
+                             String marketTrend, String analysisId) {
         for (Signal signal : signals) {
-            // Set initial status to TRACKING instead of PENDING
-            signal.setStatus("TRACKING"); // <-- KEY CHANGE
+            // ALL signals go directly to PENDING for immediate execution
+            signal.setStatus("PENDING");
             signal.setCreatedAt(LocalDateTime.now());
             signal.setEntryAssumptionPrice(ta.getCurrentPrice());
             signal.setMarketTrend(marketTrend);
             signal.setOriginalOptionPrice(signal.getEntryPrice());
 
-            // Set expiration to longer time since we need confirmation time
-            LocalDateTime expirationTime = LocalDateTime.now().plusMinutes(10); // 10 minutes instead of 5
+            // Very short expiration - 30 seconds
+            LocalDateTime expirationTime = LocalDateTime.now().plusSeconds(30);
             signal.setExpirationTime(expirationTime);
 
             signalRepository.save(signal);
 
-            log.info("[v63][{}] TRACKING {} - {} {}, Confidence: {}%, Awaiting confirmation",
+            log.info("[INST][{}] PENDING {} - {} {}, Confidence: {}%, Ready for IMMEDIATE execution",
                     analysisId, signal.getStrategy(), signal.getSignalType(),
                     signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
 
-            // Alert for high-priority signals
-            if (signal.getConfidence() >= 0.85 || signal.getStrategy().contains("UNUSUAL_FLOW")) {
+            // Alert for all signals now (since all are immediate)
+            if (signal.getConfidence() >= 0.70) {
                 telegramService.sendMessage(String.format(
-                        "🔍 TRACKING HIGH PRIORITY SIGNAL\n" +
+                        "⚡ IMMEDIATE EXECUTION SIGNAL\n" +
                                 "Strategy: %s\n" +
                                 "Option: %s\n" +
                                 "Confidence: %d%%\n" +
                                 "Entry: $%.2f\n" +
-                                "Status: Awaiting confirmation...",
+                                "Executing in <500ms...",
                         signal.getStrategy(),
                         signal.getOptionSymbol(),
                         (int)(signal.getConfidence() * 100),
@@ -1618,4 +1817,6 @@ public class ZeroDTEStrategy {
 
         return true;
     }
+
+
 }

@@ -13,6 +13,7 @@ import com.tradingBot.repository.MarketDataRepository;
 import com.tradingBot.service.SafetyService.SafetyStatus;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -39,6 +40,9 @@ public class TradingScheduler {
     private final PositionSyncService positionSyncService;
 
     private final CapitalAllocationService capitalAllocationService;
+
+    private final EnhancedTrendService enhancedTrendService;
+
     private static final Map<String, CachedQuote> componentQuoteCache = new ConcurrentHashMap<>();
     private static final long COMPONENT_CACHE_TTL = 30000; // 30 seconds
     private volatile BigDecimal cachedVix = null;
@@ -179,17 +183,24 @@ public class TradingScheduler {
         }
     }
 
+    @Autowired
+    private TradingAnalysisService analysisService;
+
     @Scheduled(cron = "0 0 16 * * MON-FRI")
     public void dailySummary() {
-        log.info("[v62] Generating daily summary");
+        log.info("[v62] Generating enhanced daily summary");
+
         LocalDateTime startOfDay = LocalDateTime.now().withHour(0).withMinute(0);
         List<Trade> todaysTrades = tradeRepository.findClosedTradesAfter(startOfDay);
         BigDecimal totalProfit = tradeRepository.calculateProfitSince(startOfDay);
         if (totalProfit == null) totalProfit = BigDecimal.ZERO;
+
+        // Original stats
         long winners = todaysTrades.stream()
                 .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) > 0)
                 .count();
         long losers = todaysTrades.size() - winners;
+
         BigDecimal avgWin = BigDecimal.ZERO;
         if (winners > 0) {
             avgWin = todaysTrades.stream()
@@ -199,10 +210,85 @@ public class TradingScheduler {
                     .divide(BigDecimal.valueOf(winners), 2, BigDecimal.ROUND_HALF_UP);
         }
 
-        log.info("[v62] Daily Summary - Trades: {}, Winners: {}, Losers: {}, Total P&L: ${}, Avg Win: ${}",
-                todaysTrades.size(), winners, losers, totalProfit, avgWin);
-        telegramService.sendDailySummary(todaysTrades, totalProfit);
-        log.info("[v62] Bot Version: {} - Date: {}", QQQTradingBotApplication.VERSION, LocalDate.now());
+        BigDecimal avgLoss = BigDecimal.ZERO;
+        if (losers > 0) {
+            avgLoss = todaysTrades.stream()
+                    .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) < 0)
+                    .map(Trade::getProfit)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add)
+                    .divide(BigDecimal.valueOf(losers), 2, BigDecimal.ROUND_HALF_UP);
+        }
+
+        // Build enhanced summary
+        StringBuilder summary = new StringBuilder();
+        summary.append("📊 <b>DAILY TRADING SUMMARY</b>\n");
+        summary.append("═══════════════════════\n\n");
+
+        summary.append(String.format("📈 Trades: %d | Win Rate: %.1f%%\n",
+                todaysTrades.size(), winners > 0 ? (winners * 100.0 / todaysTrades.size()) : 0));
+        summary.append(String.format("✅ Winners: %d | ❌ Losers: %d\n", winners, losers));
+        summary.append(String.format("💰 Total P&L: $%.2f\n", totalProfit));
+        summary.append(String.format("📊 Avg Win: $%.2f | Avg Loss: $%.2f\n", avgWin, avgLoss));
+
+        // Add blocked signals analysis
+        String blockedAnalysis = analysisService.analyzeBlockedSignals();
+        if (!blockedAnalysis.isEmpty()) {
+            summary.append("\n🚫 <b>BLOCKED SIGNALS ANALYSIS</b>\n");
+            summary.append("════════════════════════\n");
+            summary.append(blockedAnalysis);
+        }
+
+        // Add failed trades analysis
+        String failedAnalysis = analysisService.analyzeFailedTrades(todaysTrades);
+        if (!failedAnalysis.isEmpty()) {
+            summary.append("\n" + failedAnalysis);
+        }
+
+        // Add optimization suggestions
+        summary.append("\n🔧 <b>OPTIMIZATION SUGGESTIONS</b>\n");
+        summary.append("══════════════════════════\n");
+        summary.append(generateOptimizationSuggestions(todaysTrades));
+
+        // Bot info
+        summary.append(String.format("\n🤖 Bot Version: %s | Date: %s",
+                QQQTradingBotApplication.VERSION, LocalDate.now()));
+
+        // Send the enhanced summary
+        telegramService.sendMessage(summary.toString());
+
+        log.info("[v62] Enhanced daily summary sent");
+    }
+
+    private String generateOptimizationSuggestions(List<Trade> trades) {
+        StringBuilder suggestions = new StringBuilder();
+
+        // Analyze stop losses
+        long stoppedOut = trades.stream()
+                .filter(t -> "STOP_LOSS".equals(t.getExitReason()))
+                .count();
+
+        if (stoppedOut > trades.size() * 0.3) {
+            suggestions.append("• High stop-out rate (")
+                    .append(stoppedOut * 100 / trades.size())
+                    .append("%) - Consider wider stops\n");
+        }
+
+        // Check if we're missing morning opportunities
+        LocalTime avgEntryTime = trades.stream()
+                .map(t -> t.getEntryTime().toLocalTime())
+                .reduce(LocalTime.of(0,0), (a, b) -> a.plusSeconds(b.toSecondOfDay()))
+                .withSecond(trades.size() > 0 ? trades.size() : 1);
+
+        if (avgEntryTime.isAfter(LocalTime.of(11, 0))) {
+            suggestions.append("• Missing morning opportunities - Check breadth thresholds\n");
+        }
+
+        // Add more based on your needs
+        if (suggestions.length() == 0) {
+            suggestions.append("• No specific optimizations identified\n");
+        }
+
+        return suggestions.toString();
     }
 
     @Scheduled(cron = "0 30 9 * * MON-FRI")
@@ -635,39 +721,104 @@ public class TradingScheduler {
     // Add to TradingScheduler class fields
     private final IntegratedTrendService integratedTrendService;
 
-    // Replace getQQQTrend() method
     public String getQQQTrend() {
         try {
-            IntegratedTrendService.IntegratedTrendAnalysis analysis =
-                    integratedTrendService.getComprehensiveTrend("QQQ");
+//            // Use enhanced trend service with ML validation
+//            String trend = enhancedTrendService.getTrend("QQQ");
+//
+//            // Get detailed analysis for logging and alerts
+//            EnhancedTrendService.EnhancedTrendResult detailed =
+//                    enhancedTrendService.getTrendDetailed("QQQ");
+//
+//            // Enhanced logging with all factors
+//            log.info("[TREND] QQQ - {} ({}%) | Base: {} | Z-Score: {:.2f} | Volume: {:.1fx | ML: {} | Regime: {} | Time: {}ms",
+//                    trend,
+//                    (int)(detailed.getFinalConfidence() * 100),
+//                    detailed.getBaseTrend(),
+//                    detailed.getZScore(),
+//                    detailed.getVolumeScore(),
+//                    detailed.getMlValidationScore() > 0 ? "Confirmed" : "Divergent",
+//                    detailed.getMarketRegime(),
+//                    detailed.getCalculationTimeMs()
+//            );
+//
+//            // Alert conditions
+//            handleTrendAlerts(detailed);
 
-            log.info("[TREND] Integrated Analysis - Final: {} ({}%), Statistical: {} (z={}), ML: {}",
-                    analysis.getFinalTrend(),
-                    (int)(analysis.getConfidence() * 100),
-                    analysis.getStatisticalTrend(),
-                    String.format("%.2f", analysis.getZScore()),
-                    analysis.getMlPrediction());
+            return advancedTrendDetector.detectTrend("QQQ");
 
-            // Add Telegram alert for extreme z-scores
-            if (Math.abs(analysis.getZScore()) > 3.0) {
+        } catch (Exception e) {
+            log.error("Error getting enhanced trend, defaulting to NEUTRAL: {}", e.getMessage());
+            return "NEUTRAL";
+        }
+    }
+
+    private void handleTrendAlerts(EnhancedTrendService.EnhancedTrendResult detailed) {
+        try {
+            // Alert for extreme z-scores (3-sigma events)
+            if (Math.abs(detailed.getZScore()) > 3.0 && detailed.getFinalConfidence() > 0.8) {
                 telegramService.sendMessage(String.format(
-                        "🎯 EXTREME TREND SIGNAL\n" +
-                                "Trend: %s\n" +
-                                "Z-Score: %.2f (3σ event)\n" +
+                        "🎯 EXTREME TREND SIGNAL (3σ Event)\n" +
+                                "Direction: %s\n" +
+                                "Z-Score: %.2f\n" +
                                 "Confidence: %d%%\n" +
-                                "Regime: %s",
-                        analysis.getFinalTrend(),
-                        analysis.getZScore(),
-                        (int)(analysis.getConfidence() * 100),
-                        analysis.getMarketRegime()
+                                "ML: %s\n" +
+                                "Regime: %s\n" +
+                                "Analysis: %s",
+                        detailed.getFinalTrend(),
+                        detailed.getZScore(),
+                        (int)(detailed.getFinalConfidence() * 100),
+                        detailed.getMlValidationScore() > 0.5 ? "Confirmed ✅" : "Caution ⚠️",
+                        detailed.getMarketRegime(),
+                        detailed.getReasoning()
                 ));
             }
 
-            return analysis.getFinalTrend();
+            // Alert for strong ML confirmation
+            if (detailed.getMlValidationScore() > 0.8 && detailed.getFinalConfidence() > 0.75) {
+                log.info("[TREND] 🤖 Strong ML confirmation for {} trend", detailed.getFinalTrend());
+            }
+
+            // Alert for regime changes
+            if ("HIGH_VOLATILITY".equals(detailed.getMarketRegime()) ||
+                    "CHOPPY".equals(detailed.getMarketRegime())) {
+                log.warn("[TREND] ⚠️ Difficult market regime: {}", detailed.getMarketRegime());
+            }
 
         } catch (Exception e) {
-            log.error("Error in integrated trend detection, falling back to advanced detector: {}", e.getMessage());
-            return advancedTrendDetector.detectTrend("QQQ");
+            log.error("Error in trend alerts: {}", e.getMessage());
+        }
+    }
+
+    @Scheduled(fixedDelay = 60000) // Every minute
+    public void logDetailedTrendAnalysis() {
+        if (!safetyService.isTradingEnabled()) {
+            return;
+        }
+
+        try {
+            EnhancedTrendService.EnhancedTrendResult detailed =
+                    enhancedTrendService.getTrendDetailed("QQQ");
+
+            log.debug("[TREND-DETAIL] Components - Momentum: {:.2f}, Volume: {:.2f}, " +
+                            "Microstructure: {:.2f}, Regime: {:.2f}, ML: {:.2f}",
+                    detailed.getMomentumScore(),
+                    detailed.getVolumeScore(),
+                    detailed.getMicrostructureScore(),
+                    detailed.getRegimeScore(),
+                    detailed.getMlValidationScore()
+            );
+
+            if (detailed.getMlProbabilities() != null) {
+                log.debug("[TREND-DETAIL] ML Probabilities - UP: {}%, NEUTRAL: {}%, DOWN: {}%",
+                        (int)(detailed.getMlProbabilities().getOrDefault("UP", 0.0) * 100),
+                        (int)(detailed.getMlProbabilities().getOrDefault("NEUTRAL", 0.0) * 100),
+                        (int)(detailed.getMlProbabilities().getOrDefault("DOWN", 0.0) * 100)
+                );
+            }
+
+        } catch (Exception e) {
+            log.error("Error in detailed trend logging: {}", e.getMessage());
         }
     }
 
