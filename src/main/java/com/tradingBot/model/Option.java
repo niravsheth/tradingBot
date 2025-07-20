@@ -99,4 +99,5 @@ public class Option {
                 .multiply(BigDecimal.valueOf(100))
                 .doubleValue();
     }
+
 }

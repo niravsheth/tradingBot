@@ -6,6 +6,7 @@ import lombok.Getter;
 import lombok.Setter;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 
 @Getter
 @Setter
@@ -44,4 +45,21 @@ public class Quote {
 
     @JsonProperty("week_52_low")
     private BigDecimal week52Low;
+
+    private Integer openInterest; // Add this field if missing
+
+    // Add this method to calculate mid price
+    public BigDecimal getMidPrice() {
+        if (bid != null && ask != null) {
+            return bid.add(ask).divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP);
+        } else if (last != null) {
+            return last;
+        }
+        return BigDecimal.ZERO;
+    }
+
+    // Getter for open interest (if using Lombok, this is auto-generated)
+    public Integer getOpenInterest() {
+        return openInterest;
+    }
 }

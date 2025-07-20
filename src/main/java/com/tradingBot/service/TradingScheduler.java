@@ -39,12 +39,8 @@ public class TradingScheduler {
     private final SafetyService safetyService;
     private final PositionSyncService positionSyncService;
 
-    private final CapitalAllocationService capitalAllocationService;
-
     private final EnhancedTrendService enhancedTrendService;
 
-    private static final Map<String, CachedQuote> componentQuoteCache = new ConcurrentHashMap<>();
-    private static final long COMPONENT_CACHE_TTL = 30000; // 30 seconds
     private volatile BigDecimal cachedVix = null;
     private volatile LocalDateTime vixCacheTime = null;
 
@@ -55,39 +51,37 @@ public class TradingScheduler {
     public void analyzeMarketAndGenerateSignals() {
         String requestId = UUID.randomUUID().toString().substring(0, 8);
         LocalTime now = LocalTime.now();
-        log.info("[v62][{}] ===== MARKET ANALYSIS START - {} =====", requestId, now);
+        log.info("[{}] ===== MARKET ANALYSIS START - {} =====", requestId, now);
 
         try {
             // Safety checks
             if (!safetyService.isTradingEnabled()) {
-                log.warn("[v62][{}] Trading is disabled - skipping market analysis", requestId);
+                log.warn("[{}] Trading is disabled - skipping market analysis", requestId);
                 return;
             }
 
             SafetyStatus status = safetyService.getStatus();
-            log.info("[v62][{}] Safety check - Daily P&L: ${}, Open positions: {}/{}",
+            log.info("[{}] Safety check - Daily P&L: ${}, Open positions: {}/{}",
                     requestId, status.getTodayPnL(), status.getOpenPositions(), status.getMaxOpenPositions());
 
             if (!safetyService.canTrade()) {
-                log.warn("[v62][{}] Cannot open new trades - limits reached", requestId);
+                log.warn("[{}] Cannot open new trades - limits reached", requestId);
                 // Check if it's due to daily loss limit (assuming negative P&L threshold)
                 if (status.getTodayPnL() != null && status.getTodayPnL().compareTo(BigDecimal.valueOf(-500)) <= 0) {
-                    log.error("[v62][{}] DAILY LOSS LIMIT REACHED: ${}", requestId, status.getTodayPnL());
-                    telegramService.sendMessage(String.format("🛑 Daily loss limit reached: $%s - Trading halted",
-                            status.getTodayPnL()));
+                    log.error("[{}] DAILY LOSS LIMIT REACHED, trading will be haulted: ${}", requestId, status.getTodayPnL());
                 }
                 return;
             }
 
-            log.info("[v62][{}] Step 6: Starting option analysis for {}", requestId, tradingSymbol);
+            log.info("[{}] Step 6: Starting option analysis for {}", requestId, tradingSymbol);
 
             // GET MARKET TREND
             String currentTrend = getQQQTrend();
-            log.info("[v62][{}] Current market trend: {}", requestId, currentTrend);
+            log.info("[{}] Current market trend: {}", requestId, currentTrend);
 
             // PASS TREND TO STRATEGY
             List<Signal> signals = strategy.analyzeOptions(tradingSymbol, currentTrend);
-            log.info("[v62][{}] Analysis complete - Generated {} signals", requestId, signals.size());
+            log.info("[{}] Analysis complete - Generated {} signals", requestId, signals.size());
 
             if (!signals.isEmpty()) {
                 log.info("[v62][{}] === GENERATED SIGNALS ===", requestId);
@@ -294,11 +288,6 @@ public class TradingScheduler {
     @Scheduled(cron = "0 30 9 * * MON-FRI")
     public void marketOpenNotification() {
         telegramService.sendMessage("🔔 Market is open! Bot will start trading at 10:00 AM ET to avoid morning reports.");
-    }
-
-    @Scheduled(cron = "0 0 10 * * MON-FRI")
-    public void tradingStartNotification() {
-        telegramService.sendMessage("🚀 Trading session started! 0DTE QQQ bot is now actively scanning for opportunities.");
     }
 
     private void closePosition(Trade trade, String reason) {
@@ -550,7 +539,6 @@ public class TradingScheduler {
         }
     }
 
-    // UPDATED METHOD WITH DYNAMIC ADJUSTMENTS
     private void applyPositionSpecificStrategy(Trade trade, BigDecimal currentPrice, String marketTrend) {
         try {
             boolean isPut = trade.getOptionSymbol().contains("P");
@@ -632,174 +620,26 @@ public class TradingScheduler {
         }
     }
 
-    private static class CachedQuote {
-        Quote quote;
-        LocalDateTime timestamp;
-
-        CachedQuote(Quote quote) {
-            this.quote = quote;
-            this.timestamp = LocalDateTime.now();
-        }
-
-        boolean isExpired() {
-            return LocalDateTime.now().isAfter(timestamp.plusSeconds(30));
-        }
-    }
-
-//    public String getQQQTrend() {
-//        try {
-//            QuoteResponse response = tradierService.getQuote("QQQ");
-//            if (response == null || response.getQuote() == null) {
-//                return "NEUTRAL";
-//            }
-//
-//            Quote quote = response.getQuote();
-//            BigDecimal currentPrice = quote.getLast();
-//
-//            // Simple but effective trend detection
-//            double trendScore = 0.0;
-//
-//            // 1. Immediate price action (most weight)
-//            List<MarketData> recentData = marketDataRepository.findRecentData("QQQ", 10);
-//            if (recentData.size() >= 3) {
-//                BigDecimal price3MinAgo = recentData.get(recentData.size() - 3).getPrice();
-//                BigDecimal priceChange = currentPrice.subtract(price3MinAgo)
-//                        .divide(price3MinAgo, 4, RoundingMode.HALF_UP);
-//
-//                // Much more sensitive - 0.1% = 10 basis points
-//                if (priceChange.compareTo(BigDecimal.valueOf(0.001)) > 0) {
-//                    trendScore += 3.0; // Strong weight for recent move
-//                } else if (priceChange.compareTo(BigDecimal.valueOf(-0.001)) < 0) {
-//                    trendScore -= 3.0;
-//                }
-//            }
-//
-//            // 2. Day's trend (less weight)
-//            BigDecimal dayChange = currentPrice.subtract(quote.getPreviousClose())
-//                    .divide(quote.getPreviousClose(), 4, RoundingMode.HALF_UP);
-//
-//            if (dayChange.compareTo(BigDecimal.valueOf(0.002)) > 0) {
-//                trendScore += 1.0;
-//            } else if (dayChange.compareTo(BigDecimal.valueOf(-0.002)) < 0) {
-//                trendScore -= 1.0;
-//            }
-//
-//            // 3. Position in day's range
-//            if (quote.getHigh() != null && quote.getLow() != null) {
-//                BigDecimal range = quote.getHigh().subtract(quote.getLow());
-//                if (range.compareTo(BigDecimal.ZERO) > 0) {
-//                    BigDecimal position = currentPrice.subtract(quote.getLow())
-//                            .divide(range, 2, RoundingMode.HALF_UP);
-//
-//                    if (position.compareTo(BigDecimal.valueOf(0.7)) > 0) {
-//                        trendScore += 1.5;
-//                    } else if (position.compareTo(BigDecimal.valueOf(0.3)) < 0) {
-//                        trendScore -= 1.5;
-//                    }
-//                }
-//            }
-//
-//            // Simple thresholds
-//            String trend;
-//            if (trendScore >= 2.0) {
-//                trend = "UP";
-//            } else if (trendScore <= -2.0) {
-//                trend = "DOWN";
-//            } else {
-//                trend = "NEUTRAL";
-//            }
-//
-//            log.info("[TREND] QQQ Trend: {} (Score: {})", trend, String.format("%.1f", trendScore));
-//            return trend;
-//
-//        } catch (Exception e) {
-//            log.error("Error determining trend: {}", e.getMessage());
-//            return "NEUTRAL";
-//        }
-//    }
     private final AdvancedTrendDetector advancedTrendDetector;
-    // Add to TradingScheduler class fields
-    private final IntegratedTrendService integratedTrendService;
 
     public String getQQQTrend() {
         try {
-//            // Use enhanced trend service with ML validation
-//            String trend = enhancedTrendService.getTrend("QQQ");
-//
-//            // Get detailed analysis for logging and alerts
-//            EnhancedTrendService.EnhancedTrendResult detailed =
-//                    enhancedTrendService.getTrendDetailed("QQQ");
-//
-//            // Enhanced logging with all factors
-//            log.info("[TREND] QQQ - {} ({}%) | Base: {} | Z-Score: {:.2f} | Volume: {:.1fx | ML: {} | Regime: {} | Time: {}ms",
-//                    trend,
-//                    (int)(detailed.getFinalConfidence() * 100),
-//                    detailed.getBaseTrend(),
-//                    detailed.getZScore(),
-//                    detailed.getVolumeScore(),
-//                    detailed.getMlValidationScore() > 0 ? "Confirmed" : "Divergent",
-//                    detailed.getMarketRegime(),
-//                    detailed.getCalculationTimeMs()
-//            );
-//
-//            // Alert conditions
-//            handleTrendAlerts(detailed);
-
             return advancedTrendDetector.detectTrend("QQQ");
-
         } catch (Exception e) {
             log.error("Error getting enhanced trend, defaulting to NEUTRAL: {}", e.getMessage());
             return "NEUTRAL";
         }
     }
 
-    private void handleTrendAlerts(EnhancedTrendService.EnhancedTrendResult detailed) {
-        try {
-            // Alert for extreme z-scores (3-sigma events)
-            if (Math.abs(detailed.getZScore()) > 3.0 && detailed.getFinalConfidence() > 0.8) {
-                telegramService.sendMessage(String.format(
-                        "🎯 EXTREME TREND SIGNAL (3σ Event)\n" +
-                                "Direction: %s\n" +
-                                "Z-Score: %.2f\n" +
-                                "Confidence: %d%%\n" +
-                                "ML: %s\n" +
-                                "Regime: %s\n" +
-                                "Analysis: %s",
-                        detailed.getFinalTrend(),
-                        detailed.getZScore(),
-                        (int)(detailed.getFinalConfidence() * 100),
-                        detailed.getMlValidationScore() > 0.5 ? "Confirmed ✅" : "Caution ⚠️",
-                        detailed.getMarketRegime(),
-                        detailed.getReasoning()
-                ));
-            }
-
-            // Alert for strong ML confirmation
-            if (detailed.getMlValidationScore() > 0.8 && detailed.getFinalConfidence() > 0.75) {
-                log.info("[TREND] 🤖 Strong ML confirmation for {} trend", detailed.getFinalTrend());
-            }
-
-            // Alert for regime changes
-            if ("HIGH_VOLATILITY".equals(detailed.getMarketRegime()) ||
-                    "CHOPPY".equals(detailed.getMarketRegime())) {
-                log.warn("[TREND] ⚠️ Difficult market regime: {}", detailed.getMarketRegime());
-            }
-
-        } catch (Exception e) {
-            log.error("Error in trend alerts: {}", e.getMessage());
-        }
-    }
 
     @Scheduled(fixedDelay = 60000) // Every minute
     public void logDetailedTrendAnalysis() {
         if (!safetyService.isTradingEnabled()) {
             return;
         }
-
         try {
             EnhancedTrendService.EnhancedTrendResult detailed =
                     enhancedTrendService.getTrendDetailed("QQQ");
-
             log.debug("[TREND-DETAIL] Components - Momentum: {:.2f}, Volume: {:.2f}, " +
                             "Microstructure: {:.2f}, Regime: {:.2f}, ML: {:.2f}",
                     detailed.getMomentumScore(),
@@ -808,7 +648,6 @@ public class TradingScheduler {
                     detailed.getRegimeScore(),
                     detailed.getMlValidationScore()
             );
-
             if (detailed.getMlProbabilities() != null) {
                 log.debug("[TREND-DETAIL] ML Probabilities - UP: {}%, NEUTRAL: {}%, DOWN: {}%",
                         (int)(detailed.getMlProbabilities().getOrDefault("UP", 0.0) * 100),
@@ -821,243 +660,4 @@ public class TradingScheduler {
             log.error("Error in detailed trend logging: {}", e.getMessage());
         }
     }
-
-    private double analyzeQQQComponentsCached() {
-        double componentScore = 0.0;
-
-        try {
-            Map<String, Double> componentWeights = new HashMap<>();
-            componentWeights.put("NVDA", 2.0);
-            componentWeights.put("MSFT", 2.0);
-            componentWeights.put("AAPL", 1.0);
-            componentWeights.put("AMZN", 1.0);
-            componentWeights.put("TSLA", 0.8);
-            componentWeights.put("AVGO", 0.8);
-
-            boolean needsRefresh = false;
-            for (String symbol : componentWeights.keySet()) {
-                CachedQuote cached = componentQuoteCache.get(symbol);
-                if (cached == null || cached.isExpired()) {
-                    needsRefresh = true;
-                    break;
-                }
-            }
-
-            if (needsRefresh) {
-                String symbols = String.join(",", componentWeights.keySet());
-                log.debug("[TREND] Refreshing component quotes cache for: {}", symbols);
-
-                Map<String, Quote> freshQuotes = tradierService.getMultipleQuotes(symbols);
-
-                for (Map.Entry<String, Quote> entry : freshQuotes.entrySet()) {
-                    componentQuoteCache.put(entry.getKey(), new CachedQuote(entry.getValue()));
-                }
-            }
-
-            double totalWeight = 0.0;
-            double weightedTrend = 0.0;
-
-            for (Map.Entry<String, Double> entry : componentWeights.entrySet()) {
-                String symbol = entry.getKey();
-                Double weight = entry.getValue();
-
-                CachedQuote cached = componentQuoteCache.get(symbol);
-                if (cached != null && cached.quote != null) {
-                    Quote componentQuote = cached.quote;
-
-                    if (componentQuote.getLast() != null && componentQuote.getPreviousClose() != null) {
-                        BigDecimal dayChange = componentQuote.getLast()
-                                .subtract(componentQuote.getPreviousClose())
-                                .divide(componentQuote.getPreviousClose(), 4, BigDecimal.ROUND_HALF_UP);
-
-                        double symbolScore = 0.0;
-                        if (dayChange.compareTo(BigDecimal.valueOf(0.01)) > 0) {
-                            symbolScore = 1.0;
-                        } else if (dayChange.compareTo(BigDecimal.valueOf(0.005)) > 0) {
-                            symbolScore = 0.5;
-                        } else if (dayChange.compareTo(BigDecimal.valueOf(-0.005)) < 0) {
-                            symbolScore = -0.5;
-                        } else if (dayChange.compareTo(BigDecimal.valueOf(-0.01)) < 0) {
-                            symbolScore = -1.0;
-                        }
-
-                        weightedTrend += symbolScore * weight;
-                        totalWeight += weight;
-
-                        if (Math.abs(symbolScore) > 0) {
-                            log.debug("[TREND] {} change: {}% (score: {}, weight: {})",
-                                    symbol, String.format("%.2f", dayChange.multiply(BigDecimal.valueOf(100)).doubleValue()),
-                                    symbolScore, weight);
-                        }
-                    }
-                }
-            }
-
-            if (totalWeight > 0) {
-                componentScore = weightedTrend / totalWeight * 2.0;
-                log.info("[TREND] Component analysis score: {} (NVDA/MSFT weighted, cached)",
-                        String.format("%.2f", componentScore));
-            }
-
-        } catch (Exception e) {
-            log.error("Error analyzing QQQ components: {}", e.getMessage());
-        }
-
-        return componentScore;
-    }
-
-    private double getVolatilityAdjustment() {
-        try {
-            if (cachedVix == null || vixCacheTime == null ||
-                    LocalDateTime.now().isAfter(vixCacheTime.plusMinutes(5))) {
-
-                QuoteResponse vixResponse = tradierService.getQuote("VIX");
-                if (vixResponse != null && vixResponse.getQuote() != null) {
-                    cachedVix = vixResponse.getQuote().getLast();
-                    vixCacheTime = LocalDateTime.now();
-                }
-            }
-
-            if (cachedVix != null) {
-                double vix = cachedVix.doubleValue();
-
-                if (vix < 15) {
-                    return 0.8;
-                } else if (vix > 25) {
-                    return 1.3;
-                } else if (vix > 30) {
-                    return 1.5;
-                }
-            }
-        } catch (Exception e) {
-            log.debug("VIX fetch failed, using default adjustment: {}", e.getMessage());
-        }
-
-        return 1.0;
-    }
-
-    private MarketInternals getMarketInternals() {
-        try {
-            MarketInternals internals = new MarketInternals();
-
-            QuoteResponse qqqResponse = tradierService.getQuote("QQQ");
-            if (qqqResponse != null && qqqResponse.getQuote() != null) {
-                Quote qqqQuote = qqqResponse.getQuote();
-
-                if (qqqQuote.getBidSize() != null && qqqQuote.getAskSize() != null) {
-                    double breadth = (double) qqqQuote.getBidSize() /
-                            (qqqQuote.getBidSize() + qqqQuote.getAskSize());
-
-                    if (breadth > 0.6) {
-                        internals.setTrendBias(0.5);
-                    } else if (breadth < 0.4) {
-                        internals.setTrendBias(-0.5);
-                    } else {
-                        internals.setTrendBias(0.0);
-                    }
-                }
-            }
-
-            return internals;
-        } catch (Exception e) {
-            log.debug("Market internals fetch failed: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    private static class MarketInternals {
-        private double trendBias = 0.0;
-
-        public double getTrendBias() {
-            return trendBias;
-        }
-
-        public void setTrendBias(double bias) {
-            this.trendBias = bias;
-        }
-    }
-
-    private BigDecimal calculateCurrentVWAP() {
-        try {
-            List<MarketData> todaysData = marketDataRepository
-                    .findBySymbolAndTimestampAfterOrderByTimestampAsc("QQQ",
-                            LocalDateTime.now().withHour(9).withMinute(30));
-
-            if (todaysData.isEmpty()) return null;
-
-            BigDecimal cumulativePriceVolume = BigDecimal.ZERO;
-            BigDecimal cumulativeVolume = BigDecimal.ZERO;
-
-            for (MarketData data : todaysData) {
-                BigDecimal typicalPrice = data.getPrice();
-                long volume = data.getVolume() != null ? data.getVolume() : 0;
-
-                cumulativePriceVolume = cumulativePriceVolume
-                        .add(typicalPrice.multiply(BigDecimal.valueOf(volume)));
-                cumulativeVolume = cumulativeVolume.add(BigDecimal.valueOf(volume));
-            }
-
-            return cumulativeVolume.compareTo(BigDecimal.ZERO) > 0 ?
-                    cumulativePriceVolume.divide(cumulativeVolume, 2, BigDecimal.ROUND_HALF_UP) : null;
-
-        } catch (Exception e) {
-            log.debug("VWAP calculation error: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    private double calculateVolumeRatio(List<MarketData> recentData) {
-        if (recentData.size() < 10) return 1.0;
-
-        long recentVolume = recentData.stream()
-                .skip(Math.max(0, recentData.size() - 5))
-                .mapToLong(d -> d.getVolume() != null ? d.getVolume() : 0)
-                .sum();
-
-        long previousVolume = recentData.stream()
-                .skip(Math.max(0, recentData.size() - 10))
-                .limit(5)
-                .mapToLong(d -> d.getVolume() != null ? d.getVolume() : 0)
-                .sum();
-
-        return previousVolume > 0 ? (double) recentVolume / previousVolume : 1.0;
-    }
-
-    private BigDecimal getPriceMinutesAgo(List<MarketData> recentData, int minutes) {
-        if (recentData == null || recentData.isEmpty()) return null;
-
-        LocalDateTime targetTime = LocalDateTime.now().minusMinutes(minutes);
-
-        for (MarketData data : recentData) {
-            if (data.getTimestamp().isBefore(targetTime) ||
-                    data.getTimestamp().isEqual(targetTime)) {
-                return data.getPrice();
-            }
-        }
-
-        return null;
-    }
-
-    private long getAverageVolumeForQQQ() {
-        return 50000000L;
-    }
-
-
-
-//    @Scheduled(cron = "0 */5 * * * *") // Every 5 minutes
-//    public void cleanupExpiredSignals() {
-//        List<Signal> expiredSignals = signalRepository.findExpiredPendingSignals(LocalDateTime.now());
-//
-//        if (!expiredSignals.isEmpty()) {
-//            log.info("[CLEANUP] Marking {} expired signals", expiredSignals.size());
-//
-//            for (Signal signal : expiredSignals) {
-//                signal.setStatus("EXPIRED");
-//                signal.setExecuted(true);
-//                signal.setExecutionNotes("Auto-expired");
-//            }
-//
-//            signalRepository.saveAll(expiredSignals);
-//        }
-//    }
 }

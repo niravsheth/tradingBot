@@ -88,4 +88,8 @@ public class Signal {
     public String getNotes() { return notes; }
     public void setNotes(String notes) { this.notes = notes; }
 
+    public String getOptionSymbol() {
+        return this.optionSymbol; // Assuming field is 'optionSymbol'
+    }
+
 }

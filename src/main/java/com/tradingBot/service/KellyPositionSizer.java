@@ -21,8 +21,6 @@ import java.util.stream.Collectors;
 public class KellyPositionSizer {
 
     private final TradeRepository tradeRepository;
-    private final CapitalAllocationService capitalAllocationService;
-
     @Value("${trading.kelly.fraction:0.25}")
     private double kellyFraction; // Use 1/4 Kelly for safety
 
@@ -38,11 +36,44 @@ public class KellyPositionSizer {
     @Value("${trading.kelly.max-contracts:20}")
     private int maxContracts;
 
+    @Value("${trading.total-capital}")
+    private BigDecimal totalCapital;
+
+    public BigDecimal getAvailableCapital() {
+        log.debug("[v62] Calculating available capital");
+
+        // Start with total capital
+        BigDecimal available = totalCapital;
+
+        // Subtract today's losses (or add gains)
+        LocalDateTime startOfDay = LocalDateTime.now().withHour(0).withMinute(0);
+        BigDecimal todayPnL = tradeRepository.calculateProfitSince(startOfDay);
+        if (todayPnL != null) {
+            available = available.add(todayPnL);
+            log.debug("[v62] Adjusted for today's P&L: ${} (available: ${})", todayPnL, available);
+        }
+
+        // Subtract capital in open positions
+        List<Trade> openTrades = tradeRepository.findByStatus("OPEN");
+        BigDecimal capitalInUse = BigDecimal.ZERO;
+
+        for (Trade trade : openTrades) {
+            BigDecimal positionValue = trade.getEntryPrice()
+                    .multiply(BigDecimal.valueOf(trade.getQuantity() * 100));
+            capitalInUse = capitalInUse.add(positionValue);
+        }
+
+        available = available.subtract(capitalInUse);
+        log.info("[v62] Available capital: ${} (Total: ${}, In use: ${}, Today P&L: ${})",
+                available, totalCapital, capitalInUse, todayPnL != null ? todayPnL : 0);
+
+        return available.max(BigDecimal.ZERO);
+    }
     public int calculateOptimalSize(Signal signal, BigDecimal currentOptionPrice) {
         String sizeId = "SIZE-" + signal.getId();
 
         // Get available capital
-        BigDecimal availableCapital = capitalAllocationService.getAvailableCapital();
+        BigDecimal availableCapital = getAvailableCapital();
         if (availableCapital.compareTo(BigDecimal.ZERO) <= 0) {
             log.warn("[{}] No available capital", sizeId);
             return 0;

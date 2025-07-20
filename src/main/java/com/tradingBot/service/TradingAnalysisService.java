@@ -15,9 +15,13 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
@@ -177,5 +181,25 @@ public class TradingAnalysisService {
     @Scheduled(cron = "0 0 0 * * *") // Midnight
     public void clearDailyData() {
         todaysBlockedSignals.clear();
+    }
+    // Make blocked signals accessible
+    public List<BlockedSignalInfo> getTodaysBlockedSignals() {
+        return new ArrayList<>(todaysBlockedSignals);
+    }
+
+    // Add market breadth tracking
+    private final Map<LocalDateTime, Double> marketBreadthHistory = new ConcurrentHashMap<>();
+
+    public void recordMarketBreadth(double breadth) {
+        marketBreadthHistory.put(LocalDateTime.now(), breadth);
+    }
+
+    public double getMarketBreadthAt(LocalDateTime time) {
+        // Find closest breadth reading
+        return marketBreadthHistory.entrySet().stream()
+                .min(Comparator.comparing(e ->
+                        Duration.between(e.getKey(), time).abs()))
+                .map(Map.Entry::getValue)
+                .orElse(0.5);
     }
 }

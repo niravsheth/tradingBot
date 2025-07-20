@@ -36,10 +36,6 @@ public class ZeroDTEStrategy {
     @Value("${trading.max-spread-percentage:10.0}")
     private double maxSpreadPercentage;
 
-    @Value("${trading.signal-expiration-minutes:5}")
-    private int signalExpirationMinutes;
-
-
 
     // Timezone
     private static final ZoneId ET_ZONE = ZoneId.of("America/New_York");
@@ -47,12 +43,6 @@ public class ZeroDTEStrategy {
     // Updated strategy thresholds - REDUCED FOR 0DTE
     private static final double MIN_VOLUME_RATIO_BREAKOUT = 1.2;
     private static final double MIN_VOLUME_RATIO_STANDARD = 0.8;
-    private static final double MAX_RSI_DIVERGENCE = 65.0;
-    private static final double MIN_RSI_DIVERGENCE = 35.0;
-
-    // Time windows
-    private static final LocalTime OPENING_RANGE_END = LocalTime.of(9, 45);
-    private static final LocalTime MORNING_SESSION_END = LocalTime.of(11, 30);
     private static final LocalTime PRIME_WINDOW_1_START = LocalTime.of(9, 45);
     private static final LocalTime PRIME_WINDOW_1_END = LocalTime.of(10, 30);
     private static final LocalTime PRIME_WINDOW_2_START = LocalTime.of(10, 30);
@@ -63,23 +53,17 @@ public class ZeroDTEStrategy {
     private static final LocalTime FINAL_WINDOW_END = LocalTime.of(15, 55);
 
 
-    // Flow detection thresholds
-    private static final double UNUSUAL_VOLUME_RATIO = 5.0;
-    private static final int UNUSUAL_VOLUME_MIN = 5000;
-    private static final double SMART_MONEY_THRESHOLD = 50000;
-
-    // UPDATED METHOD SIGNATURE TO ACCEPT MARKET TREND
     public List<Signal> analyzeOptions(String symbol, String marketTrend) {
         String analysisId = UUID.randomUUID().toString().substring(0, 8);
-        log.info("[INST][{}] ========== INSTITUTIONAL ANALYSIS START ==========", analysisId);
-        log.info("[INST][{}] Market trend: {}", analysisId, marketTrend);
+        log.info("Trading ANALYSIS START ==========", analysisId);
+        log.info("Market trend: {}", analysisId, marketTrend);
 
         List<Signal> rawSignals = new ArrayList<>();
 
         try {
             // PRE-TRADE MARKET CHECKS
             if (!preTradeRiskEngine.isMarketSuitable()) {
-                log.warn("[INST][{}] Market unsuitable for trading - aborting analysis", analysisId);
+                log.warn("Market unsuitable for trading - aborting analysis", analysisId);
                 return Collections.emptyList();
             }
 
@@ -211,7 +195,7 @@ public class ZeroDTEStrategy {
         }
     }
 
-    // Helper method to get Option from Signal
+
     private Option getOptionFromSignal(Signal signal, List<Option> options) {
         return options.stream()
                 .filter(opt -> opt.getSymbol().equals(signal.getOptionSymbol()))
@@ -219,7 +203,6 @@ public class ZeroDTEStrategy {
                 .orElse(null);
     }
 
-    // New method for dynamic strike selection
     private List<Option> selectStrikesBasedOnVolatility(List<Option> options, TechnicalAnalysis ta, String analysisId) {
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal dayRange = BigDecimal.ZERO;
@@ -294,7 +277,7 @@ public class ZeroDTEStrategy {
         return selected;
     }
 
-    // New method to save signals for immediate execution
+
     private void saveSignalsImmediate(List<Signal> signals, TechnicalAnalysis ta,
                                       String marketTrend, String analysisId) {
         for (Signal signal : signals) {
@@ -427,7 +410,6 @@ public class ZeroDTEStrategy {
                 analysisId, totalFlows, filteredAsHedging, confirmedDirectional, smartMoneyFlows);
     }
 
-    // OVERLOADED METHOD FOR BACKWARD COMPATIBILITY
     public List<Signal> analyzeOptions(String symbol) {
         return analyzeOptions(symbol, "NEUTRAL");
     }
@@ -460,28 +442,6 @@ public class ZeroDTEStrategy {
     private MarketInternals getMarketInternals() {
         MarketInternals internals = new MarketInternals();
         return internals;
-    }
-
-    private double estimateMaxConfidence(TechnicalAnalysis ta) {
-        double maxConfidence = 0.5;
-
-        if (ta.getVolumeRatio() > 2.0) {
-            maxConfidence = Math.max(maxConfidence, 0.75);
-        }
-
-        if (ta.isVwapBreakout() && ta.getVolumeRatio() > 1.5) {
-            maxConfidence = Math.max(maxConfidence, 0.78);
-        }
-
-        if (ta.isExtendedFromVwap() && (ta.getRsi() > 70 || ta.getRsi() < 30)) {
-            maxConfidence = Math.max(maxConfidence, 0.80);
-        }
-
-        if ((ta.isVwapAsSupport() || ta.isVwapAsResistance()) && ta.getVolumeRatio() > 1.0) {
-            maxConfidence = Math.max(maxConfidence, 0.70);
-        }
-
-        return maxConfidence;
     }
 
     private boolean isGoodTradingTime(LocalTime now) {
@@ -724,38 +684,7 @@ public class ZeroDTEStrategy {
         return filtered;
     }
 
-    private BigDecimal findATMStrike(Set<BigDecimal> strikes, BigDecimal currentPrice) {
-        // Find the closest strike to current price
-        return strikes.stream()
-                .min(Comparator.comparing(strike -> strike.subtract(currentPrice).abs()))
-                .orElse(currentPrice.setScale(0, RoundingMode.HALF_UP));
-    }
 
-    private BigDecimal determineStrikeInterval(Set<BigDecimal> strikes) {
-        if (strikes.size() < 2) {
-            return BigDecimal.ONE; // Default $1
-        }
-
-        List<BigDecimal> strikeList = new ArrayList<>(strikes);
-        Collections.sort(strikeList);
-
-        // Get the most common interval
-        Map<BigDecimal, Integer> intervalCounts = new HashMap<>();
-
-        for (int i = 1; i < Math.min(strikeList.size(), 10); i++) {
-            BigDecimal interval = strikeList.get(i).subtract(strikeList.get(i-1));
-            intervalCounts.merge(interval, 1, Integer::sum);
-        }
-
-        return intervalCounts.entrySet().stream()
-                .max(Map.Entry.comparingByValue())
-                .map(Map.Entry::getKey)
-                .orElse(BigDecimal.ONE);
-    }
-
-    private TradingAnalysisService analysisService;
-
-    // UPDATED METHOD SIGNATURE
     private void analyzeOptionWithStrategies(Option option, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend,
                                              String analysisId, List<Option> allOptions){
@@ -806,19 +735,7 @@ public class ZeroDTEStrategy {
             analyzeVWAPBounce(option,allOptions, ta, signals, marketTrend, analysisId);
         }
     }
-    // In PreTradeRiskEngine.java - Track breadth blocks
-//    public boolean isMarketSuitable() {
-//        if (marketBreadth < MIN_MARKET_BREADTH) {
-//            // Track this block
-//            applicationEventPublisher.publishEvent(
-//                    new MarketBreadthBlockEvent(marketBreadth)
-//            );
-//            log.warn("Market breadth too low: {} < {}", marketBreadth, MIN_MARKET_BREADTH);
-//            return false;
-//        }
-//        return true;
-//    }
-    // UPDATE ALL STRATEGY METHODS TO ACCEPT MARKET TREND
+
     private void analyzeOpeningDriveStrategy(Option option,List<Option> allOptions, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend, String analysisId) {
         if (!detectOpeningDrive(ta, analysisId)) {
@@ -1049,8 +966,7 @@ public class ZeroDTEStrategy {
         }
 
         boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions,analysisId);
-        BigDecimal currentPrice = ta.getCurrentPrice();
-        BigDecimal vwap = ta.getVwap();
+
         double priceRatio = ta.getPriceToVwapRatio();
 
         log.info("[v63][{}] Deviation Reversion - Price/VWAP: {}, Extended: {}",
@@ -1290,82 +1206,6 @@ public class ZeroDTEStrategy {
         }
     }
 
-    // Update saveSignals() method
-    private void saveSignals(List<Signal> signals, TechnicalAnalysis ta,
-                             String marketTrend, String analysisId) {
-        for (Signal signal : signals) {
-            // ALL signals go directly to PENDING for immediate execution
-            signal.setStatus("PENDING");
-            signal.setCreatedAt(LocalDateTime.now());
-            signal.setEntryAssumptionPrice(ta.getCurrentPrice());
-            signal.setMarketTrend(marketTrend);
-            signal.setOriginalOptionPrice(signal.getEntryPrice());
-
-            // Very short expiration - 30 seconds
-            LocalDateTime expirationTime = LocalDateTime.now().plusSeconds(30);
-            signal.setExpirationTime(expirationTime);
-
-            signalRepository.save(signal);
-
-            log.info("[INST][{}] PENDING {} - {} {}, Confidence: {}%, Ready for IMMEDIATE execution",
-                    analysisId, signal.getStrategy(), signal.getSignalType(),
-                    signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
-
-            // Alert for all signals now (since all are immediate)
-            if (signal.getConfidence() >= 0.70) {
-                telegramService.sendMessage(String.format(
-                        "⚡ IMMEDIATE EXECUTION SIGNAL\n" +
-                                "Strategy: %s\n" +
-                                "Option: %s\n" +
-                                "Confidence: %d%%\n" +
-                                "Entry: $%.2f\n" +
-                                "Executing in <500ms...",
-                        signal.getStrategy(),
-                        signal.getOptionSymbol(),
-                        (int)(signal.getConfidence() * 100),
-                        signal.getEntryPrice()
-                ));
-            }
-        }
-    }
-    private int calculateDynamicExpiration(Signal signal, TechnicalAnalysis ta) {
-        String strategy = signal.getStrategy();
-        LocalTime now = LocalTime.now(ET_ZONE);
-
-        // Unusual flow - very short expiration
-        if (strategy.contains("UNUSUAL_FLOW")) {
-            return 2; // 2 minutes - execute ASAP
-        }
-        // Near market close - VERY short window
-        if (now.isAfter(LocalTime.of(15, 30))) {
-            return 1; // 1 minute only!
-        }
-
-        // High confidence signals - quick execution
-        if (signal.getConfidence() >= 0.85) {
-            return 3; // 3 minutes for high confidence
-        }
-
-        // Scalp trades - medium expiration
-        if (strategy.contains("SCALP") || strategy.contains("BOUNCE")) {
-            return 4; // 4 minutes
-        }
-
-        // Breakout trades - slightly longer
-        if (strategy.contains("BREAKOUT") || strategy.contains("OPENING_DRIVE")) {
-            return 5; // 5 minutes
-        }
-
-
-        // High volatility - faster execution needed
-        if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
-            return 3; // 3 minutes
-        }
-
-        // Default - still quick
-        return 4; // 4 minutes default
-    }
-
 
     private double calculateBreakoutConfidence(TechnicalAnalysis ta, boolean bullish) {
         double confidence = 0.5;
@@ -1502,7 +1342,7 @@ public class ZeroDTEStrategy {
         return Math.min(confidence, 0.85);
     }
 
-    // UPDATED createSignal METHOD WITH MARKET TREND
+
     private Signal createSignal(Option option,List<Option> allOptions, TechnicalAnalysis ta, String signalType,
                                 String strategy, double confidence, String marketTrend) {
         if (option == null || ta == null || signalType == null || strategy == null) {
@@ -1558,7 +1398,6 @@ public class ZeroDTEStrategy {
         }
     }
 
-    // NEW DYNAMIC STOP LOSS CALCULATION
     private BigDecimal calculateDynamicStopLoss(BigDecimal entryPrice, BigDecimal atr, String strategy,
                                                 TechnicalAnalysis ta, String marketTrend, Option option) {
         if (entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0) {
@@ -1625,7 +1464,6 @@ public class ZeroDTEStrategy {
         return stopLoss.setScale(2, RoundingMode.HALF_UP);
     }
 
-    // NEW DYNAMIC TARGET CALCULATION
     private BigDecimal calculateDynamicTargetPrice(BigDecimal entryPrice, BigDecimal atr, String strategy,
                                                    TechnicalAnalysis ta, String marketTrend, Option option) {
         if (entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0) {
@@ -1738,7 +1576,6 @@ public class ZeroDTEStrategy {
                 analysisId, strategyName, (int)(confidence * 100));
     }
 
-    // UPDATED TREND ALIGNMENT CHECK
     private boolean isSignalAlignedWithTrend(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                              String marketTrend, String analysisId) {
         log.info("[{}] Market trend: {}, TA trend: {}, Price: ${}, VWAP: ${}",

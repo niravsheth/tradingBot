@@ -703,8 +703,6 @@ public class TechnicalAnalysisService {
         return current.compareTo(p1Low) < 0 && current.compareTo(p2Low) < 0 &&
                 current.compareTo(n1Low) < 0 && current.compareTo(n2Low) < 0;
     }
-
-    // UPDATED analyzeTrends METHOD - MUCH MORE SENSITIVE
     private void analyzeTrends(List<MarketData> data, TechnicalAnalysis ta) {
         if (data.size() < 5) {
             ta.setTrend("NEUTRAL");

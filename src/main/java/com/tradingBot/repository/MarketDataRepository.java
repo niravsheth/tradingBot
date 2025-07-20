@@ -13,7 +13,7 @@ import java.util.Optional;
 
 @Repository
 public interface MarketDataRepository extends JpaRepository<MarketData, Long> {
-    MarketData findTopBySymbolOrderByTimestampDesc(String symbol);
+
     List<MarketData> findBySymbolAndTimestampAfterOrderByTimestampAsc(String symbol, LocalDateTime timestamp);
 
     @Query("SELECT m FROM MarketData m WHERE m.symbol = :symbol " +
@@ -33,20 +33,5 @@ public interface MarketDataRepository extends JpaRepository<MarketData, Long> {
                                                      @Param("startTime") LocalDateTime startTime,
                                                      @Param("endTime") LocalDateTime endTime);
 
-    List<MarketData> findBySymbolAndTimestampAfterOrderByTimestampDesc(
-            String symbol, LocalDateTime after);
 
-    List<MarketData> findBySymbolAndTimestampBetweenOrderByTimestamp(
-            String symbol, LocalDateTime start, LocalDateTime end);
-
-    @Query("SELECT m FROM MarketData m WHERE m.symbol = :symbol " +
-            "ORDER BY m.timestamp DESC LIMIT 1")
-    Optional<MarketData> findLatestBySymbol(@Param("symbol") String symbol);
-
-    @Query("SELECT DISTINCT m.symbol FROM MarketData m WHERE m.timestamp > :after")
-    List<String> findActiveSymbolsSince(@Param("after") LocalDateTime after);
-
-    @Modifying  // Added for delete operation
-    @Query("DELETE FROM MarketData m WHERE m.timestamp < :before")
-    void deleteOldData(@Param("before") LocalDateTime before);
 }

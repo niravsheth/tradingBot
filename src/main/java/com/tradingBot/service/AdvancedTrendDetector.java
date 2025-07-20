@@ -42,9 +42,6 @@ public class AdvancedTrendDetector {
 
     public String detectTrend(String symbol) {
         try {
-            // 1. Get market internals (with fallback if not available)
-           // MarketInternals internals = getMarketInternals();
-
             // 2. Volume-confirmed price action
             VolumeProfile volumeProfile = analyzeVolumeProfile(symbol);
 
@@ -201,113 +198,6 @@ public class AdvancedTrendDetector {
         }
     }
 
-//    private MarketInternals getMarketInternals() {
-//        MarketInternals internals = new MarketInternals();
-//
-//        try {
-//            // Try to get TICK - but handle if not available
-////            try {
-////                QuoteResponse tickResponse = tradierService.getQuote("$TICK");
-////                if (tickResponse != null && tickResponse.getQuote() != null && tickResponse.getQuote().getLast() != null) {
-////                    internals.setTick(tickResponse.getQuote().getLast().intValue());
-////                    internals.setHasData(true);
-////                }
-////            } catch (Exception e) {
-////                log.debug("TICK data not available: {}", e.getMessage());
-////            }
-//
-//            // Try to get advance/decline - but handle if not available
-////            try {
-////                QuoteResponse addResponse = tradierService.getQuote("$ADD");
-////                if (addResponse != null && addResponse.getQuote() != null && addResponse.getQuote().getLast() != null) {
-////                    internals.setAdvanceDecline(addResponse.getQuote().getLast().intValue());
-////                    internals.setHasData(true);
-////                }
-////            } catch (Exception e) {
-////                log.debug("ADD data not available: {}", e.getMessage());
-////            }
-//
-//            // Try to get up/down volume - but handle if not available
-////            try {
-////                QuoteResponse voldResponse = tradierService.getQuote("$VOLD");
-////                if (voldResponse != null && voldResponse.getQuote() != null && voldResponse.getQuote().getLast() != null) {
-////                    internals.setDownVolume(voldResponse.getQuote().getLast().longValue());
-////                    internals.setHasData(true);
-////                }
-////            } catch (Exception e) {
-////                log.debug("VOLD data not available: {}", e.getMessage());
-////            }
-//
-////            try {
-////                QuoteResponse voluResponse = tradierService.getQuote("$VOLU");
-////                if (voluResponse != null && voluResponse.getQuote() != null && voluResponse.getQuote().getLast() != null) {
-////                    internals.setUpVolume(voluResponse.getQuote().getLast().longValue());
-////                    internals.setHasData(true);
-////                }
-////            } catch (Exception e) {
-////                log.debug("VOLU data not available: {}", e.getMessage());
-////            }
-//
-//            // If we couldn't get market internals, try to infer from SPY/QQQ breadth
-//            if (!internals.hasValidData()) {
-//                log.debug("Market internals not available from standard symbols, using fallback method");
-//                internals = inferMarketInternalsFromETFs();
-//            }
-//
-//        } catch (Exception e) {
-//            log.debug("Market internals fetch failed: {}", e.getMessage());
-//        }
-//
-//        return internals;
-//    }
-
-    private MarketInternals inferMarketInternalsFromETFs() {
-        MarketInternals internals = new MarketInternals();
-
-        try {
-            // Use SPY and QQQ data as proxy for market internals
-            QuoteResponse spyResponse = tradierService.getQuote("SPY");
-            QuoteResponse qqqResponse = tradierService.getQuote("QQQ");
-
-            if (spyResponse != null && spyResponse.getQuote() != null &&
-                    qqqResponse != null && qqqResponse.getQuote() != null) {
-
-                // Infer advance/decline from price changes
-                BigDecimal spyChange = calculatePercentChange(spyResponse.getQuote());
-                BigDecimal qqqChange = calculatePercentChange(qqqResponse.getQuote());
-
-                if (spyChange != null && qqqChange != null) {
-                    // If both positive, market is advancing
-                    if (spyChange.compareTo(BigDecimal.ZERO) > 0 && qqqChange.compareTo(BigDecimal.ZERO) > 0) {
-                        internals.setAdvanceDecline(500); // Simulated positive A/D
-                    } else if (spyChange.compareTo(BigDecimal.ZERO) < 0 && qqqChange.compareTo(BigDecimal.ZERO) < 0) {
-                        internals.setAdvanceDecline(-500); // Simulated negative A/D
-                    } else {
-                        internals.setAdvanceDecline(0); // Mixed signals
-                    }
-
-                    // Infer up/down volume from actual volume
-                    if (spyResponse.getQuote().getVolume() != null) {
-                        long volume = spyResponse.getQuote().getVolume();
-                        if (spyChange.compareTo(BigDecimal.ZERO) > 0) {
-                            internals.setUpVolume((long)(volume * 0.6));
-                            internals.setDownVolume((long)(volume * 0.4));
-                        } else {
-                            internals.setUpVolume((long)(volume * 0.4));
-                            internals.setDownVolume((long)(volume * 0.6));
-                        }
-                    }
-
-                    internals.setHasData(true);
-                }
-            }
-        } catch (Exception e) {
-            log.debug("Failed to infer market internals from ETFs: {}", e.getMessage());
-        }
-
-        return internals;
-    }
-
     private BigDecimal calculatePercentChange(com.tradingBot.model.Quote quote) {
         if (quote.getLast() != null && quote.getPreviousClose() != null &&
                 quote.getPreviousClose().compareTo(BigDecimal.ZERO) > 0) {
@@ -376,7 +266,6 @@ public class AdvancedTrendDetector {
                 }
             }
         }
-
         return new VolumeProfile(buyVolume, sellVolume);
     }
 
@@ -457,27 +346,6 @@ public class AdvancedTrendDetector {
         }
     }
 
-    @Data
-    private static class MarketInternals {
-        private int tick = 0;
-        private int advanceDecline = 0;
-        private long upVolume = 0;
-        private long downVolume = 0;
-        private boolean hasData = false;
-
-        public boolean hasValidData() {
-            return hasData;
-        }
-
-        public double getAdvanceDeclineRatio() {
-            // Calculate advancing vs declining stocks ratio
-            if (advanceDecline > 1000) return 3.0;
-            if (advanceDecline > 500) return 2.0;
-            if (advanceDecline < -1000) return 0.33;
-            if (advanceDecline < -500) return 0.5;
-            return 1.0;
-        }
-    }
 
     private final Map<String, String> previousTrends = new ConcurrentHashMap<>();
 

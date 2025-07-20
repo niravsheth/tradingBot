@@ -92,4 +92,6 @@ public interface SignalRepository extends JpaRepository<Signal, Long> {
             "AND s.expirationTime <= :currentTime")
     List<Signal> findExpiredSignals(@Param("currentTime") LocalDateTime currentTime);
 
+    List<Signal> findByCreatedAtAfter(LocalDateTime after);
+
 }
