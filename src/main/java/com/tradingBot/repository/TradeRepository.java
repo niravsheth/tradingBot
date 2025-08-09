@@ -8,10 +8,14 @@ import org.springframework.stereotype.Repository;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.Optional;
 
 @Repository
 public interface TradeRepository extends JpaRepository<Trade, Long> {
+
+    List<Trade> findAll();
     List<Trade> findByStatusAndSymbol(String status, String symbol);
 
     @Query("SELECT t FROM Trade t WHERE t.entryTime >= :startDate AND t.status = 'CLOSED'")
@@ -59,5 +63,13 @@ public interface TradeRepository extends JpaRepository<Trade, Long> {
     @Query("SELECT t FROM Trade t WHERE t.strategy = :strategy AND t.entryTime >= :after ORDER BY t.entryTime DESC")
     List<Trade> findByStrategyAndCreatedAtAfter(@Param("strategy") String strategy, @Param("after") LocalDateTime after);
 
+    List<Trade> findByStrategyAndStatusInAndCreatedAtAfter(
+            String strategy,
+            List<String> statuses,
+            ZonedDateTime createdAt
+    );
+
+    // In TradeRepository interface, add:
+    Optional<Trade> findBySignalId(Long signalId);
 
 }

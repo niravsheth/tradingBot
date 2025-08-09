@@ -7,6 +7,7 @@ import com.tradingBot.repository.MarketDataRepository;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -78,7 +79,7 @@ public class TechnicalAnalysisService {
             return null;
         }
 
-        log.info("[TA] Found {} data points for analysis", sessionData.size());
+        //log.info("[TA] Found {} data points for analysis", sessionData.size());
 
         // Get current quote
         QuoteResponse quote = tradierService.getQuote(symbol);
@@ -131,8 +132,11 @@ public class TechnicalAnalysisService {
         // Calculate VWAP extensions
         calculateVwapExtensions(ta);
 
-        log.info("[TA] Analysis complete - VWAP: ${}, Price: ${}, RSI: {:.1f}, Volume Ratio: {:.2f}, Regime: {}",
-                ta.getVwap(), ta.getCurrentPrice(), ta.getRsi(), ta.getVolumeRatio(), ta.getMarketRegime());
+        log.info("[TA] Analysis complete - VWAP: ${}, Price: ${}, RSI: {}, Volume Ratio: {}, Regime: {}",
+                ta.getVwap(), ta.getCurrentPrice(),
+                String.format("%.1f", ta.getRsi()),
+                String.format("%.2f", ta.getVolumeRatio()),
+                ta.getMarketRegime());
 
         // Get previous close from market data
         BigDecimal previousClose = getPreviousCloseFromTradier(symbol);
@@ -297,53 +301,94 @@ public class TechnicalAnalysisService {
 
     private void checkVWAPSupportResistanceOptimized(List<MarketData> recentData,
                                                      BigDecimal vwap, TechnicalAnalysis ta) {
-        if (recentData.size() < 5) {
+        if (recentData.size() < 3) {
             ta.setVwapAsSupport(false);
             ta.setVwapAsResistance(false);
             return;
         }
 
-        int touchesAbove = 0;
-        int touchesBelow = 0;
-        int rejections = 0;
+        int supportTouches = 0;
+        int resistanceTouches = 0;
+        int successfulBounces = 0;
 
-        BigDecimal vwapThreshold = vwap.multiply(BigDecimal.valueOf(0.0015)); // 0.15% threshold
+        // More sensitive threshold - 0.1% instead of 0.15%
+        BigDecimal vwapThreshold = vwap.multiply(BigDecimal.valueOf(0.001));
 
-        for (int i = 1; i < recentData.size(); i++) {
+        for (int i = 1; i < recentData.size() - 1; i++) {
             MarketData current = recentData.get(i);
             MarketData previous = recentData.get(i - 1);
+            MarketData next = recentData.get(i + 1);
 
-            BigDecimal low = current.getLow() != null ? current.getLow() : current.getPrice();
-            BigDecimal high = current.getHigh() != null ? current.getHigh() : current.getPrice();
+            BigDecimal currentLow = current.getLow() != null ? current.getLow() : current.getPrice();
+            BigDecimal currentHigh = current.getHigh() != null ? current.getHigh() : current.getPrice();
+            BigDecimal currentPrice = current.getPrice();
 
-            // Check if candle crossed VWAP
-            boolean crossedVwap = (previous.getPrice().compareTo(vwap) < 0 && high.compareTo(vwap) >= 0) ||
-                    (previous.getPrice().compareTo(vwap) > 0 && low.compareTo(vwap) <= 0);
-
-            if (crossedVwap) {
-                // Check rejection
-                if (current.getPrice().compareTo(vwap) > 0 &&
-                        low.subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
-                    touchesAbove++;
-                } else if (current.getPrice().compareTo(vwap) < 0 &&
-                        vwap.subtract(high).abs().compareTo(vwapThreshold) <= 0) {
-                    touchesBelow++;
+            // Check for support touch (price dipped to VWAP and bounced)
+            if (currentLow.subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
+                // Price touched VWAP from above
+                if (previous.getPrice().compareTo(vwap) > 0) {
+                    // Check if it bounced (next price is higher)
+                    if (next.getPrice().compareTo(currentPrice) > 0 &&
+                            next.getPrice().compareTo(vwap) > 0) {
+                        supportTouches++;
+                        successfulBounces++;
+                        log.debug("Support bounce detected at index {} - Low: {}, VWAP: {}, Next: {}",
+                                i, currentLow, vwap, next.getPrice());
+                    }
                 }
+            }
 
-                // Check if it was rejected
-                if (i + 1 < recentData.size()) {
-                    MarketData next = recentData.get(i + 1);
-                    if ((current.getPrice().compareTo(vwap) > 0 && next.getPrice().compareTo(current.getPrice()) > 0) ||
-                            (current.getPrice().compareTo(vwap) < 0 && next.getPrice().compareTo(current.getPrice()) < 0)) {
-                        rejections++;
+            // Check for resistance touch (price rose to VWAP and rejected)
+            if (vwap.subtract(currentHigh).abs().compareTo(vwapThreshold) <= 0) {
+                // Price touched VWAP from below
+                if (previous.getPrice().compareTo(vwap) < 0) {
+                    // Check if it was rejected (next price is lower)
+                    if (next.getPrice().compareTo(currentPrice) < 0 &&
+                            next.getPrice().compareTo(vwap) < 0) {
+                        resistanceTouches++;
+                        log.debug("Resistance rejection detected at index {} - High: {}, VWAP: {}, Next: {}",
+                                i, currentHigh, vwap, next.getPrice());
                     }
                 }
             }
         }
 
-        // Statistical significance test
-        ta.setVwapAsSupport(touchesAbove >= 2 && rejections < touchesAbove / 2);
-        ta.setVwapAsResistance(touchesBelow >= 2 && rejections < touchesBelow / 2);
+        // Also check the most recent candle for real-time detection
+        if (recentData.size() >= 2) {
+            MarketData latest = recentData.get(recentData.size() - 1);
+            MarketData previousCandle = recentData.get(recentData.size() - 2);
+
+            // Real-time support check
+            if (latest.getPrice().compareTo(vwap) > 0 &&
+                    previousCandle.getLow() != null &&
+                    previousCandle.getLow().subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
+                // Just bounced off VWAP
+                supportTouches++;
+                log.info("REAL-TIME: Potential support bounce - Current: {}, VWAP: {}",
+                        latest.getPrice(), vwap);
+            }
+
+            // Real-time resistance check
+            if (latest.getPrice().compareTo(vwap) < 0 &&
+                    previousCandle.getHigh() != null &&
+                    vwap.subtract(previousCandle.getHigh()).abs().compareTo(vwapThreshold) <= 0) {
+                // Just rejected from VWAP
+                resistanceTouches++;
+                log.info("REAL-TIME: Potential resistance rejection - Current: {}, VWAP: {}",
+                        latest.getPrice(), vwap);
+            }
+        }
+
+        // Lower threshold for 0DTE - only need 1 clean touch/bounce
+        ta.setVwapAsSupport(supportTouches >= 1 && successfulBounces >= 1);
+        ta.setVwapAsResistance(resistanceTouches >= 1);
+
+        if (ta.isVwapAsSupport()) {
+            log.info("VWAP acting as SUPPORT - {} touches, {} bounces", supportTouches, successfulBounces);
+        }
+        if (ta.isVwapAsResistance()) {
+            log.info("VWAP acting as RESISTANCE - {} touches", resistanceTouches);
+        }
     }
 
     private BigDecimal calculateVWAPAtIndex(List<MarketData> data, int endIndex) {
@@ -703,34 +748,12 @@ public class TechnicalAnalysisService {
         return current.compareTo(p1Low) < 0 && current.compareTo(p2Low) < 0 &&
                 current.compareTo(n1Low) < 0 && current.compareTo(n2Low) < 0;
     }
+    @Autowired
+    private UnifiedTrendDetector unifiedTrendDetector;
     private void analyzeTrends(List<MarketData> data, TechnicalAnalysis ta) {
-        if (data.size() < 5) {
-            ta.setTrend("NEUTRAL");
-            ta.setStrength(0.0);
-            return;
-        }
-
-        // Use very short timeframe for 0DTE (5 bars instead of 10)
-        BigDecimal firstPrice = data.get(Math.max(0, data.size() - 5)).getPrice();
-        BigDecimal lastPrice = data.get(data.size() - 1).getPrice();
-        BigDecimal priceChange = lastPrice.subtract(firstPrice);
-        BigDecimal priceChangePercent = priceChange.divide(firstPrice, 4, RoundingMode.HALF_UP);
-
-        // EXTREMELY sensitive thresholds for intraday - 0.05% (5 basis points)
-        if (priceChangePercent.compareTo(BigDecimal.valueOf(0.0005)) > 0) { // 0.05%
-            ta.setTrend("UP"); // Match TradingScheduler naming
-            ta.setStrength(Math.min(priceChangePercent.doubleValue() * 200, 1.0)); // Scale up
-        } else if (priceChangePercent.compareTo(BigDecimal.valueOf(-0.0005)) < 0) { // -0.05%
-            ta.setTrend("DOWN"); // Match TradingScheduler naming
-            ta.setStrength(Math.min(Math.abs(priceChangePercent.doubleValue()) * 200, 1.0));
-        } else {
-            ta.setTrend("NEUTRAL");
-            ta.setStrength(Math.abs(priceChangePercent.doubleValue()) * 200);
-        }
-
-        log.info("[TA] Trend Analysis - First: ${}, Last: ${}, Change: {}%, Trend: {}",
-                firstPrice, lastPrice, priceChangePercent.multiply(BigDecimal.valueOf(100)),
-                ta.getTrend());
+        String trend = unifiedTrendDetector.detectTrend("QQQ");
+        ta.setTrend(trend);
+        log.info("[TA] Trend: {}", ta.getTrend());
     }
 
     private void checkReversals(TechnicalAnalysis ta) {

@@ -6,6 +6,8 @@ import com.tradingBot.model.*;
 import com.tradingBot.repository.*;
 import com.tradingBot.service.PositionSyncService.BrokerPosition;
 import jakarta.annotation.PostConstruct;
+import lombok.AllArgsConstructor;
+import lombok.NoArgsConstructor;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
@@ -16,16 +18,13 @@ import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 
 @Service
 @Slf4j
-@RequiredArgsConstructor
+@AllArgsConstructor
 public class TradingService {
     private final TradierService tradierService;
     private final TelegramService telegramService;
@@ -37,24 +36,21 @@ public class TradingService {
     private final ExecutionPipeline executionPipeline;
     private final PreTradeRiskEngine preTradeRiskEngine;
 
+    private final SignalConfirmationService signalConfirmationService;
+
     private final SafetyService safetyService;
     private final PositionSyncService positionSyncService;
+    private final EnhancedStopLossMonitor enhancedStopLossMonitor;
 
-    @Value("${trading.max-position-size}")
-    private BigDecimal maxPositionSize;
+    private final IntegratedBayesianMLSystem integratedBayesianMLSystem;
 
-    @Value("${trading.risk-percentage}")
-    private Double riskPercentage;
-
-    @Value("${safety.paper-mode:true}")
-    private boolean paperMode;
 
     @Transactional
     public void executeSignals() {
         String executionId = UUID.randomUUID().toString().substring(0, 8);
         log.info("[INST][{}] === INSTITUTIONAL EXECUTION START ===", executionId);
 
-        // Get pending signals - NO tracking status anymore
+        // Get pending signals
         List<Signal> signals = signalRepository
                 .findByStatusAndExpirationTimeAfter("PENDING", LocalDateTime.now())
                 .stream()
@@ -73,7 +69,7 @@ public class TradingService {
                 })
                 .collect(Collectors.toList());
 
-        log.info("[INST][{}] Found {} signals ready for immediate execution",
+        log.info("[INST][{}] Found {} signals for confirmation and execution",
                 executionId, signals.size());
 
         if (!signals.isEmpty()) {
@@ -91,15 +87,58 @@ public class TradingService {
                 return;
             }
 
-            // Execute high priority signals immediately
-            List<Signal> urgentSignals = signals.stream()
+            // CONFIRM SIGNALS FIRST
+            List<Signal> confirmedSignals = new ArrayList<>();
+
+            for (Signal signal : signals) {
+                try {
+                    // SIGNAL CONFIRMATION STEP
+                    SignalConfirmationService.ConfirmationResult confirmation =
+                            signalConfirmationService.confirmSignal(signal);
+
+                    if (confirmation.isConfirmed()) {
+                        // Update confidence based on confirmation
+                        signal.setConfidence(confirmation.getFinalConfidence());
+                        confirmedSignals.add(signal);
+
+                        log.info("[INST][{}] ✅ Signal CONFIRMED: {} - Confidence: {}% -> {}%",
+                                executionId, signal.getOptionSymbol(),
+                                (int)(signal.getConfidence() * 100),
+                                (int)(confirmation.getFinalConfidence() * 100));
+                    } else {
+                        // Mark as rejected
+                        signal.setStatus("CONFIRMATION_REJECTED");
+                        signal.setExecuted(true);
+                        signalRepository.save(signal);
+
+                        log.warn("[INST][{}] ❌ Signal REJECTED: {} - Reasons: {}",
+                                executionId, signal.getOptionSymbol(),
+                                String.join(", ", confirmation.getRejectionReasons()));
+                    }
+
+                } catch (Exception e) {
+                    log.error("[INST][{}] Error confirming signal {}: {}",
+                            executionId, signal.getOptionSymbol(), e.getMessage());
+
+                    // Mark as error
+                    signal.setStatus("CONFIRMATION_ERROR");
+                    signal.setExecuted(true);
+                    signalRepository.save(signal);
+                }
+            }
+
+            log.info("[INST][{}] Confirmation complete: {} confirmed out of {} total",
+                    executionId, confirmedSignals.size(), signals.size());
+
+            // Execute high priority confirmed signals immediately
+            List<Signal> urgentSignals = confirmedSignals.stream()
                     .filter(s -> s.getStrategy().contains("UNUSUAL_FLOW") ||
                             s.getConfidence() >= 0.85)
                     .limit(3) // Max 3 simultaneous executions
                     .collect(Collectors.toList());
 
             if (!urgentSignals.isEmpty()) {
-                log.info("[INST][{}] Executing {} URGENT signals immediately",
+                log.info("[INST][{}] Executing {} URGENT confirmed signals immediately",
                         executionId, urgentSignals.size());
 
                 // Execute in parallel for speed
@@ -112,8 +151,8 @@ public class TradingService {
                         .join();
             }
 
-            // Execute remaining signals sequentially
-            List<Signal> remainingSignals = signals.stream()
+            // Execute remaining confirmed signals sequentially
+            List<Signal> remainingSignals = confirmedSignals.stream()
                     .filter(s -> !urgentSignals.contains(s))
                     .collect(Collectors.toList());
 
@@ -135,46 +174,320 @@ public class TradingService {
     @Transactional
     public void checkOpenPositions() {
         String checkId = UUID.randomUUID().toString().substring(0, 8);
-        log.debug("[v62][{}] Checking open positions", checkId);
+        log.debug("[ENHANCED][{}] Checking open positions with order validation", checkId);
 
-        // ALWAYS sync with broker first
         positionSyncService.refreshPositions();
 
-        // Get REAL positions from broker
-        Map<String, BrokerPosition> brokerPositions =
-                positionSyncService.getCurrentPositions(false);
+        Map<String, BrokerPosition> brokerPositions = positionSyncService.getCurrentPositions(false);
 
-        // Get DB trades for metadata (stops, targets, strategy)
-        List<Trade> dbTrades = tradeRepository.findByStatusAndSymbol("OPEN", "QQQ");
+        List<Trade> dbTrades = tradeRepository.findByStatusAndSymbol("OPEN", "QQQ").stream()
+                .filter(this::hasValidOrderExecution)
+                .collect(Collectors.toList());
 
-        log.info("[{}] Found {} broker positions, {} DB trades",
+        log.info("[{}] Found {} broker positions, {} valid DB trades for monitoring",
                 checkId, brokerPositions.size(), dbTrades.size());
 
-        // Process each broker position
         for (Map.Entry<String, BrokerPosition> entry : brokerPositions.entrySet()) {
             String optionSymbol = entry.getKey();
             BrokerPosition brokerPos = entry.getValue();
 
-            // Skip if not an option position
             if (!optionSymbol.contains("C") && !optionSymbol.contains("P")) {
                 continue;
             }
 
-            // Find matching DB trade
             Trade dbTrade = dbTrades.stream()
-                    .filter(t -> t.getOptionSymbol().equals(optionSymbol) ||
-                            t.getOptionSymbol().equals("PAPER_" + optionSymbol))
+                    .filter(t -> matchesOptionSymbol(t, optionSymbol))
+                    .filter(this::hasValidOrderExecution)
                     .findFirst()
                     .orElse(null);
 
             if (dbTrade != null) {
-                // Use DB metadata with broker prices
-                checkPositionWithRealPrice(brokerPos, dbTrade, checkId);
+                checkPositionWithEnhancedStopLoss(brokerPos, dbTrade, checkId);
             } else {
-                // No DB record - create one or use conservative stops
-                log.warn("[{}] No DB record for broker position: {}", checkId, optionSymbol);
                 checkBrokerOnlyPosition(brokerPos, checkId);
             }
+        }
+    }
+
+
+
+    // Update the monitoring validation to be more strict
+    private boolean hasValidOrderExecution(Trade trade) {
+        // Must have OPEN status
+        if (!"OPEN".equals(trade.getStatus())) {
+            return false;
+        }
+
+        // Must have valid order ID
+        if (trade.getOrderId() == null || trade.getOrderId().trim().isEmpty() || "unknown".equals(trade.getOrderId())) {
+            log.warn("Trade {} missing valid order ID - skipping monitoring", trade.getId());
+            return false;
+        }
+
+        // Must have valid entry price
+        if (trade.getEntryPrice() == null || trade.getEntryPrice().compareTo(BigDecimal.ZERO) <= 0) {
+            log.warn("Trade {} has invalid entry price - skipping monitoring", trade.getId());
+            return false;
+        }
+
+        // Must be recent (within 24 hours)
+        if (trade.getEntryTime() == null || trade.getEntryTime().isBefore(LocalDateTime.now().minusHours(24))) {
+            log.warn("Trade {} is too old - skipping monitoring", trade.getId());
+            return false;
+        }
+
+        return true;
+    }
+
+    // ADD this new method to TradingService.java
+    private boolean matchesOptionSymbol(Trade trade, String brokerSymbol) {
+        String tradeSymbol = trade.getOptionSymbol();
+        if (tradeSymbol == null) return false;
+
+        if (tradeSymbol.startsWith("PAPER_")) {
+            tradeSymbol = tradeSymbol.substring(6);
+        }
+
+        return tradeSymbol.equals(brokerSymbol);
+    }
+
+    private void checkPositionWithEnhancedStopLoss(BrokerPosition brokerPos, Trade dbTrade, String checkId) {
+        try {
+            log.debug("[ENHANCED][{}] Checking {} with advanced stop-loss monitoring",
+                    checkId, dbTrade.getOptionSymbol());
+
+            // STEP 1: Get fresh market data
+            String optionSymbol = brokerPos.getSymbol();
+            QuoteResponse quoteResponse = tradierService.getQuote(optionSymbol);
+
+            if (quoteResponse == null || quoteResponse.getQuote() == null) {
+                log.error("[ENHANCED][{}] Failed to get quote for {}", checkId, optionSymbol);
+                return;
+            }
+
+            Quote quote = quoteResponse.getQuote();
+            BigDecimal currentBid = quote.getBid();
+            BigDecimal currentAsk = quote.getAsk();
+            BigDecimal currentMid = currentBid.add(currentAsk).divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP);
+
+            if (currentBid == null || currentBid.compareTo(BigDecimal.ZERO) <= 0) {
+                log.warn("[{}] Invalid bid price for {}", checkId, optionSymbol);
+                return;
+            }
+
+            // STEP 2: Enhanced stop-loss evaluation
+            EnhancedStopLossMonitor.StopLossDecision stopDecision =
+                    enhancedStopLossMonitor.evaluateStopLoss(dbTrade);
+
+            // STEP 3: Update position with current prices
+            dbTrade.setCurrentPrice(currentMid);
+            BigDecimal entryPrice = brokerPos.getAvgCost();
+            BigDecimal pnl = currentMid.subtract(entryPrice)
+                    .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100));
+            BigDecimal pnlPercent = currentMid.subtract(entryPrice)
+                    .divide(entryPrice, 4, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100));
+
+            log.info("[ENHANCED][{}] {} - Entry: ${}, Bid: ${}/Ask: ${}, P&L: ${} ({}%)",
+                    checkId, optionSymbol, entryPrice, currentBid, currentAsk, pnl, pnlPercent);
+
+            // STEP 4: Check for enhanced stop-loss exit
+            if (stopDecision.isShouldExit()) {
+                executeEnhancedStopLossExit(dbTrade, brokerPos, stopDecision, checkId);
+                return;
+            }
+
+            // STEP 5: Log enhanced stop-loss status
+            EnhancedStopLossMonitor.StopLossState stopState =
+                    enhancedStopLossMonitor.getStopLossState(dbTrade.getId().toString());
+
+            if (stopState != null) {
+                log.info("[ENHANCED][{}] Stop Status - Original: ${}, Current: ${}, Reason: {}",
+                        checkId, stopState.getOriginalStop(), stopState.getCurrentStop(),
+                        stopState.getAdjustmentReason());
+
+                // Update trade record with enhanced stop
+                if (stopState.getCurrentStop() != null &&
+                        !stopState.getCurrentStop().equals(dbTrade.getStopLoss())) {
+                    dbTrade.setStopLoss(stopState.getCurrentStop());
+                    log.info("[ENHANCED][{}] Updated DB stop-loss to ${}", checkId, stopState.getCurrentStop());
+                }
+            }
+
+            // STEP 6: Check for traditional exits (targets, time-based)
+            boolean shouldClose = false;
+            String closeReason = "";
+
+            // Target Check
+            if (dbTrade.getTarget() != null && currentAsk.compareTo(dbTrade.getTarget()) >= 0) {
+                shouldClose = true;
+                closeReason = "TARGET_REACHED";
+                log.info("[{}] 🎯 TARGET HIT - Ask ${} >= Target ${}",
+                        checkId, currentAsk, dbTrade.getTarget());
+            }
+            // Time-based exits
+            else if (LocalTime.now().isAfter(LocalTime.of(15, 50))) {
+                shouldClose = true;
+                closeReason = "EOD_EXIT";
+                log.warn("[{}] ⏰ End of day exit - 3:50 PM", checkId);
+            }
+
+            // STEP 7: Execute traditional exit if needed
+            if (shouldClose) {
+                executePositionClose(dbTrade, brokerPos, currentMid, closeReason, checkId);
+            } else {
+                // Save updated data
+                dbTrade.setCurrentPrice(currentMid);
+                dbTrade.setProfit(pnl);
+                tradeRepository.save(dbTrade);
+            }
+
+        } catch (Exception e) {
+            log.error("[ENHANCED][{}] Error in enhanced position check: {}", checkId, e.getMessage());
+        }
+    }
+
+    private void executeEnhancedStopLossExit(Trade trade, BrokerPosition brokerPos,
+                                             EnhancedStopLossMonitor.StopLossDecision decision, String checkId) {
+        try {
+            log.warn("[ENHANCED][{}] 🛑 ENHANCED STOP-LOSS TRIGGERED - {} (Type: {}, Confidence: {}%)",
+                    checkId, trade.getOptionSymbol(), decision.getTriggerType(),
+                    (int)(decision.getConfidence() * 100));
+
+            // Create market order to close
+            OrderRequest closeOrder = new OrderRequest();
+            closeOrder.setupForOption(brokerPos.getSymbol());
+            closeOrder.setSymbol(brokerPos.getSymbol());
+            closeOrder.setQuantity(Math.abs(brokerPos.getQuantity()));
+            closeOrder.setSide("sell_to_close");
+            closeOrder.setType("market");
+            closeOrder.setDuration("day");
+
+            log.info("[ENHANCED][{}] Placing ENHANCED STOP market close order for {} contracts",
+                    checkId, closeOrder.getQuantity());
+
+            OrderResponse response = tradierService.placeOrder(closeOrder);
+
+            if (response != null && response.getOrder() != null) {
+                // Update trade record
+                BigDecimal exitPrice = decision.getRecommendedExitPrice() != null ?
+                        decision.getRecommendedExitPrice() : brokerPos.getAvgCost();
+
+                trade.setExitPrice(exitPrice);
+                trade.setExitTime(LocalDateTime.now());
+                trade.setStatus("CLOSED");
+                trade.setCloseReason("ENHANCED_STOP_LOSS_" + decision.getTriggerType());
+                trade.setExitReason(decision.getExitReason());
+
+                // Calculate final P&L
+                BigDecimal finalPnl = exitPrice.subtract(brokerPos.getAvgCost())
+                        .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100));
+                trade.setRealizedPnl(finalPnl);
+                trade.setProfit(finalPnl);
+
+                tradeRepository.save(trade);
+
+                updateAILearning(trade);
+
+                // Refresh positions
+                positionSyncService.refreshPositions();
+
+                // Enhanced alert with details
+                String emoji = finalPnl.compareTo(BigDecimal.ZERO) >= 0 ? "✅" : "❌";
+                String alertMessage = String.format(
+                        "%s ENHANCED STOP-LOSS EXIT\n" +
+                                "Option: %s\n" +
+                                "Trigger: %s (%.0f%% confidence)\n" +
+                                "Reason: %s\n" +
+                                "Entry: $%.2f → Exit: $%.2f\n" +
+                                "P&L: $%.2f (%.1f%%)\n" +
+                                "Order ID: %s\n" +
+                                "🔬 Advanced monitoring system",
+                        emoji, trade.getOptionSymbol(),
+                        decision.getTriggerType(), decision.getConfidence() * 100,
+                        decision.getExitReason(),
+                        brokerPos.getAvgCost(), exitPrice,
+                        finalPnl,
+                        finalPnl.divide(brokerPos.getAvgCost()
+                                        .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100)),
+                                2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100))
+                );
+
+                telegramService.sendMessage(alertMessage);
+
+                log.info("[ENHANCED][{}] ✅ Enhanced stop-loss exit completed - P&L: ${}",
+                        checkId, finalPnl);
+
+            } else {
+                log.error("[ENHANCED][{}] Failed to place enhanced stop-loss order", checkId);
+                telegramService.sendMessage("❌ FAILED to execute enhanced stop-loss: " + trade.getOptionSymbol());
+            }
+
+        } catch (Exception e) {
+            log.error("[ENHANCED][{}] Error executing enhanced stop-loss: {}", checkId, e.getMessage());
+            telegramService.sendMessage("❌ Enhanced stop-loss execution error: " + e.getMessage());
+        }
+    }
+
+    private final ZeroDTEStrategy zeroDTEStrategy;
+    public void updateAILearning(Trade trade) {
+        try {
+            if (trade.getSignalId() != null) {
+                Signal originalSignal = signalRepository.findById(trade.getSignalId()).orElse(null);
+
+                if (originalSignal != null && originalSignal.getStrategy().contains("AI_LEADER_LAG")) {
+                    // 🤖 UPDATE AI LEARNING
+                    zeroDTEStrategy.updateAIFromTrade(trade, originalSignal);
+
+                    double pnlPercent = calculatePnLPercent(trade);
+                    log.info("🤖 [AI-LEARNING] Updated from trade: {} P&L: {}%",
+                            trade.getOptionSymbol(), String.format("%.2f", pnlPercent));
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error updating AI learning: {}", e.getMessage());
+        }
+    }
+
+    private double calculatePnLPercent(Trade trade) {
+        if (trade.getExitPrice() != null && trade.getEntryPrice() != null) {
+            return trade.getExitPrice().subtract(trade.getEntryPrice())
+                    .divide(trade.getEntryPrice(), 4, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100)).doubleValue();
+        }
+        return 0.0;
+    }
+
+    // ADD THIS NEW METHOD FOR MANUAL STOP-LOSS ADJUSTMENTS:
+    @Transactional
+    public void adjustStopLoss(Long tradeId, BigDecimal newStop, String reason) {
+        try {
+            Trade trade = tradeRepository.findById(tradeId).orElse(null);
+            if (trade == null) {
+                log.error("Trade not found for stop-loss adjustment: {}", tradeId);
+                return;
+            }
+
+            // Update database
+            trade.setStopLoss(newStop);
+            trade.setLastAdjustmentTime(LocalDateTime.now());
+            tradeRepository.save(trade);
+
+            // Update enhanced monitoring
+            enhancedStopLossMonitor.adjustStopLoss(tradeId.toString(), newStop, reason);
+
+            log.info("[MANUAL STOP] Trade {} - Stop adjusted to ${} (Reason: {})",
+                    tradeId, newStop, reason);
+
+            telegramService.sendMessage(String.format(
+                    "🔧 Manual Stop-Loss Adjustment\n" +
+                            "Trade: %s\n" +
+                            "New Stop: $%.2f\n" +
+                            "Reason: %s",
+                    trade.getOptionSymbol(), newStop, reason));
+
+        } catch (Exception e) {
+            log.error("Error adjusting stop-loss: {}", e.getMessage());
         }
     }
 
@@ -425,6 +738,9 @@ public class TradingService {
 
                 tradeRepository.save(trade);
 
+                updateAILearning(trade);
+
+                integratedBayesianMLSystem.closeTradeWithMLFeedback(trade, reason);
                 // Refresh positions
                 positionSyncService.refreshPositions();
 

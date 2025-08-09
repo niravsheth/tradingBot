@@ -7,5 +7,8 @@ public enum MarketRegime {
     LOW_VOLATILITY,
     HIGH_VOLATILITY,
     OPENING_RANGE,  // First 30 minutes
-    CLOSING_RANGE   // Last 30 minutes
+    CLOSING_RANGE ,  // Last 30 minutes
+
+    BREAKOUT_PENDING,
+    REVERSAL_PATTERN
 }

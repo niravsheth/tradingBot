@@ -8,6 +8,7 @@ import com.tradingBot.model.OrderRequest;
 import com.tradingBot.model.OrderResponse;
 import com.tradingBot.model.QuoteResponse;
 import com.tradingBot.model.Quote;
+import com.tradingBot.repository.SignalRepository;
 import com.tradingBot.repository.TradeRepository;
 import com.tradingBot.repository.MarketDataRepository;
 import com.tradingBot.service.SafetyService.SafetyStatus;
@@ -19,11 +20,10 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.LocalDate;
+import java.time.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 @Component
 @Slf4j
@@ -34,15 +34,79 @@ public class TradingScheduler {
     private final TradingService tradingService;
     private final TelegramService telegramService;
     private final TradeRepository tradeRepository;
+    private final SignalRepository signalRepository;
     private final TradierService tradierService;
     private final MarketDataRepository marketDataRepository;
     private final SafetyService safetyService;
     private final PositionSyncService positionSyncService;
 
-    private final EnhancedTrendService enhancedTrendService;
+    private final UnifiedTrendDetector unifiedTrendDetector;
 
     private volatile BigDecimal cachedVix = null;
     private volatile LocalDateTime vixCacheTime = null;
+
+    private final ZeroDTEStrategy zeroDTEStrategy;
+    private final MarketTrendMonitor marketTrendMonitor; // ADD THIS
+
+    @Scheduled(fixedRate = 60000) // Every minute
+    public void executeScheduledAnalysis() {
+        String analysisId = UUID.randomUUID().toString().substring(0, 8);
+
+        try {
+            // Get trend from detector
+            String marketTrend = unifiedTrendDetector.detectTrend("QQQ");
+
+            // ENHANCED: Log trend with more detail from monitor
+            MarketTrendMonitor.TrendState trendState = marketTrendMonitor.getCurrentTrendState("QQQ");
+            if (trendState != null) {
+                log.info("[{}] Market Trend: {} (Changes today: {}, Duration: {} min)",
+                        analysisId, marketTrend, trendState.getChangeCount(),
+                        trendState.getLastChangeTime() != null ?
+                                Duration.between(trendState.getLastChangeTime(), LocalDateTime.now()).toMinutes() : 0);
+            } else {
+                log.info("[{}] Market Trend: {} (No trend history yet)", analysisId, marketTrend);
+            }
+
+            // Continue with your existing analysis
+            List<Signal> signals = zeroDTEStrategy.analyzeOptions("QQQ", marketTrend);
+
+            // ENHANCED: Add trend stability check for VWAP signals
+            if (!signals.isEmpty() && trendState != null) {
+                boolean isStableTrend = isTrendStableForVWAP(trendState);
+                if (!isStableTrend) {
+                    log.warn("[{}] ⚠️ Trend instability detected - {} changes in short time",
+                            analysisId, trendState.getChangeCount());
+
+                    // Optionally reduce signal confidence for unstable trends
+                    signals.forEach(signal -> {
+                        if (signal.getStrategy().contains("VWAP")) {
+                            double originalConfidence = signal.getConfidence();
+                            signal.setConfidence(originalConfidence * 0.9); // 10% reduction
+                            log.info("[{}] Reduced VWAP signal confidence: {}% -> {}% due to trend instability",
+                                    analysisId, (int)(originalConfidence * 100), (int)(signal.getConfidence() * 100));
+                        }
+                    });
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("[{}] Error in scheduled analysis: {}", analysisId, e.getMessage());
+        }
+    }
+
+    // Helper to check trend stability for VWAP signals
+    private boolean isTrendStableForVWAP(MarketTrendMonitor.TrendState trendState) {
+        if (trendState.getLastChangeTime() == null) return true;
+
+        long minutesSinceChange = Duration.between(trendState.getLastChangeTime(), LocalDateTime.now()).toMinutes();
+        int changeCount = trendState.getChangeCount();
+
+        // Consider trend stable if:
+        // - Less than 4 changes today, OR
+        // - No change in last 15 minutes
+        return changeCount < 4 || minutesSinceChange > 15;
+    }
+
 
     @Value("${trading.symbol}")
     private String tradingSymbol;
@@ -101,6 +165,7 @@ public class TradingScheduler {
         }
     }
 
+    // Add this debug method to TradingScheduler.java
     @Scheduled(cron = "*/5 * 9-16 * * MON-FRI")
     public void executePendingSignals() {
         String executionId = UUID.randomUUID().toString().substring(0, 8);
@@ -120,16 +185,14 @@ public class TradingScheduler {
 
             if (!safetyService.canTrade()) {
                 log.warn("[v62][{}] Trading BLOCKED by safety checks - skipping execution", executionId);
-                SafetyStatus status = safetyService.getStatus();
-                log.warn("[v62][{}] Safety details - Today P&L: ${}, Open positions: {}/{}",
-                        executionId, status.getTodayPnL(), status.getOpenPositions(), status.getMaxOpenPositions());
                 return;
             }
 
-            log.info("[v62][{}] Executing pending signals", executionId);
-            tradingService.executeSignals();
+            log.info("[v62][{}] Executing pending signals - SHOULD PLACE BUY_TO_OPEN ORDERS", executionId);
+            // Remove this line if it exists and is calling wrong method:
+            // tradingService.executeSignals();
 
-            log.info("[v62][{}] Monitoring open positions", executionId);
+            log.info("[v62][{}] Monitoring open positions - SHOULD PLACE SELL_TO_CLOSE ORDERS", executionId);
             List<Trade> openTrades = tradeRepository.findByStatusAndSymbol("OPEN", tradingSymbol);
             if (!openTrades.isEmpty()) {
                 log.info("[v62][{}] Monitoring {} open positions", executionId, openTrades.size());
@@ -137,43 +200,56 @@ public class TradingScheduler {
                     log.debug("[v62][{}] Open position: {} - Entry: ${}, Qty: {}",
                             executionId, trade.getOptionSymbol(), trade.getEntryPrice(), trade.getQuantity());
                 }
+                // Only call this for existing trades, not new signals:
                 tradingService.checkOpenPositions();
             }
 
             log.info("[v62][{}] ===== SIGNAL EXECUTION COMPLETE =====", executionId);
         } catch (Exception e) {
             log.error("[v62][{}] ERROR in signal execution: {}", executionId, e.getMessage(), e);
-            telegramService.sendMessage(String.format("⚠️ Execution error [%s]: %s", executionId, e.getMessage()));
         }
     }
 
-    @Scheduled(cron = "0 * 9-16 * * MON-FRI")
+    @Scheduled(fixedRate = 1000)
     public void collectMarketData() {
         LocalTime now = LocalTime.now();
+        DayOfWeek day = LocalDate.now().getDayOfWeek();
+
+        // Skip weekends
+        if (day == DayOfWeek.SATURDAY || day == DayOfWeek.SUNDAY) {
+            return;
+        }
         if (now.isBefore(LocalTime.of(9, 30)) || now.isAfter(LocalTime.of(16, 0))) {
             return;
         }
 
-        try {
-            QuoteResponse quoteResponse = tradierService.getQuote("QQQ");
-            if (quoteResponse != null && quoteResponse.getQuote() != null) {
-                Quote quote = quoteResponse.getQuote();
-                MarketData marketData = new MarketData();
-                marketData.setSymbol("QQQ");
-                marketData.setPrice(quote.getLast());
-                marketData.setBid(quote.getBid());
-                marketData.setAsk(quote.getAsk());
-                marketData.setBidSize(quote.getBidSize());
-                marketData.setAskSize(quote.getAskSize());
-                marketData.setVolume(quote.getVolume());
-                marketData.setHigh(quote.getHigh());
-                marketData.setLow(quote.getLow());
-                marketData.setPreviousClose(quote.getPreviousClose());
-                marketData.setTimestamp(LocalDateTime.now());
-                marketDataRepository.save(marketData);
+        // Collect data for both symbols
+        String[] symbols = {"QQQ", "SPY","AAPL","MSFT","NVDA"};
+
+        for (String symbol : symbols) {
+            try {
+                QuoteResponse quoteResponse = tradierService.getQuote(symbol);
+                if (quoteResponse != null && quoteResponse.getQuote() != null) {
+                    Quote quote = quoteResponse.getQuote();
+                    MarketData marketData = new MarketData();
+                    marketData.setSymbol(symbol); // ✅ Now handles both
+                    marketData.setPrice(quote.getLast());
+                    marketData.setBid(quote.getBid());
+                    marketData.setAsk(quote.getAsk());
+                    marketData.setBidSize(quote.getBidSize());
+                    marketData.setAskSize(quote.getAskSize());
+                    marketData.setVolume(quote.getVolume());
+                    marketData.setHigh(quote.getHigh());
+                    marketData.setLow(quote.getLow());
+                    marketData.setPreviousClose(quote.getPreviousClose());
+                    marketData.setTimestamp(LocalDateTime.now());
+                    marketDataRepository.save(marketData);
+
+                    //log.debug("Collected market data for {}: ${}", symbol, quote.getLast());
+                }
+            } catch (Exception e) {
+                log.error("Error collecting market data for {}: {}", symbol, e.getMessage());
             }
-        } catch (Exception e) {
-            log.error("Error collecting market data: {}", e.getMessage());
         }
     }
 
@@ -252,6 +328,16 @@ public class TradingScheduler {
 
         log.info("[v62] Enhanced daily summary sent");
     }
+//    private final ZeroDTEStrategy.SignalAttributeLearning attributeLearning = new ZeroDTEStrategy.SignalAttributeLearning();
+//    @Scheduled(cron = "0 30 16 * * MON-FRI", zone = "America/New_York") // 4:30 PM ET daily
+//    public void sendAILearningSummary() {
+//
+//        try {
+//            attributeLearning.sendDailySummary();
+//        } catch (Exception e) {
+//            log.error("Error sending AI learning summary: {}", e.getMessage());
+//        }
+//    }
 
     private String generateOptimizationSuggestions(List<Trade> trades) {
         StringBuilder suggestions = new StringBuilder();
@@ -323,6 +409,8 @@ public class TradingScheduler {
 
                 tradeRepository.save(trade);
 
+                tradingService.updateAILearning(trade);
+
                 String emoji = pnl.compareTo(BigDecimal.ZERO) > 0 ? "💰" : "💸";
                 telegramService.sendMessage(String.format(
                         "%s Position Closed: %s\nReason: %s\nP&L: $%.2f",
@@ -338,28 +426,83 @@ public class TradingScheduler {
         }
     }
 
+    // Update monitoring to only track OPEN trades in TradingScheduler.java
     @Scheduled(cron = "*/10 * 9-16 * * MON-FRI")
     public void monitorPositions() {
-        LocalTime now = LocalTime.now();
-        if (now.isBefore(LocalTime.of(9, 30)) || now.isAfter(LocalTime.of(16, 0))) {
-            return;
-        }
-
         String monitorId = generateExecutionId();
-        log.info("[MONITOR][{}] Checking open positions", monitorId);
+        log.info("[MONITOR][{}] Checking OPEN positions only", monitorId);
 
-        List<Trade> openTrades = tradeRepository.findByStatus("OPEN");
+        // ONLY monitor OPEN trades - ignore FAILED, REJECTED, etc.
+        List<Trade> openTrades = tradeRepository.findByStatusAndSymbol("OPEN", tradingSymbol).stream()
+                .filter(trade -> {
+                    boolean hasOrderId = trade.getOrderId() != null && !trade.getOrderId().trim().isEmpty();
+                    boolean hasEntryPrice = trade.getEntryPrice() != null &&
+                            trade.getEntryPrice().compareTo(BigDecimal.ZERO) > 0;
+                    boolean isRecent = trade.getEntryTime() != null &&
+                            trade.getEntryTime().isAfter(LocalDateTime.now().minusHours(24));
 
-        if (openTrades.isEmpty()) {
-            return;
+                    return hasOrderId && hasEntryPrice && isRecent;
+                })
+                .collect(Collectors.toList());
+
+        log.info("[MONITOR][{}] Found {} OPEN positions to monitor", monitorId, openTrades.size());
+
+        // Also log rejected/failed counts for visibility
+        long failedCount = tradeRepository.countByStatus("FAILED");
+        long rejectedCount = tradeRepository.countByStatus("BAYESIAN_REJECTED");
+
+        log.info("[MONITOR][{}] Database status - OPEN: {}, FAILED: {}, REJECTED: {}",
+                monitorId, openTrades.size(), failedCount, rejectedCount);
+
+        if (!openTrades.isEmpty()) {
+            String currentTrend = getQQQTrend();
+            for (Trade trade : openTrades) {
+                monitorPosition(trade, currentTrend);
+            }
         }
+    }
 
-        log.info("[MONITOR][{}] Monitoring {} open positions", monitorId, openTrades.size());
+    // Add this cleanup method to TradingScheduler.java
+    @Scheduled(cron = "0 */30 * * * *") // Every 30 minutes
+    public void cleanupInvalidTrades() {
+        try {
+            // Find trades that are OPEN but have no valid order ID (older than 1 hour)
+            List<Trade> invalidTrades = tradeRepository.findByStatus("OPEN").stream()
+                    .filter(trade -> trade.getOrderId() == null || trade.getOrderId().trim().isEmpty() || "unknown".equals(trade.getOrderId()))
+                    .filter(trade -> trade.getEntryTime() != null && trade.getEntryTime().isBefore(LocalDateTime.now().minusHours(1)))
+                    .collect(Collectors.toList());
 
-        String currentTrend = getQQQTrend();
+            if (!invalidTrades.isEmpty()) {
+                log.warn("[CLEANUP] Found {} invalid OPEN trades without order IDs - marking as FAILED", invalidTrades.size());
 
-        for (Trade trade : openTrades) {
-            monitorPosition(trade, currentTrend);
+                for (Trade trade : invalidTrades) {
+                    trade.setStatus("FAILED");
+                    trade.setFailureReason("NO_ORDER_ID");
+                    trade.setExitReason("Cleanup - no valid order ID");
+                    trade.setExitTime(LocalDateTime.now());
+                    tradeRepository.save(trade);
+
+                    log.warn("[CLEANUP] Marked Trade ID {} as FAILED - No valid order ID", trade.getId());
+                }
+            }
+
+            // Cleanup very old PENDING signals (older than 2 hours)
+            List<Signal> oldSignals = signalRepository.findByStatus("PENDING").stream()
+                    .filter(signal -> signal.getCreatedAt() != null && signal.getCreatedAt().isBefore(LocalDateTime.now().minusHours(2)))
+                    .collect(Collectors.toList());
+
+            if (!oldSignals.isEmpty()) {
+                log.info("[CLEANUP] Found {} old PENDING signals - marking as EXPIRED", oldSignals.size());
+
+                for (Signal signal : oldSignals) {
+                    signal.setStatus("EXPIRED");
+                    signal.setExecuted(true);
+                    signalRepository.save(signal);
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("[CLEANUP] Error during cleanup: {}", e.getMessage());
         }
     }
 
@@ -620,44 +763,41 @@ public class TradingScheduler {
         }
     }
 
-    private final AdvancedTrendDetector advancedTrendDetector;
 
     public String getQQQTrend() {
         try {
-            return advancedTrendDetector.detectTrend("QQQ");
+            return unifiedTrendDetector.detectTrend("QQQ");
         } catch (Exception e) {
-            log.error("Error getting enhanced trend, defaulting to NEUTRAL: {}", e.getMessage());
+            log.error("Error getting unified trend, defaulting to NEUTRAL: {}", e.getMessage());
             return "NEUTRAL";
         }
     }
 
-
-    @Scheduled(fixedDelay = 60000) // Every minute
-    public void logDetailedTrendAnalysis() {
-        if (!safetyService.isTradingEnabled()) {
-            return;
-        }
-        try {
-            EnhancedTrendService.EnhancedTrendResult detailed =
-                    enhancedTrendService.getTrendDetailed("QQQ");
-            log.debug("[TREND-DETAIL] Components - Momentum: {:.2f}, Volume: {:.2f}, " +
-                            "Microstructure: {:.2f}, Regime: {:.2f}, ML: {:.2f}",
-                    detailed.getMomentumScore(),
-                    detailed.getVolumeScore(),
-                    detailed.getMicrostructureScore(),
-                    detailed.getRegimeScore(),
-                    detailed.getMlValidationScore()
-            );
-            if (detailed.getMlProbabilities() != null) {
-                log.debug("[TREND-DETAIL] ML Probabilities - UP: {}%, NEUTRAL: {}%, DOWN: {}%",
-                        (int)(detailed.getMlProbabilities().getOrDefault("UP", 0.0) * 100),
-                        (int)(detailed.getMlProbabilities().getOrDefault("NEUTRAL", 0.0) * 100),
-                        (int)(detailed.getMlProbabilities().getOrDefault("DOWN", 0.0) * 100)
-                );
-            }
-
-        } catch (Exception e) {
-            log.error("Error in detailed trend logging: {}", e.getMessage());
-        }
-    }
+//    @Scheduled(fixedDelay = 60000) // Every minute
+//    public void logDetailedTrendAnalysis() {
+//        if (!safetyService.isTradingEnabled()) {
+//            return;
+//        }
+//        try {
+//            UnifiedTrendDetector.EnhancedTrendResult detailed =
+//                    unifiedTrendDetector.getTrendDetailed("QQQ");
+//            log.debug("[TREND-DETAIL] Components - Momentum: {}, Volume: {}, " +
+//                            "Microstructure: {}, Regime: {}, ML: {}",
+//                    String.format("%.2f",detailed.getMomentumScore()),
+//                    String.format("%.2f",detailed.getVolumeScore()),
+//                    String.format("%.2f",detailed.getMicrostructureScore()),
+//                    String.format("%.2f",detailed.getRegimeScore()),
+//                    String.format("%.2f",detailed.getMlValidationScore())
+//            );
+//            if (detailed.getMlProbabilities() != null) {
+//                log.debug("[TREND-DETAIL] ML Probabilities - UP: {}%, NEUTRAL: {}%, DOWN: {}%",
+//                        (int)(detailed.getMlProbabilities().getOrDefault("UP", 0.0) * 100),
+//                        (int)(detailed.getMlProbabilities().getOrDefault("NEUTRAL", 0.0) * 100),
+//                        (int)(detailed.getMlProbabilities().getOrDefault("DOWN", 0.0) * 100)
+//                );
+//            }
+//        } catch (Exception e) {
+//            log.error("Error in detailed trend logging: {}", e.getMessage());
+//        }
+//    }
 }

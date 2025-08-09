@@ -4,14 +4,22 @@ import com.tradingBot.analytics.AdvancedUnusualFlowDetector;
 import com.tradingBot.entity.*;
 import com.tradingBot.model.*;
 import com.tradingBot.repository.*;
+import lombok.Getter;
 import lombok.RequiredArgsConstructor;
+import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.PreDestroy;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Service
@@ -23,9 +31,21 @@ public class ZeroDTEStrategy {
     private final TelegramService telegramService;
     private final TechnicalAnalysisService technicalAnalysisService;
     private final SignalRepository signalRepository;
+    private final MarketDataRepository marketDataRepository;
+    private final TradeRepository tradeRepository;
     private final SignalOrchestrator signalOrchestrator;
-    private final AdvancedUnusualFlowDetector flowDetector;
-    private final PreTradeRiskEngine preTradeRiskEngine;  // Add this field
+    private final PreTradeRiskEngine preTradeRiskEngine;
+    private final IntegratedBayesianMLSystem integratedBayesianMLSystem;
+    private final AdvancedSignalDetector advancedSignalDetector;
+    private final SHAPExplainerService shapExplainerService;
+    private final PriceLevelRiskService priceLevelRiskService;
+
+    // AI Persistence Repositories
+    private final AIStateRepository aiStateRepository;
+    private final VolumeProfileRepository volumeProfileRepository;
+    private final POCDataRepository pocDataRepository;
+    private final SupportResistanceLevelsRepository supportResistanceLevelsRepository;
+    private final VWAPDataRepository vwapDataRepository;
 
     @Value("${trading.min-volume:50}")
     private int minVolume;
@@ -33,37 +53,72 @@ public class ZeroDTEStrategy {
     @Value("${trading.min-iv:0.15}")
     private double minIV;
 
-    @Value("${trading.max-spread-percentage:10.0}")
-    private double maxSpreadPercentage;
-
-
     // Timezone
     private static final ZoneId ET_ZONE = ZoneId.of("America/New_York");
 
-    // Updated strategy thresholds - REDUCED FOR 0DTE
+    // Leader stocks for AI analysis
+    private static final List<String> LEADER_STOCKS = Arrays.asList("AAPL", "MSFT", "NVDA");
+
+    // Updated strategy thresholds
     private static final double MIN_VOLUME_RATIO_BREAKOUT = 1.2;
     private static final double MIN_VOLUME_RATIO_STANDARD = 0.8;
     private static final LocalTime PRIME_WINDOW_1_START = LocalTime.of(9, 45);
     private static final LocalTime PRIME_WINDOW_1_END = LocalTime.of(10, 30);
     private static final LocalTime PRIME_WINDOW_2_START = LocalTime.of(10, 30);
     private static final LocalTime PRIME_WINDOW_2_END = LocalTime.of(12, 00);
-    private static final LocalTime PRIME_WINDOW_3_START = LocalTime.of(13, 00);
+    private static final LocalTime PRIME_WINDOW_3_START = LocalTime.of(12, 00);
     private static final LocalTime PRIME_WINDOW_3_END = LocalTime.of(15, 00);
     private static final LocalTime FINAL_WINDOW_START = LocalTime.of(15, 00);
     private static final LocalTime FINAL_WINDOW_END = LocalTime.of(15, 55);
+    private static final LocalTime POWER_HOUR_START = LocalTime.of(15, 30);
 
+    // AI LEARNING COMPONENTS - PERSISTENT
+    private final AILearningEngine aiLearning = new AILearningEngine();
+    private final CorrelationDetector correlationDetector = new CorrelationDetector();
+
+    private final SignalAttributeLearning attributeLearning = new SignalAttributeLearning();
+
+    @PostConstruct
+    public void initializeAI() {
+        try {
+            aiLearning.loadAIState();
+            attributeLearning.loadLearnedPatterns(); // ADD THIS
+            log.info("AI Learning Engine initialized with persistent state");
+        } catch (Exception e) {
+            log.error("Error initializing AI Learning Engine: {}", e.getMessage());
+        }
+    }
+
+    @PreDestroy
+    public void shutdownAI() {
+        try {
+            aiLearning.saveAIState();
+            log.info("AI Learning Engine state saved on shutdown");
+        } catch (Exception e) {
+            log.error("Error saving AI state on shutdown: {}", e.getMessage());
+        }
+    }
+
+    @Scheduled(fixedDelay = 300000) // Every 5 minutes
+    public void saveAIStatePeriodically() {
+        try {
+            aiLearning.saveAIState();
+        } catch (Exception e) {
+            log.debug("Error in periodic AI state save: {}", e.getMessage());
+        }
+    }
 
     public List<Signal> analyzeOptions(String symbol, String marketTrend) {
         String analysisId = UUID.randomUUID().toString().substring(0, 8);
-        log.info("Trading ANALYSIS START ==========", analysisId);
-        log.info("Market trend: {}", analysisId, marketTrend);
+        log.info("Trading ANALYSIS START ========== {}", analysisId);
+        log.info("[{}] Market trend: {}", analysisId, marketTrend);
 
         List<Signal> rawSignals = new ArrayList<>();
 
         try {
             // PRE-TRADE MARKET CHECKS
             if (!preTradeRiskEngine.isMarketSuitable()) {
-                log.warn("Market unsuitable for trading - aborting analysis", analysisId);
+                log.warn("[{}] Market unsuitable for trading - aborting analysis", analysisId);
                 return Collections.emptyList();
             }
 
@@ -71,33 +126,40 @@ public class ZeroDTEStrategy {
             LocalTime now = LocalTime.now(ET_ZONE);
             boolean isLateSession = now.isAfter(LocalTime.of(15, 30));
             if (isLateSession) {
-                log.warn("[INST][{}] LATE SESSION MODE - Only 90%+ confidence signals allowed", analysisId);
+                log.warn("[{}] LATE SESSION MODE - Only 90%+ confidence signals allowed", analysisId);
             }
 
             // Block analysis in neutral market
             if ("NEUTRAL".equals(marketTrend)) {
-                log.warn("[INST][{}] MARKET IS NEUTRAL - NO SIGNALS WILL BE GENERATED", analysisId);
+                log.warn("[{}] MARKET IS NEUTRAL - NO SIGNALS WILL BE GENERATED", analysisId);
                 return Collections.emptyList();
             }
 
             if (!isGoodTradingTime(now)) {
-                log.warn("[INST][{}] Not a good time for 0DTE trading: {}", analysisId, now);
+                log.warn("[{}] Not a good time for 0DTE trading: {}", analysisId, now);
+                return Collections.emptyList();
+            }
+
+            // Data sufficiency check
+            if (!hasDataSufficiency(symbol, analysisId)) {
+                log.warn("[{}] Insufficient data for analysis - aborting", analysisId);
                 return Collections.emptyList();
             }
 
             // Get technical analysis
             TechnicalAnalysis ta = technicalAnalysisService.analyze(symbol);
             if (ta == null) {
-                log.error("[INST][{}] Technical analysis failed", analysisId);
+                log.error("[{}] Technical analysis failed", analysisId);
                 return Collections.emptyList();
             }
+            ta.setTrend(marketTrend);
 
             logTechnicalAnalysis(ta, analysisId);
 
             // Check market conditions
             MarketConditions marketConditions = getMarketConditions();
             if (!signalOrchestrator.shouldAnalyze(symbol, marketConditions)) {
-                log.info("[INST][{}] Orchestrator vetoed analysis - unfavorable conditions", analysisId);
+                log.info("[{}] Orchestrator vetoed analysis - unfavorable conditions", analysisId);
                 return Collections.emptyList();
             }
 
@@ -106,7 +168,7 @@ public class ZeroDTEStrategy {
             List<LocalDate> expirations = tradierService.getExpirations(symbol);
 
             if (!expirations.contains(today)) {
-                log.warn("[INST][{}] No 0DTE options available today", analysisId);
+                log.warn("[{}] No 0DTE options available today", analysisId);
                 return Collections.emptyList();
             }
 
@@ -114,12 +176,12 @@ public class ZeroDTEStrategy {
             OptionChainResponse chainResponse = tradierService.getOptionChain(symbol, today);
 
             if (chainResponse == null || !chainResponse.hasOptions()) {
-                log.error("[INST][{}] No option chain data available", analysisId);
+                log.error("[{}] No option chain data available", analysisId);
                 return Collections.emptyList();
             }
 
             List<Option> options = chainResponse.getOptionsList();
-            log.info("[INST][{}] Retrieved {} options", analysisId, options.size());
+            log.info("[{}] Retrieved {} options", analysisId, options.size());
 
             // Apply filtering based on market regime
             List<Option> filteredOptions = filterOptionsByMarketRegime(options, ta, analysisId);
@@ -129,751 +191,794 @@ public class ZeroDTEStrategy {
                     .filter(option -> preTradeRiskEngine.isStrikeSuitable(option))
                     .collect(Collectors.toList());
 
-            log.info("[INST][{}] {} options passed pre-trade qualification (from {} filtered)",
+            log.info("[{}] {} options passed pre-trade qualification (from {} filtered)",
                     analysisId, qualifiedOptions.size(), filteredOptions.size());
 
             // Apply dynamic strike selection based on volatility
             List<Option> selectedStrikes = selectStrikesBasedOnVolatility(qualifiedOptions, ta, analysisId);
 
-            log.info("[INST][{}] Analyzing {} selected strikes", analysisId, selectedStrikes.size());
+            log.info("[{}] Analyzing {} selected strikes", analysisId, selectedStrikes.size());
 
-            // Log flow analysis summary first
-            logFlowAnalysisSummary(selectedStrikes, analysisId);
+            // PRIORITY 1: AI-POWERED LEADER-LAG STRATEGIES (HIGHEST PRIORITY)
+            List<Signal> leaderLagSignals = analyzeAILeaderLagStrategies(selectedStrikes, ta, marketTrend, analysisId);
+            rawSignals.addAll(leaderLagSignals);
 
-            // Analyze each option against strategies
-            for (Option option : selectedStrikes) {
-                // Quick pre-validation
-                if (!quickSignalValidation(option, selectedStrikes, ta, marketTrend, analysisId)) {
-                    continue;
-                }
+            // PRIORITY 2: ADVANCED SIGNALS (with data sufficiency checks)
+            AdvancedSignalDetector.AdvancedSignalResult advancedResult =
+                    advancedSignalDetector.detectAdvancedSignals(symbol, marketTrend);
 
-                analyzeOptionWithStrategies(option, ta, rawSignals, marketTrend, analysisId, selectedStrikes);
+            if (advancedResult != null) {
+                rawSignals.addAll(advancedResult.getTrendlineBreakSignals());
+                rawSignals.addAll(advancedResult.getGapFillSignals());
+                rawSignals.addAll(advancedResult.getHighLowBreachSignals());
             }
 
-            log.info("[INST][{}] Generated {} raw signals", analysisId, rawSignals.size());
+            log.info("[{}] Generated {} AI leader-lag + {} advanced signals",
+                    analysisId, leaderLagSignals.size(),
+                    advancedResult != null ? (advancedResult.getTrendlineBreakSignals().size() +
+                            advancedResult.getGapFillSignals().size() +
+                            advancedResult.getHighLowBreachSignals().size()) : 0);
 
-            // Validate and adjust flow signals
-            List<Signal> validatedSignals = rawSignals.stream()
-                    .filter(signal -> isFlowSignalValid(signal, getOptionFromSignal(signal, selectedStrikes), selectedStrikes, analysisId))
-                    .map(signal -> {
-                        Option option = getOptionFromSignal(signal, selectedStrikes);
-                        if (option != null) {
-                            double adjustedConfidence = adjustFlowConfidence(signal, option, selectedStrikes);
-                            signal.setConfidence(adjustedConfidence);
-                        }
-                        return signal;
-                    })
-                    .collect(Collectors.toList());
+            // PRIORITY 3: TRADITIONAL STRATEGIES (Only if no AI signals)
+            if (leaderLagSignals.isEmpty()) {
+                for (Option option : selectedStrikes) {
+                    if (!quickSignalValidation(option, selectedStrikes, ta, marketTrend, analysisId)) {
+                        continue;
+                    }
+                    analyzeOptionWithStrategies(option, ta, rawSignals, marketTrend, analysisId, selectedStrikes);
+                }
+            }
+
+            log.info("[{}] Generated {} total raw signals", analysisId, rawSignals.size());
+
+            // Apply Bayesian filtering to ALL signals
+            List<Signal> processedSignals = new ArrayList<>();
+            for (Signal signal : rawSignals) {
+                IntegratedBayesianMLSystem.IntegratedAnalysisResult result =
+                        integratedBayesianMLSystem.analyzeAndExecuteSignal(signal);
+
+                if (result.getExecutionDecision().isShouldExecute()) {
+                    signal.setConfidence(result.getBayesianAnalysis().getAdjustedConfidence());
+
+                    // Store Bayesian analysis data in signal metadata
+                    signal.getMetadata().put("bayesianConfidence", String.valueOf(result.getBayesianAnalysis().getAdjustedConfidence()));
+                    signal.getMetadata().put("learningPhase", result.getLearningState().getLearningPhase());
+                    signal.getMetadata().put("thresholdMethod", result.getDynamicThreshold().getOptimizationMethod());
+                    signal.getMetadata().put("priorProbability", String.valueOf(result.getBayesianAnalysis().getPriorProbability()));
+                    signal.getMetadata().put("likelihood", String.valueOf(result.getBayesianAnalysis().getLikelihood()));
+                    signal.getMetadata().put("posteriorProbability", String.valueOf(result.getBayesianAnalysis().getPosteriorProbability()));
+
+                    processedSignals.add(signal);
+
+                    log.info("[BAYESIAN][{}] ✅ Signal APPROVED: {} - Will attempt execution",
+                            analysisId, signal.getOptionSymbol());
+                } else {
+                    saveBayesianRejectedSignal(signal, result.getExecutionDecision(), analysisId);
+                }
+            }
+
+            log.info("[{}] {} signals passed Bayesian filtering (from {} total)",
+                    analysisId, processedSignals.size(), rawSignals.size());
 
             // Use orchestrator to process signals intelligently
             List<Signal> orchestratedSignals = signalOrchestrator.orchestrateSignals(
-                    validatedSignals, ta, analysisId);
+                    processedSignals, ta, analysisId);
 
-            // Late session filter
+            // Late session filter with AI priority
             if (isLateSession && !orchestratedSignals.isEmpty()) {
-                List<Signal> highConfidenceOnly = orchestratedSignals.stream()
-                        .filter(s -> s.getConfidence() >= 0.90)
-                        .collect(Collectors.toList());
-
-                log.info("[INST][{}] Late session filter: {} signals -> {} (90%+ only)",
-                        analysisId, orchestratedSignals.size(), highConfidenceOnly.size());
-
-                orchestratedSignals = highConfidenceOnly;
+                orchestratedSignals = applyLateSessionFiltering(orchestratedSignals, analysisId);
             }
 
             // Save signals for IMMEDIATE execution
-            saveSignalsImmediate(orchestratedSignals, ta, marketTrend, analysisId);
+            saveSignalsAfterConfirmation(orchestratedSignals, ta, marketTrend, analysisId);
 
-            log.info("[INST][{}] ========== ANALYSIS COMPLETE - {} SIGNALS ==========",
+            log.info("[{}] ========== ANALYSIS COMPLETE - {} SIGNALS ==========",
                     analysisId, orchestratedSignals.size());
 
             return orchestratedSignals;
 
         } catch (Exception e) {
-            log.error("[INST][{}] ERROR in analyzeOptions: {}", analysisId, e.getMessage(), e);
+            log.error("[{}] ERROR in analyzeOptions: {}", analysisId, e.getMessage(), e);
             return new ArrayList<>();
         }
-    }
-
-
-    private Option getOptionFromSignal(Signal signal, List<Option> options) {
-        return options.stream()
-                .filter(opt -> opt.getSymbol().equals(signal.getOptionSymbol()))
-                .findFirst()
-                .orElse(null);
-    }
-
-    private List<Option> selectStrikesBasedOnVolatility(List<Option> options, TechnicalAnalysis ta, String analysisId) {
-        BigDecimal currentPrice = ta.getCurrentPrice();
-        BigDecimal dayRange = BigDecimal.ZERO;
-
-        // Calculate day's range
-        QuoteResponse qqqQuote = tradierService.getQuote("QQQ");
-        if (qqqQuote != null && qqqQuote.getQuote() != null) {
-            Quote quote = qqqQuote.getQuote();
-            if (quote.getHigh() != null && quote.getLow() != null) {
-                dayRange = quote.getHigh().subtract(quote.getLow());
-            }
-        }
-
-        // Calculate price movement percentage
-        BigDecimal priceMove = BigDecimal.ZERO;
-        if (ta.getPreviousClose() != null && ta.getPreviousClose().compareTo(BigDecimal.ZERO) > 0) {
-            priceMove = currentPrice.subtract(ta.getPreviousClose())
-                    .abs()
-                    .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP);
-        }
-
-        // Determine strike range based on volatility
-        int strikesFromATM;
-        if (priceMove.compareTo(BigDecimal.valueOf(0.005)) > 0 || // >0.5% move
-                dayRange.compareTo(currentPrice.multiply(BigDecimal.valueOf(0.01))) > 0) { // >1% range
-            strikesFromATM = 4; // High volatility - wider strikes
-            log.info("[INST][{}] High volatility detected - selecting up to {} strikes from ATM",
-                    analysisId, strikesFromATM);
-        } else {
-            strikesFromATM = 2; // Normal volatility - tighter strikes
-            log.info("[INST][{}] Normal volatility - selecting up to {} strikes from ATM",
-                    analysisId, strikesFromATM);
-        }
-
-        // Filter options by strike distance
-        List<Option> selected = options.stream()
-                .filter(option -> {
-                    BigDecimal strike = option.getStrikePrice();
-                    BigDecimal distance = strike.subtract(currentPrice).abs();
-
-                    boolean isCall = "CALL".equalsIgnoreCase(option.getType());
-                    boolean isPut = "PUT".equalsIgnoreCase(option.getType());
-
-                    if (isCall) {
-                        // For calls: ATM to X strikes above
-                        return strike.compareTo(currentPrice) >= 0 &&
-                                strike.compareTo(currentPrice.add(BigDecimal.valueOf(strikesFromATM))) <= 0;
-                    } else if (isPut) {
-                        // For puts: ATM to X strikes below
-                        return strike.compareTo(currentPrice.subtract(BigDecimal.valueOf(strikesFromATM))) >= 0 &&
-                                strike.compareTo(currentPrice) <= 0;
-                    }
-                    return false;
-                })
-                .sorted((o1, o2) -> {
-                    // Sort by distance from current price (closest first)
-                    BigDecimal dist1 = o1.getStrikePrice().subtract(currentPrice).abs();
-                    BigDecimal dist2 = o2.getStrikePrice().subtract(currentPrice).abs();
-                    return dist1.compareTo(dist2);
-                })
-                .collect(Collectors.toList());
-
-        // Log selected strikes
-        selected.forEach(opt -> {
-            BigDecimal distance = opt.getStrikePrice().subtract(currentPrice);
-            log.info("[INST][{}] Selected: {} ${} (${} from current, Vol: {}, OI: {})",
-                    analysisId, opt.getType(), opt.getStrikePrice(),
-                    distance.compareTo(BigDecimal.ZERO) > 0 ? "+" + distance : distance,
-                    opt.getVolume(), opt.getOpenInterest());
-        });
-
-        return selected;
-    }
-
-
-    private void saveSignalsImmediate(List<Signal> signals, TechnicalAnalysis ta,
-                                      String marketTrend, String analysisId) {
-        for (Signal signal : signals) {
-            // ALL signals go directly to PENDING for immediate execution
-            signal.setStatus("PENDING");
-            signal.setCreatedAt(LocalDateTime.now());
-            signal.setEntryAssumptionPrice(ta.getCurrentPrice());
-            signal.setMarketTrend(marketTrend);
-            signal.setOriginalOptionPrice(signal.getEntryPrice());
-
-            // Very short expiration - 30 seconds
-            LocalDateTime expirationTime = LocalDateTime.now().plusSeconds(30);
-            signal.setExpirationTime(expirationTime);
-
-            signalRepository.save(signal);
-
-            log.info("[INST][{}] IMMEDIATE {} - {} {}, Confidence: {}%, Executing in <500ms",
-                    analysisId, signal.getStrategy(), signal.getSignalType(),
-                    signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
-
-            // Alert for all signals
-            if (signal.getConfidence() >= 0.70) {
-                String urgency = signal.getStrategy().contains("UNUSUAL_FLOW") ? "URGENT" : "IMMEDIATE";
-                telegramService.sendMessage(String.format(
-                        "⚡ %s EXECUTION SIGNAL\n" +
-                                "Strategy: %s\n" +
-                                "Option: %s\n" +
-                                "Confidence: %d%%\n" +
-                                "Entry: $%.2f\n" +
-                                "Target: $%.2f (+%.0f%%)\n" +
-                                "Stop: $%.2f (-%.0f%%)\n" +
-                                "Executing NOW...",
-                        urgency,
-                        signal.getStrategy(),
-                        signal.getOptionSymbol(),
-                        (int)(signal.getConfidence() * 100),
-                        signal.getEntryPrice(),
-                        signal.getTargetPrice(),
-                        ((signal.getTargetPrice().doubleValue() / signal.getEntryPrice().doubleValue() - 1) * 100),
-                        signal.getStopLoss(),
-                        ((1 - signal.getStopLoss().doubleValue() / signal.getEntryPrice().doubleValue()) * 100)
-                ));
-            }
-        }
-    }
-
-    private boolean isFlowSignalValid(Signal signal, Option option, List<Option> allOptions, String analysisId) {
-        if (!signal.getStrategy().contains("UNUSUAL_FLOW")) {
-            return true; // Not a flow signal, use regular validation
-        }
-
-        // Re-validate the flow in case market conditions changed
-        AdvancedUnusualFlowDetector.FlowAnalysis analysis =
-                flowDetector.analyzeFlow(option, signal.getSymbol(), allOptions, analysisId);
-
-        if (!analysis.isUnusualFlow()) {
-            log.warn("[v63][{}] Flow signal invalidated - {} Reason: {}",
-                    analysisId, signal.getOptionSymbol(), analysis.getReasoning());
-            return false;
-        }
-
-        // Additional validation for flow signals
-        if (analysis.getHedgingProbability() > 0.4) {
-            log.warn("[v63][{}] Flow signal rejected - High hedging probability: {}%",
-                    analysisId, (int)(analysis.getHedgingProbability() * 100));
-            return false;
-        }
-
-        return true;
-    }
-
-
-    private double adjustFlowConfidence(Signal signal, Option option, List<Option> allOptions) {
-        if (!signal.getStrategy().contains("UNUSUAL_FLOW")) {
-            return signal.getConfidence(); // Not a flow signal
-        }
-
-        AdvancedUnusualFlowDetector.FlowAnalysis analysis =
-                flowDetector.analyzeFlow(option, signal.getSymbol(), allOptions, "confidence-adj");
-
-        double baseConfidence = signal.getConfidence();
-
-        // Boost for smart money
-        if (analysis.isSmartMoney()) {
-            baseConfidence = Math.min(baseConfidence * 1.2, 0.95);
-        }
-
-        // Boost for high aggressiveness
-        if (analysis.getAggressiveness() > 0.8) {
-            baseConfidence = Math.min(baseConfidence * 1.1, 0.93);
-        }
-
-        // Reduce for any hedging probability
-        if (analysis.getHedgingProbability() > 0.1) {
-            baseConfidence *= (1 - analysis.getHedgingProbability() * 0.5);
-        }
-
-        return baseConfidence;
-    }
-
-    private void logFlowAnalysisSummary(List<Option> options, String analysisId) {
-        log.info("[v63][{}] === FLOW ANALYSIS SUMMARY ===", analysisId);
-
-        int totalFlows = 0;
-        int filteredAsHedging = 0;
-        int confirmedDirectional = 0;
-        int smartMoneyFlows = 0;
-
-        for (Option option : options) {
-            if (option.getVolume() > 1000) { // Only analyze significant volume
-                AdvancedUnusualFlowDetector.FlowAnalysis analysis =
-                        flowDetector.analyzeFlow(option, "QQQ", options, analysisId);
-
-                totalFlows++;
-
-                if (analysis.getHedgingProbability() > 0.3) {
-                    filteredAsHedging++;
-                }
-
-                if (analysis.isUnusualFlow()) {
-                    confirmedDirectional++;
-                    if (analysis.isSmartMoney()) {
-                        smartMoneyFlows++;
-                    }
-                }
-            }
-        }
-
-        log.info("[v63][{}] Flow Summary - Total: {}, Hedging: {}, Directional: {}, Smart Money: {}",
-                analysisId, totalFlows, filteredAsHedging, confirmedDirectional, smartMoneyFlows);
     }
 
     public List<Signal> analyzeOptions(String symbol) {
         return analyzeOptions(symbol, "NEUTRAL");
     }
 
-    private int getAdjustedMinVolume(LocalTime now) {
-        if (now.isBefore(LocalTime.of(10, 30))) {
-            return minVolume / 2;
-        } else if (now.isAfter(LocalTime.of(15, 0))) {
-            return minVolume / 2;
-        }
-        return minVolume;
-    }
-
-    private MarketConditions getMarketConditions() {
-        MarketConditions conditions = new MarketConditions();
-        conditions.setVix(getVixLevel());
-        conditions.setMarketBreadth(calculateMarketBreadth());
-        conditions.setInternals(getMarketInternals());
-        return conditions;
-    }
-
-    private double getVixLevel() {
-        return 18.0;
-    }
-
-    private double calculateMarketBreadth() {
-        return 0.5;
-    }
-
-    private MarketInternals getMarketInternals() {
-        MarketInternals internals = new MarketInternals();
-        return internals;
-    }
-
-    private boolean isGoodTradingTime(LocalTime now) {
-        if ((now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END)) ||
-                (now.isAfter(PRIME_WINDOW_2_START) && now.isBefore(PRIME_WINDOW_2_END)) ||
-                (now.isAfter(PRIME_WINDOW_3_START) && now.isBefore(PRIME_WINDOW_3_END)) ||
-                (now.isAfter(FINAL_WINDOW_START) && now.isBefore(FINAL_WINDOW_END))) {
-            return true;
-        }
-
-        log.info("[v63] Outside prime trading windows - skipping analysis");
-        return false;
-    }
-
-    private boolean detectOpeningDrive(TechnicalAnalysis ta, String analysisId) {
-        LocalTime now = LocalTime.now(ET_ZONE);
-
-//        if (!now.isAfter(LocalTime.of(9, 30)) || !now.isBefore(LocalTime.of(10, 00))) {
-//            return false;
-//        }
-
-        BigDecimal gap = calculatePremarketGap(ta);
-        boolean hasGap = gap.abs().compareTo(BigDecimal.valueOf(0.005)) > 0;
-        boolean hasVolume = ta.getVolumeRatio() > 1.5;
-
-        if (hasGap && hasVolume) {
-            log.info("[v63][{}] Opening Drive detected - Gap: {}%, Volume: {}x",
-                    analysisId,
-                    String.format("%.2f", gap.multiply(BigDecimal.valueOf(100)).doubleValue()),
-                    String.format("%.1f", ta.getVolumeRatio()));
-            return true;
-        }
-
-        return false;
-    }
-
-    private BigDecimal calculatePremarketGap(TechnicalAnalysis ta) {
-        if (ta.getPreviousClose() != null && ta.getPreviousClose().compareTo(BigDecimal.ZERO) > 0) {
-            return ta.getCurrentPrice().subtract(ta.getPreviousClose())
-                    .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP);
-        }
-        return BigDecimal.ZERO;
-    }
-
-    private boolean detectUnusualOptionsFlow(Option option, List<Option> allOptions, String analysisId) {
+    private boolean hasDataSufficiency(String symbol, String analysisId) {
         try {
-            AdvancedUnusualFlowDetector.FlowAnalysis analysis =
-                    flowDetector.analyzeFlow(option, "QQQ", allOptions, analysisId);
+            // Check market data availability (minimum 2 hours of data for 0DTE)
+            LocalDateTime twoHoursAgo = LocalDateTime.now(ET_ZONE).minusHours(2);
+            List<MarketData> recentData = marketDataRepository.findRecentData(symbol, 120); // 2 hours in minutes
 
-            if (analysis.isUnusualFlow()) {
-                log.info("[v63][{}] ✅ CONFIRMED UNUSUAL FLOW - {} {} Premium: ${} Type: {} Confidence: {}%",
-                        analysisId, option.getType(), option.getStrikePrice(),
-                        option.getMidPrice().multiply(BigDecimal.valueOf(option.getVolume() * 100)),
-                        analysis.getFlowType(), (int)(analysis.getConfidence() * 100));
-
-                // Alert for smart money flows
-                if (analysis.isSmartMoney()) {
-                    telegramService.sendMessage(String.format(
-                            "🎯 <b>SMART MONEY FLOW DETECTED</b>\n" +
-                                    "Option: %s %s\n" +
-                                    "Volume: %,d contracts\n" +
-                                    "Premium: $%,.0f\n" +
-                                    "Type: %s\n" +
-                                    "Confidence: %.0f%%\n" +
-                                    "Aggressiveness: %.0f%%",
-                            option.getType(), option.getStrikePrice(),
-                            option.getVolume(),
-                            option.getMidPrice().multiply(BigDecimal.valueOf(option.getVolume() * 100)).doubleValue(),
-                            analysis.getFlowType(),
-                            analysis.getConfidence() * 100,
-                            analysis.getAggressiveness() * 100
-                    ));
-                }
-
-                return true;
-            } else {
-                // Log why it was filtered out
-                log.debug("[v63][{}] ❌ Flow filtered out - {} {} Reason: {}",
-                        analysisId, option.getType(), option.getStrikePrice(), analysis.getReasoning());
-
-                // Alert for large flows that were filtered (might be interesting)
-                BigDecimal premium = option.getMidPrice()
-                        .multiply(BigDecimal.valueOf(option.getVolume()))
-                        .multiply(BigDecimal.valueOf(100));
-
-                if (premium.compareTo(BigDecimal.valueOf(2000000)) > 0) { // >$2M flows that were filtered
-                    log.warn("[v63][{}] 🚫 LARGE FLOW FILTERED - {} {} Premium: ${} Reason: {}",
-                            analysisId, option.getType(), option.getStrikePrice(),
-                            premium, analysis.getReasoning());
-                }
-
+            if (recentData.size() < 120) {
+                log.warn("[DATA-CHECK][{}] Insufficient market data: {} minutes (need 120)", analysisId, recentData.size());
                 return false;
             }
+
+            // Check for data gaps in critical trading hours
+            LocalDateTime marketOpen = LocalDateTime.now(ET_ZONE).with(LocalTime.of(9, 30));
+            LocalDateTime now = LocalDateTime.now(ET_ZONE);
+
+            if (now.isAfter(marketOpen.plusHours(2))) {
+                long expectedMinutes = Duration.between(marketOpen, now).toMinutes();
+                long actualDataPoints = recentData.stream()
+                        .filter(data -> data.getTimestamp().isAfter(marketOpen))
+                        .count();
+
+                double dataCompleteness = (double) actualDataPoints / expectedMinutes;
+
+                if (dataCompleteness < 0.80) { // Need at least 80% data completeness
+                    log.warn("[DATA-CHECK][{}] Data completeness {}% < 80% threshold", analysisId, (int)(dataCompleteness * 100));
+                    return false;
+                }
+            }
+
+            // Check leader stock data availability for AI
+            for (String leaderSymbol : LEADER_STOCKS) {
+                List<MarketData> leaderData = marketDataRepository.findRecentData(leaderSymbol, 30);
+                if (leaderData.size() < 30) {
+                    log.warn("[DATA-CHECK][{}] Insufficient {} data: {} minutes (need 30)", analysisId, leaderSymbol, leaderData.size());
+                    return false;
+                }
+            }
+
+            log.info("[DATA-CHECK][{}] Data sufficiency ✅ - {} minutes of data available", analysisId, recentData.size());
+            return true;
+
         } catch (Exception e) {
-            log.error("[v63][{}] Error in enhanced flow detection: {}", analysisId, e.getMessage());
-            return false; // Fail safe - don't trade on errors
+            log.error("[DATA-CHECK][{}] Error checking data sufficiency: {}", analysisId, e.getMessage());
+            return false; // Fail safe
         }
     }
 
+    // ================================================================================================
+    // AI-POWERED LEADER-LAG ANALYSIS - ENHANCED FOR INDIVIDUAL STOCKS
+    // ================================================================================================
 
-    private double getTimeWindowMultiplier(LocalTime now) {
-        if ((now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END))) {
-            return 1.15;
-        } else if ((now.isAfter(PRIME_WINDOW_2_START) && now.isBefore(PRIME_WINDOW_2_END))) {
-            return 1.10;
-        } else if ((now.isAfter(PRIME_WINDOW_3_START) && now.isBefore(PRIME_WINDOW_3_END))) {
-            return 1.20;
-        } else if ((now.isAfter(FINAL_WINDOW_START) && now.isBefore(FINAL_WINDOW_END))) {
-            return 1.05;
-        }
-        return 0.8;
-    }
-
-    private void logTechnicalAnalysis(TechnicalAnalysis ta, String analysisId) {
-        log.info("[v63][{}] TA Results - Price: ${}, VWAP: ${}, Regime: {}",
-                analysisId, ta.getCurrentPrice(), ta.getVwap(), ta.getMarketRegime());
-        log.info("[v63][{}] Volume - Current: {}, Ratio: {}, High: {}",
-                analysisId, ta.getCurrentVolume(),
-                String.format("%.2f", ta.getVolumeRatio()),
-                ta.isHighVolume());
-        log.info("[v63][{}] Momentum - RSI: {}, MACD: {}, Divergence: {}",
-                analysisId,
-                String.format("%.1f", ta.getRsi()),
-                ta.getMacdSignal(),
-                ta.isHasRsiDivergence() || ta.isHasMacdDivergence());
-        log.info("[v63][{}] VWAP - Upper: ${}, Lower: ${}, Extended: {}",
-                analysisId, ta.getVwapUpperBand(), ta.getVwapLowerBand(), ta.isExtendedFromVwap());
-
-        if (ta.getOpeningRangeHigh() != null) {
-            log.info("[v63][{}] Opening Range - High: ${}, Low: ${}",
-                    analysisId, ta.getOpeningRangeHigh(), ta.getOpeningRangeLow());
-        }
-    }
-
-    private List<Option> filterOptionsByMarketRegime(List<Option> options, TechnicalAnalysis ta,
-                                                     String analysisId) {
-        MarketRegime regime = ta.getMarketRegime();
-        DynamicParameters params = ta.getDynamicParameters();
-
+    private List<Signal> analyzeAILeaderLagStrategies(List<Option> options, TechnicalAnalysis ta,
+                                                      String marketTrend, String analysisId) {
+        List<Signal> leaderLagSignals = new ArrayList<>();
         LocalTime now = LocalTime.now(ET_ZONE);
 
-        int adjustedMinVolume = getAdjustedMinVolume(now);
-        double adjustedMinIV = minIV;
+        try {
+            // Build comprehensive market context for AI with leader stocks
+            MarketContext context = buildEnhancedMarketContext(ta, marketTrend, now, analysisId);
 
-        // Remove the percentage-based filtering - we'll use strike-based instead
+            if (context == null) {
+                log.warn("[AI-LEADER-LAG][{}] Could not build market context - insufficient leader data", analysisId);
+                return leaderLagSignals;
+            }
 
-        switch (regime) {
-            case HIGH_VOLATILITY:
-                adjustedMinVolume = (int)(adjustedMinVolume * 0.7);
-                adjustedMinIV = minIV * 1.2;
-                break;
-            case LOW_VOLATILITY:
-                adjustedMinVolume = (int)(adjustedMinVolume * 1.3);
-                adjustedMinIV = minIV * 0.8;
-                break;
-            case OPENING_RANGE:
-                adjustedMinVolume = (int)(adjustedMinVolume * 0.5);
-                break;
-            default:
-                break;
+            // Use AI to determine optimal strategy
+            AIDecision aiDecision = aiLearning.decideStrategy(context, analysisId);
+
+            if (aiDecision.getStrategy() == LeaderLagStrategy.NONE) {
+                log.info("[AI-LEADER-LAG][{}] AI decided to skip leader-lag: {}", analysisId, aiDecision.getReasoning());
+                return leaderLagSignals;
+            }
+
+            // Get leader correlation metrics
+            LeaderCorrelationMetrics metrics = correlationDetector.getLeaderMetrics(analysisId);
+
+            if (metrics == null || metrics.getStrongestCorrelation() < 0.4) {
+                log.warn("[AI-LEADER-LAG][{}] Insufficient leader correlation ({}%) - AI overridden",
+                        analysisId, metrics != null ? (int)(metrics.getStrongestCorrelation() * 100) : 0);
+                return leaderLagSignals;
+            }
+
+            log.info("[AI-LEADER-LAG][{}] 🤖 AI SELECTED: {} (Confidence: {}%)",
+                    analysisId, aiDecision.getStrategy(), (int)(aiDecision.getConfidence() * 100));
+            log.info("[AI-LEADER-LAG][{}] 🧠 AI Reasoning: {}", analysisId, aiDecision.getReasoning());
+            log.info("[AI-LEADER-LAG][{}] 📊 Leader Analysis: {} ({}% corr), QQQ momentum: {}",
+                    analysisId, metrics.getStrongestLeader(),
+                    (int)(metrics.getStrongestCorrelation() * 100),
+                    String.format("%.2f", context.qqqMomentum));
+
+            // Generate signals based on AI decision
+            for (Option option : options) {
+                if (!quickSignalValidation(option, options, ta, marketTrend, analysisId)) {
+                    continue;
+                }
+
+                AILeaderLagSignal aiSignal = generateEnhancedAILeaderLagSignal(option, aiDecision, ta, marketTrend, metrics, context);
+
+                if (aiSignal != null && aiSignal.getConfidence() >= getAIThreshold(aiDecision.getStrategy(), now)) {
+                    Signal signal = createAILeaderLagSignal(option, options, ta, aiSignal, marketTrend, analysisId);
+                    if (signal != null) {
+                        leaderLagSignals.add(signal);
+
+                        log.info("[AI-LEADER-LAG][{}] ✅ {} Signal Generated - Confidence: {}%",
+                                analysisId, aiDecision.getStrategy(), (int)(aiSignal.getConfidence() * 100));
+                    }
+                }
+            }
+
+            return leaderLagSignals;
+
+        } catch (Exception e) {
+            log.error("[AI-LEADER-LAG][{}] Error in AI leader-lag analysis: {}", analysisId, e.getMessage());
+            return leaderLagSignals;
         }
-
-        if (params != null) {
-            adjustedMinVolume = (int)(adjustedMinVolume * params.getMinVolumeMultiplier());
-            adjustedMinIV = adjustedMinIV * params.getMinIVMultiplier();
-        }
-
-        final int finalMinVolume = adjustedMinVolume;
-        final double finalMinIV = adjustedMinIV;
-
-        log.info("[v63][{}] Base filtering - Volume: {}, IV: {:.3f}",
-                analysisId, finalMinVolume, finalMinIV);
-
-        List<Option> basicFiltered = options.stream()
-                .filter(option -> option.isValid())
-                .filter(option -> option.getVolume() >= finalMinVolume)
-                .filter(option -> {
-                    Double iv = option.getImpliedVolatility();
-                    return iv != null && iv >= finalMinIV;
-                })
-                .filter(option -> option.getSpreadPercentage() <= maxSpreadPercentage)
-                .collect(Collectors.toList());
-
-        log.info("[v63][{}] After basic filtering: {} options", analysisId, basicFiltered.size());
-
-        // Now apply strike filtering - this is the key change
-        return filterByConfidenceAdjustedStrikes(basicFiltered, ta, 0.0, analysisId);
     }
 
-    private List<Option> filterByConfidenceAdjustedStrikes(List<Option> options,
-                                                           TechnicalAnalysis ta,
-                                                           double expectedConfidence,
-                                                           String analysisId) {
-        BigDecimal currentPrice = ta.getCurrentPrice();
+    private MarketContext buildEnhancedMarketContext(TechnicalAnalysis ta, String marketTrend, LocalTime now, String analysisId) {
+        try {
+            // Get leader stock analysis
+            Map<String, TechnicalAnalysis> leaderAnalysis = new HashMap<>();
+            Map<String, Double> leaderMomentum = new HashMap<>();
 
-        log.info("[v63][{}] Current QQQ price: ${}", analysisId, currentPrice);
+            for (String leaderSymbol : LEADER_STOCKS) {
+                TechnicalAnalysis leaderTA = technicalAnalysisService.analyze(leaderSymbol);
+                if (leaderTA != null) {
+                    leaderAnalysis.put(leaderSymbol, leaderTA);
+                    leaderMomentum.put(leaderSymbol, leaderTA.getMomentumStrength());
+                } else {
+                    log.warn("[AI-CONTEXT][{}] Missing TA for leader stock: {}", analysisId, leaderSymbol);
+                }
+            }
 
-        // For 0DTE, we want ATM and 1 strike OTM only
-        List<Option> filtered = options.stream()
-                .filter(option -> {
-                    BigDecimal strike = option.getStrikePrice();
-                    BigDecimal distance = currentPrice.subtract(strike).abs();
+            // Ensure we have at least 2 leaders with data
+            if (leaderMomentum.size() < 2) {
+                log.warn("[AI-CONTEXT][{}] Insufficient leader data: {} of {} leaders",
+                        analysisId, leaderMomentum.size(), LEADER_STOCKS.size());
+                return null;
+            }
 
-                    boolean isCall = "CALL".equalsIgnoreCase(option.getType());
-                    boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+            // Find strongest leader
+            String strongestLeader = leaderMomentum.entrySet().stream()
+                    .max(Map.Entry.comparingByValue(Comparator.comparing(Math::abs)))
+                    .map(Map.Entry::getKey)
+                    .orElse("AAPL");
 
-                    if (isCall) {
-                        // For calls: ATM or 1-2 strikes above current price
-                        // If QQQ = 553.30, accept 554, 555
-                        return strike.compareTo(currentPrice) >= 0 &&
-                                strike.compareTo(currentPrice.add(BigDecimal.valueOf(2))) <= 0;
-                    } else if (isPut) {
-                        // For puts: ATM or 1-2 strikes below current price
-                        // If QQQ = 553.30, accept 553, 552
-                        return strike.compareTo(currentPrice.subtract(BigDecimal.valueOf(2))) >= 0 &&
-                                strike.compareTo(currentPrice) <= 0;
+            double strongestLeaderMomentum = leaderMomentum.get(strongestLeader);
+
+            // Calculate leader-QQQ divergence
+            double leaderQQQDivergence = Math.abs(strongestLeaderMomentum - ta.getMomentumStrength());
+
+            return new MarketContext(
+                    strongestLeaderMomentum,
+                    ta.getMomentumStrength(),
+                    correlationDetector.getLeaderQQQCorrelation(strongestLeader),
+                    getVixLevel(),
+                    marketTrend,
+                    ta.getMarketRegime().toString(),
+                    now.getHour() * 60 + now.getMinute(),
+                    LocalDate.now().getDayOfWeek().getValue(),
+                    ta.getVolumeRatio(),
+                    leaderQQQDivergence,
+                    ta.getRsi(),
+                    ta.getCurrentPrice(),
+                    strongestLeader
+            );
+
+        } catch (Exception e) {
+            log.error("[AI-CONTEXT][{}] Error building market context: {}", analysisId, e.getMessage());
+            return null;
+        }
+    }
+
+    private AILeaderLagSignal generateEnhancedAILeaderLagSignal(Option option, AIDecision aiDecision,
+                                                                TechnicalAnalysis ta, String marketTrend,
+                                                                LeaderCorrelationMetrics metrics, MarketContext context) {
+
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+
+        if (aiDecision.getStrategy() == LeaderLagStrategy.STANDARD) {
+            // STANDARD: Leader moves against QQQ, expect QQQ to follow
+            String leader = context.strongestLeader;
+            double leaderMomentum = context.spyMomentum; // This is actually strongest leader momentum now
+            double qqqMomentum = context.qqqMomentum;
+
+            // Leader bullish, QQQ bearish/neutral -> take QQQ CALL
+            if (isCall && leaderMomentum > 0.3 && qqqMomentum < 0.1 &&
+                    (leaderMomentum - qqqMomentum) > 0.2) {
+                return createStandardAISignal(option, context, metrics, "CALL", aiDecision, leader);
+            }
+            // Leader bearish, QQQ bullish/neutral -> take QQQ PUT
+            else if (isPut && leaderMomentum < -0.3 && qqqMomentum > -0.1 &&
+                    (qqqMomentum - leaderMomentum) > 0.2) {
+                return createStandardAISignal(option, context, metrics, "PUT", aiDecision, leader);
+            }
+        }
+        else if (aiDecision.getStrategy() == LeaderLagStrategy.REVERSE) {
+            // REVERSE: Leader previously drove QQQ, now fading -> bet on QQQ's true direction
+            double leaderMomentum = context.spyMomentum; // Actually strongest leader
+            double qqqMomentum = context.qqqMomentum;
+
+            // Leader fading from strong bullish, QQQ continuing up -> QQQ CALL
+            if (isCall && leaderMomentum > 0.1 && leaderMomentum < 0.4 && qqqMomentum > 0.3) {
+                return createReverseAISignal(option, context, metrics, "CALL", aiDecision);
+            }
+            // Leader fading from strong bearish, QQQ continuing down -> QQQ PUT
+            else if (isPut && leaderMomentum < -0.1 && leaderMomentum > -0.4 && qqqMomentum < -0.3) {
+                return createReverseAISignal(option, context, metrics, "PUT", aiDecision);
+            }
+        }
+
+        return null;
+    }
+
+    private AILeaderLagSignal createStandardAISignal(Option option, MarketContext context,
+                                                     LeaderCorrelationMetrics metrics, String type,
+                                                     AIDecision aiDecision, String leader) {
+        double confidence = aiDecision.getConfidence();
+
+        // AI confidence boosts for standard strategy
+        double leaderMomentum = context.spyMomentum; // Actually leader momentum
+        double divergence = Math.abs(leaderMomentum - context.qqqMomentum);
+
+        if (divergence > 0.4) confidence = Math.min(0.95, confidence * 1.15); // Strong divergence
+        if (Math.abs(leaderMomentum) > 0.5) confidence = Math.min(0.95, confidence * 1.10); // Strong leader move
+        if (metrics.getStrongestCorrelation() > 0.7) confidence = Math.min(0.95, confidence * 1.08); // High correlation
+        if (context.volumeRatio > 1.5) confidence = Math.min(0.95, confidence * 1.05); // Volume confirmation
+
+        String strategy = type.equals("CALL") ? "0DTE_AI_LEADER_LAG_CALL" : "0DTE_AI_LEADER_LAG_PUT";
+        String reason = String.format("🤖 AI Standard: %s momentum %.2f vs QQQ %.2f, correlation %.0f%%, divergence %.2f",
+                leader, leaderMomentum, context.qqqMomentum, metrics.getStrongestCorrelation() * 100, divergence);
+
+        return new AILeaderLagSignal(LeaderLagStrategy.STANDARD, "BUY", strategy, confidence,
+                metrics.getStrongestCorrelation(), Math.abs(leaderMomentum), reason, aiDecision.getMarketRegime(), leader);
+    }
+
+    private AILeaderLagSignal createReverseAISignal(Option option, MarketContext context,
+                                                    LeaderCorrelationMetrics metrics, String type, AIDecision aiDecision) {
+        double confidence = aiDecision.getConfidence();
+
+        // AI confidence boosts for reverse strategy
+        double leaderFade = 0.5 - Math.abs(context.spyMomentum); // How much leader has faded
+        double qqqStrength = Math.abs(context.qqqMomentum);
+
+        if (leaderFade > 0.3) confidence = Math.min(0.95, confidence * 1.12); // Leader fading
+        if (qqqStrength > 0.4) confidence = Math.min(0.95, confidence * 1.15); // QQQ strong momentum
+        if (context.timeOfDay > 930) confidence = Math.min(0.95, confidence * 1.10); // Power hour boost
+        if (metrics.getStrongestCorrelation() > 0.6) confidence = Math.min(0.95, confidence * 1.05);
+
+        String strategy = type.equals("CALL") ? "0DTE_AI_REVERSE_LEADER_LAG_CALL" : "0DTE_AI_REVERSE_LEADER_LAG_PUT";
+        String reason = String.format("🤖 AI Reverse: %s fading %.2f, QQQ continuing %.2f, correlation %.0f%%",
+                context.strongestLeader, context.spyMomentum, context.qqqMomentum, metrics.getStrongestCorrelation() * 100);
+
+        return new AILeaderLagSignal(LeaderLagStrategy.REVERSE, "BUY", strategy, confidence,
+                metrics.getStrongestCorrelation(), qqqStrength, reason, aiDecision.getMarketRegime(), context.strongestLeader);
+    }
+
+    private Signal createAILeaderLagSignal(Option option, List<Option> allOptions, TechnicalAnalysis ta,
+                                           AILeaderLagSignal aiSignal, String marketTrend, String analysisId) {
+
+        Signal signal = createSignal(option, allOptions, ta, aiSignal.getSignalType(),
+                aiSignal.getStrategy(), aiSignal.getConfidence(), marketTrend);
+
+        if (signal == null) return null;
+
+        // Enhanced AI metadata
+        signal.getMetadata().put("aiStrategy", aiSignal.getLeaderLagStrategy().toString());
+        signal.getMetadata().put("aiCorrelation", String.valueOf(aiSignal.getCorrelation()));
+        signal.getMetadata().put("aiSignalStrength", String.valueOf(aiSignal.getSignalStrength()));
+        signal.getMetadata().put("aiMarketRegime", aiSignal.getMarketRegime());
+        signal.getMetadata().put("leaderStock", aiSignal.getLeaderStock());
+        signal.getMetadata().put("priority", "HIGHEST"); // AI gets highest priority
+        signal.getMetadata().put("signalSource", "AI_LEARNING_ENGINE");
+
+        // AI-optimized risk management
+        signal.setTargetPrice(calculateAITarget(signal.getEntryPrice(), aiSignal, ta));
+        signal.setStopLoss(calculateAIStop(signal.getEntryPrice(), aiSignal, ta));
+
+        signal.setReason(aiSignal.getReason());
+
+        return signal;
+    }
+
+    private BigDecimal calculateAITarget(BigDecimal entryPrice, AILeaderLagSignal aiSignal, TechnicalAnalysis ta) {
+        double baseMultiplier = aiSignal.getLeaderLagStrategy() == LeaderLagStrategy.STANDARD ? 2.5 : 2.0;
+
+        // AI strength adjustment
+        double strengthAdjustment = 1.0 + (aiSignal.getSignalStrength() - 0.5) * 0.6;
+        double finalMultiplier = baseMultiplier * strengthAdjustment;
+
+        // Time decay for 0DTE
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isAfter(LocalTime.of(15, 0))) {
+            finalMultiplier *= 0.75; // Reduce targets in final hour
+        }
+
+        // High confidence boost
+        if (aiSignal.getConfidence() > 0.9) {
+            finalMultiplier *= 1.1;
+        }
+
+        return entryPrice.multiply(BigDecimal.valueOf(finalMultiplier)).setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal calculateAIStop(BigDecimal entryPrice, AILeaderLagSignal aiSignal, TechnicalAnalysis ta) {
+        double baseStopPercentage = aiSignal.getLeaderLagStrategy() == LeaderLagStrategy.STANDARD ? 0.30 : 0.25;
+
+        // Tighter stops for high-confidence AI signals
+        if (aiSignal.getConfidence() > 0.9) {
+            baseStopPercentage *= 0.80;
+        }
+
+        // Power hour adjustment
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isAfter(POWER_HOUR_START)) {
+            baseStopPercentage *= 0.85; // Tighter stops in power hour
+        }
+
+        return entryPrice.multiply(BigDecimal.ONE.subtract(BigDecimal.valueOf(baseStopPercentage)))
+                .setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private double getAIThreshold(LeaderLagStrategy strategy, LocalTime now) {
+        boolean isPowerHour = now.isAfter(POWER_HOUR_START);
+
+        switch (strategy) {
+            case STANDARD:
+                return isPowerHour ? 0.80 : 0.70; // Lower threshold - AI is smart
+            case REVERSE:
+                return isPowerHour ? 0.75 : 0.80; // Reverse easier in power hour
+            default:
+                return 0.85;
+        }
+    }
+
+    private List<Signal> applyLateSessionFiltering(List<Signal> signals, String analysisId) {
+        List<Signal> filtered = signals.stream()
+                .filter(s -> {
+                    String priority = s.getMetadata().get("priority");
+                    String source = s.getMetadata().get("signalSource");
+
+                    // AI signals: need 75%+ confidence (lower bar for AI)
+                    if ("HIGHEST".equals(priority) && "AI_LEARNING_ENGINE".equals(source)) {
+                        return s.getConfidence() >= 0.75;
                     }
 
-                    return false;
-                })
-                .sorted((o1, o2) -> {
-                    // Sort by distance from current price (closest first)
-                    BigDecimal dist1 = o1.getStrikePrice().subtract(currentPrice).abs();
-                    BigDecimal dist2 = o2.getStrikePrice().subtract(currentPrice).abs();
-                    return dist1.compareTo(dist2);
+                    // Advanced signals: need 95% confidence
+                    if (s.getStrategy().contains("TRENDLINE_BREAK") ||
+                            s.getStrategy().contains("GAP_FILL") ||
+                            s.getStrategy().contains("HIGH_BREACH") ||
+                            s.getStrategy().contains("LOW_BREACH")) {
+                        return s.getConfidence() >= 0.95;
+                    }
+
+                    // Traditional signals: need 90% confidence
+                    return s.getConfidence() >= 0.90;
                 })
                 .collect(Collectors.toList());
 
-        // Log selected strikes
-        log.info("[v63][{}] Strike filtering for price ${}: Found {} options",
-                analysisId, currentPrice, filtered.size());
-
-        filtered.forEach(opt -> {
-            BigDecimal distance = opt.getStrikePrice().subtract(currentPrice);
-            log.info("[v63][{}] Selected: {} ${} (${} from current)",
-                    analysisId, opt.getType(), opt.getStrikePrice(),
-                    distance.compareTo(BigDecimal.ZERO) > 0 ? "+" + distance : distance);
-        });
+        log.info("[LATE-SESSION][{}] Late session filter: {} signals -> {} (AI-priority-aware filtering)",
+                analysisId, signals.size(), filtered.size());
 
         return filtered;
     }
 
+    // ================================================================================================
+    // TRADITIONAL STRATEGY ANALYSIS (SIMPLIFIED - NO UNUSUAL FLOW OR VOLUME SPIKE)
+    // ================================================================================================
 
     private void analyzeOptionWithStrategies(Option option, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend,
-                                             String analysisId, List<Option> allOptions){
-        // When blocking due to neutral market
-//        if ("NEUTRAL".equals(marketTrend)) {
-//            // Check if this would have been a signal
-//            if (wouldGenerateSignal(option, ta)) {
-//                analysisService.recordBlockedSignal(
-//                        option.getSymbol(),
-//                        "POTENTIAL_SIGNAL",
-//                        0.75, // estimated confidence
-//                        "MARKET_NEUTRAL",
-//                        option.getMidPrice(),
-//                        getCurrentMarketBreadth(),
-//                        marketTrend
-//                );
-//            }
-//            return;
-//        }
+                                             String analysisId, List<Option> allOptions) {
 
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, allOptions, analysisId);
-        if (hasUnusualFlow) {
-            analyzeUnusualFlow(option, allOptions,ta, signals, marketTrend, analysisId);
-        }
-
-        // Continue checking other strategies regardless of unusual flow
         LocalTime now = LocalTime.now(ET_ZONE);
 
-        if (now.isBefore(LocalTime.of(10, 0))) {
-            analyzeOpeningDriveStrategy(option,allOptions, ta, signals, marketTrend, analysisId);
-        }
-
+        // Opening Range Breakout (after 9:45 AM)
         if (now.isAfter(LocalTime.of(9, 45))) {
-            analyzeOpeningRangeBreakout(option,allOptions, ta, signals, marketTrend, analysisId);
+            analyzeOpeningRangeBreakout(option, allOptions, ta, signals, marketTrend, analysisId);
         }
 
-        if (ta.getVolumeRatio() > 1.5) {
-            analyzeVolumeSpikeStrategy(option,allOptions, ta, signals, marketTrend, analysisId);
+        // VWAP-based strategies
+        if (ta.getVwap() != null && ta.getVwap().compareTo(BigDecimal.ZERO) > 0) {
+
+            // 1. Strong breakouts with volume (HIGHEST PRIORITY)
+            if (ta.isVwapBreakout() && ta.getVolumeRatio() > 1.5) {
+                analyzeVWAPBreakout(option, allOptions, ta, signals, marketTrend, analysisId);
+            }
+
+            // 2. Extended reversions (far from VWAP)
+            else if (ta.isExtendedFromVwap() && (ta.getRsi() > 70 || ta.getRsi() < 30)) {
+                analyzeVWAPDeviationReversion(option, allOptions, ta, signals, marketTrend, analysisId);
+            }
+
+            // 3. Support/Resistance plays (clear levels)
+            else if (ta.isVwapAsSupport() || ta.isVwapAsResistance()) {
+                analyzeVWAPSupportResistance(option, allOptions, ta, signals, marketTrend, analysisId);
+            }
+
+            // 4. VWAP Reclaim (gradual reclaim after test)
+            else if (ta.getVolumeRatio() > 0.8 && !ta.isExtendedFromVwap()) {
+                analyzeVWAPReclaim(option, allOptions, ta, signals, marketTrend, analysisId);
+            }
+
+            // 5. Directional bounce (very close to VWAP with clear direction)
+            else if (Math.abs(ta.getPriceToVwapRatio() - 1.0) < 0.002) {
+                analyzeDirectionalVWAPBounce(option, allOptions, ta, signals, marketTrend, analysisId);
+            }
+
+            // 6. Generic bounce (close to VWAP, less specific)
+            else if (Math.abs(ta.getPriceToVwapRatio() - 1.0) < 0.005) {
+                analyzeVWAPBounce(option, allOptions, ta, signals, marketTrend, analysisId);
+            }
         }
 
-        if (ta.isVwapBreakout() && ta.getVolumeRatio() > 1.5) {
-            analyzeVWAPBreakout(option,allOptions, ta, signals, marketTrend, analysisId);
-        } else if (ta.isExtendedFromVwap() && (ta.getRsi() > 70 || ta.getRsi() < 30)) {
-            analyzeVWAPDeviationReversion(option,allOptions, ta, signals, marketTrend, analysisId);
-        } else if (ta.isVwapAsSupport() || ta.isVwapAsResistance()) {
-            analyzeVWAPSupportResistance(option,allOptions, ta, signals, marketTrend, analysisId);
-        } else if (Math.abs(ta.getPriceToVwapRatio() - 1.0) < 0.005) {
-            analyzeVWAPBounce(option,allOptions, ta, signals, marketTrend, analysisId);
+        // Enhanced pattern detection for existing VWAP strategies
+        VWAPPattern currentPattern = detectMultiCandleVWAPPattern(
+                marketDataRepository.findRecentData(ta.getSymbol(), 10), ta);
+
+        // Boost confidence for pattern-confirmed signals
+        if (currentPattern != VWAPPattern.NONE) {
+            log.info("[{}] Multi-candle pattern detected: {}", analysisId, currentPattern);
+
+            // Apply pattern-specific confidence boosts to existing signals
+            signals.stream()
+                    .filter(s -> s.getStrategy().contains("VWAP"))
+                    .forEach(signal -> {
+                        double boost = getPatternConfidenceBoost(currentPattern);
+                        signal.setConfidence(Math.min(0.95, signal.getConfidence() * boost));
+                        signal.setReason(signal.getReason() + " [Pattern: " + currentPattern + "]");
+                    });
         }
     }
 
-    private void analyzeOpeningDriveStrategy(Option option,List<Option> allOptions, TechnicalAnalysis ta,
-                                             List<Signal> signals, String marketTrend, String analysisId) {
-        if (!detectOpeningDrive(ta, analysisId)) {
-            return;
-        }
-        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
-            return;
-        }
-
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
-        BigDecimal gap = calculatePremarketGap(ta);
-        boolean isCallOption = "CALL".equalsIgnoreCase(option.getType());
-        boolean isPutOption = "PUT".equalsIgnoreCase(option.getType());
-
-        if (gap.compareTo(BigDecimal.ZERO) > 0 && isCallOption && "UP".equals(marketTrend)) {
-            double confidence = 0.70;
-
-            if (ta.getVolumeRatio() > 2.0 || hasUnusualFlow) {
-                confidence += 0.15;
-            }
-
-            if (ta.getMomentumStrength() > 0.5) {
-                confidence += 0.10;
-            }
-
-            if (confidence >= 0.70) {
-                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_OPENING_DRIVE_CALL", confidence, marketTrend);
-                signal.setReason(String.format(
-                        "Opening drive +%.2f%% gap with %.1fx volume - momentum continuation%s",
-                        gap.multiply(BigDecimal.valueOf(100)).doubleValue(),
-                        ta.getVolumeRatio(),
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
-                signals.add(signal);
-
-                log.info("[v63][{}] ✅ OPENING DRIVE CALL - Confidence: {}%",
-                        analysisId, (int)(confidence * 100));
-            }
-        }
-
-        if (gap.compareTo(BigDecimal.ZERO) < 0 && isPutOption && "DOWN".equals(marketTrend)) {
-            double confidence = 0.70;
-
-            if (ta.getVolumeRatio() > 2.0 || hasUnusualFlow) {
-                confidence += 0.15;
-            }
-
-            if (ta.getMomentumStrength() < -0.5) {
-                confidence += 0.10;
-            }
-
-            if (confidence >= 0.70) {
-                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_OPENING_DRIVE_PUT", confidence, marketTrend);
-                signal.setReason(String.format(
-                        "Opening drive %.2f%% gap down with %.1fx volume - momentum continuation%s",
-                        gap.multiply(BigDecimal.valueOf(100)).doubleValue(),
-                        ta.getVolumeRatio(),
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
-                signals.add(signal);
-
-                log.info("[v63][{}] ✅ OPENING DRIVE PUT - Confidence: {}%",
-                        analysisId, (int)(confidence * 100));
-            }
+    private double getPatternConfidenceBoost(VWAPPattern pattern) {
+        switch (pattern) {
+            case COMPRESSION:
+                return 1.15; // 15% boost
+            case FAILED_BREAKDOWN:
+                return 1.20; // 20% boost - strong pattern
+            case STAIR_STEP:
+                return 1.10; // 10% boost
+            default:
+                return 1.0;
         }
     }
+
+    // ================================================================================================
+    // EXECUTION WITH PRICE LEVEL VALIDATION
+    // ================================================================================================
+
+    private void executeSignalImmediately(Signal signal, SHAPExplainerService.SHAPExplanation explanation, String analysisId) {
+        try {
+            log.info("[EXECUTION][{}] Attempting BUY_TO_OPEN execution: {}", analysisId, signal.getOptionSymbol());
+
+            // 1. GET QUOTE FIRST
+            QuoteResponse quote = tradierService.getQuote(signal.getOptionSymbol());
+            if (quote == null || quote.getQuote() == null) {
+                log.error("[EXECUTION][{}] ❌ Cannot get quote - saving as QUOTE_FAILED", analysisId);
+                saveFailedTrade(signal, "QUOTE_FAILED", "Unable to get option quote", analysisId);
+                saveFailedSignal(signal, "QUOTE_FAILED", "Unable to get option quote");
+                return;
+            }
+
+            BigDecimal currentPrice = quote.getQuote().getLast();
+
+            // 2. PRICE LEVEL RISK ASSESSMENT
+            PriceLevelRiskService.PriceLevelRisk priceLevelRisk =
+                    priceLevelRiskService.assessPriceLevelRisk(signal.getSymbol(),
+                            signal.getEntryAssumptionPrice(), analysisId);
+
+            if (!priceLevelRisk.shouldProceed()) {
+                log.warn("[EXECUTION][{}] ❌ Price level risk - saving as LEVEL_BLOCKED: {}",
+                        analysisId, priceLevelRisk.getRecommendation());
+
+                saveFailedTrade(signal, "LEVEL_BLOCKED",
+                        "Near POC/resistance without volume confirmation: " + priceLevelRisk.getRecommendation(), analysisId);
+                saveFailedSignal(signal, "LEVEL_BLOCKED",
+                        "Near POC/resistance without volume confirmation");
+
+                // Send notification for blocked signals
+                telegramService.sendMessage(String.format(
+                        "🚫 SIGNAL BLOCKED - PRICE LEVEL RISK\n" +
+                                "Option: %s\n" +
+                                "Reason: %s\n" +
+                                "Risk: %s\n" +
+                                "Status: Saved for analysis",
+                        signal.getOptionSymbol(),
+                        priceLevelRisk.getRecommendation(),
+                        priceLevelRisk.isHighRisk() ? "HIGH" : "MODERATE"
+                ));
+                return;
+            }
+
+            // 3. PROCEED WITH EXECUTION IF LEVELS ARE CLEAR
+            log.info("[EXECUTION][{}] ✅ Price levels CLEAR - proceeding with execution", analysisId);
+
+            boolean orderSuccessful = attemptSignalExecution(signal, analysisId);
+
+            if (orderSuccessful) {
+                log.info("[EXECUTION][{}] ✅ Tradier order CONFIRMED - saving as OPEN", analysisId);
+
+                Trade trade = createSuccessfulTrade(signal, currentPrice, analysisId);
+                enrichTradeWithBayesianData(trade, signal);
+                trade = tradeRepository.save(trade);
+
+                // Update signal
+                signal.setEntryPrice(currentPrice);
+                signal.setStatus("EXECUTED");
+                signal.getMetadata().put("tradeId", trade.getId().toString());
+                signal.getMetadata().put("executedAt", LocalDateTime.now().toString());
+                signal.getMetadata().put("priceLevelClear", "true");
+                signalRepository.save(signal);
+
+                log.info("[EXECUTION][{}] ✅ SUCCESS SAVED - Trade ID: {} (OPEN), Signal (EXECUTED)",
+                        analysisId, trade.getId());
+
+                // Send success notification
+                sendSuccessNotification(trade, signal, explanation, analysisId);
+
+                // Update AI learning asynchronously
+                updateAIFromTradeAsync(trade, signal);
+
+            } else {
+                log.warn("[EXECUTION][{}] ❌ Tradier order FAILED - saving as ORDER_FAILED", analysisId);
+                saveFailedTrade(signal, "ORDER_FAILED", "Tradier order rejected", analysisId);
+                saveFailedSignal(signal, "ORDER_FAILED", "Tradier order rejected");
+
+                telegramService.sendMessage(String.format(
+                        "❌ EXECUTION FAILED\n" +
+                                "Option: %s\n" +
+                                "Reason: Tradier order rejected\n" +
+                                "Status: ORDER_FAILED (saved for analysis)",
+                        signal.getOptionSymbol()
+                ));
+            }
+
+        } catch (Exception e) {
+            log.error("[EXECUTION][{}] ❌ Exception during execution: {}", analysisId, e.getMessage());
+            saveFailedTrade(signal, "EXECUTION_ERROR", e.getMessage(), analysisId);
+            saveFailedSignal(signal, "EXECUTION_ERROR", e.getMessage());
+        }
+    }
+
+    @Async
+    public void updateAIFromTradeAsync(Trade trade, Signal signal) {
+        try {
+            if (signal.getStrategy().contains("AI_LEADER_LAG")) {
+                aiLearning.updateFromTrade(trade, signal);
+                log.info("[AI-UPDATE] Updated AI learning from trade: {} P&L: {}%",
+                        trade.getOptionSymbol(), calculateTradePerformance(trade));
+            }
+        } catch (Exception e) {
+            log.error("[AI-UPDATE] Error updating AI from trade: {}", e.getMessage());
+        }
+    }
+
+    // ================================================================================================
+    // MODIFIED TREND FILTERING (ALLOWS AI COUNTER-TREND SIGNALS)
+    // ================================================================================================
+
+    private boolean isSignalAlignedWithTrend(Option option, List<Option> allOptions, TechnicalAnalysis ta,
+                                             String marketTrend, String analysisId) {
+
+        // STRICT RULE 1: Block ALL signals in NEUTRAL trend
+        if ("NEUTRAL".equals(marketTrend)) {
+            log.warn("[{}] ❌ BLOCKED: {} {} - Market is NEUTRAL (NO TRADES ALLOWED)",
+                    analysisId, option.getType(), option.getStrikePrice());
+            return false;
+        }
+
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+        boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
+
+        log.info("[{}] Trend Check: {} option vs {} market trend = {}",
+                analysisId, option.getType(), marketTrend, aligned ? "ALIGNED" : "MISALIGNED");
+
+        return aligned;
+    }
+
+    private boolean isAILeaderLagSignal(Signal signal) {
+        return signal != null && signal.getStrategy() != null &&
+                signal.getStrategy().contains("AI_LEADER_LAG");
+    }
+
+    private boolean isSignalAlignedWithTrendOrAI(Option option, List<Option> allOptions, TechnicalAnalysis ta,
+                                                 String marketTrend, String analysisId, Signal signal) {
+
+        // AI Leader-Lag signals are allowed to be counter-trend
+        if (isAILeaderLagSignal(signal)) {
+            log.info("[{}] ✅ AI LEADER-LAG signal allowed (counter-trend permitted): {} {}",
+                    analysisId, option.getType(), option.getStrikePrice());
+            return true;
+        }
+
+        // All other signals must follow trend
+        return isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId);
+    }
+
+    // ================================================================================================
+    // TRADITIONAL STRATEGY IMPLEMENTATIONS (SIMPLIFIED)
+    // ================================================================================================
 
     private void analyzeOpeningRangeBreakout(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                              List<Signal> signals, String marketTrend, String analysisId) {
-        if (ta.getOpeningRangeHigh() == null || ta.getOpeningRangeLow() == null) {
-            return;
+        LocalTime now = LocalTime.now(ET_ZONE);
+
+        // PRIMARY: 30-minute ORB (10:00-10:30 AM optimal window)
+        if (now.isAfter(LocalTime.of(10, 0)) && now.isBefore(LocalTime.of(10, 30))) {
+            analyze30MinuteORB(option, allOptions, ta, signals, marketTrend, analysisId);
         }
-        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+    }
+
+    private void analyze30MinuteORB(Option option, List<Option> allOptions, TechnicalAnalysis ta,
+                                    List<Signal> signals, String marketTrend, String analysisId) {
+        LocalTime now = LocalTime.now(ET_ZONE);
+
+        // Check data sufficiency for ORB
+        if (!hasORBDataSufficiency(ta.getSymbol(), analysisId)) {
             return;
         }
 
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
+        OpeningRange range30Min = calculate30MinuteRange(ta);
+        if (range30Min == null || !isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId)) return;
+
         BigDecimal currentPrice = ta.getCurrentPrice();
-        BigDecimal orHigh = ta.getOpeningRangeHigh();
-        BigDecimal orLow = ta.getOpeningRangeLow();
 
-        log.info("[v63][{}] ORB Analysis - Current: ${}, OR High: ${}, OR Low: ${}",
-                analysisId, currentPrice, orHigh, orLow);
+        // Enhanced false breakout protection
+        if (!validateEnhancedBreakout(currentPrice, range30Min, ta, now)) return;
 
-        if (currentPrice.compareTo(orHigh) > 0 && "CALL".equalsIgnoreCase(option.getType())) {
-            boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
+        // Volume validation
+        VolumeRequirement volReq = calculateBreakoutCandleVolume(ta);
+        if (!volReq.isMet()) return;
 
-            if (volumeRequirementMet && !ta.isHasRsiDivergence()) {
-                double confidence = calculateORBConfidence(ta, true);
+        // Gap analysis
+        GapAnalysis gapAnalysis = analyzeGapConditions(ta);
 
-                if (hasUnusualFlow) {
-                    confidence = Math.min(confidence * 1.15, 0.95);
-                }
+        String strategy = "CALL".equalsIgnoreCase(option.getType()) ? "0DTE_30MIN_ORB_CALL" : "0DTE_30MIN_ORB_PUT";
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
 
-                if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_ORB_CALL", confidence, marketTrend);
-                    signal.setReason(String.format(
-                            "Opening range breakout above $%.2f with %.1fx volume%s",
-                            orHigh, ta.getVolumeRatio(),
-                            hasUnusualFlow ? " (Unusual Flow)" : ""));
-                    signals.add(signal);
+        if ((isCall && currentPrice.compareTo(range30Min.getHigh()) > 0) ||
+                (!isCall && currentPrice.compareTo(range30Min.getLow()) < 0)) {
 
-                    log.info("[v63][{}] ✅ ORB CALL signal - Confidence: {}%",
-                            analysisId, (int)(confidence * 100));
-                }
+            double confidence = calculateEnhancedORBConfidence(ta, volReq, gapAnalysis, isCall, now);
+            double threshold = calculateDynamicThreshold(now, volReq);
+
+            if (confidence >= threshold) {
+                Signal signal = createAdvancedORBSignal(option, allOptions, ta, "BUY", strategy, confidence, marketTrend, range30Min, volReq);
+                signals.add(signal);
+
+                log.info("[{}] ✅ {} - Confidence: {}%, Volume: {}, Gap: {}%",
+                        analysisId, strategy, (int)(confidence * 100), volReq.getTier(),
+                        gapAnalysis.getGapPercentage() * 100);
             }
         }
+    }
 
-        if (currentPrice.compareTo(orLow) < 0 && "PUT".equalsIgnoreCase(option.getType())) {
-            boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
+    private boolean hasORBDataSufficiency(String symbol, String analysisId) {
+        try {
+            LocalDateTime marketOpen = LocalDateTime.now(ET_ZONE).with(LocalTime.of(9, 30));
+            LocalDateTime orbEnd = marketOpen.plusMinutes(30);
+            LocalDateTime now = LocalDateTime.now(ET_ZONE);
 
-            if (volumeRequirementMet && !ta.isHasRsiDivergence()) {
-                double confidence = calculateORBConfidence(ta, false);
+            // If we're before ORB completion, check if we have data up to now
+            LocalDateTime checkUntil = now.isBefore(orbEnd) ? now : orbEnd;
 
-                if (hasUnusualFlow) {
-                    confidence = Math.min(confidence * 1.15, 0.95);
-                }
+            List<MarketData> orbData = marketDataRepository.findRecentData(symbol, 100)
+                    .stream()
+                    .filter(data -> data.getTimestamp().isAfter(marketOpen) &&
+                            data.getTimestamp().isBefore(checkUntil))
+                    .collect(Collectors.toList());
 
-                if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_ORB_PUT", confidence, marketTrend);
-                    signal.setReason(String.format(
-                            "Opening range breakdown below $%.2f with %.1fx volume%s",
-                            orLow, ta.getVolumeRatio(),
-                            hasUnusualFlow ? " (Unusual Flow)" : ""));
-                    signals.add(signal);
+            long expectedMinutes = Duration.between(marketOpen, checkUntil).toMinutes();
+            double completeness = expectedMinutes > 0 ? (double) orbData.size() / expectedMinutes : 0;
 
-                    log.info("[v63][{}] ✅ ORB PUT signal - Confidence: {}%",
-                            analysisId, (int)(confidence * 100));
-                }
+            if (completeness < 0.80) {
+                log.warn("[ORB-DATA][{}] Insufficient ORB data: {}% completeness", analysisId, (int)(completeness * 100));
+                return false;
             }
+
+            return true;
+
+        } catch (Exception e) {
+            log.error("[ORB-DATA][{}] Error checking ORB data sufficiency: {}", analysisId, e.getMessage());
+            return false;
         }
     }
 
     private void analyzeVWAPBreakout(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                      List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
-        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+        if (!isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId)) {
             return;
         }
 
@@ -882,7 +987,7 @@ public class ZeroDTEStrategy {
         BigDecimal vwapLower = ta.getVwapLowerBand();
 
         if (ta.isHasRsiDivergence()) {
-            log.info("[v63][{}] ⚠️ RSI divergence detected - reducing breakout confidence", analysisId);
+            log.info("[{}] ⚠️ RSI divergence detected - reducing breakout confidence", analysisId);
         }
 
         if (currentPrice.compareTo(vwapUpper) > 0 && "CALL".equalsIgnoreCase(option.getType())) {
@@ -890,7 +995,11 @@ public class ZeroDTEStrategy {
                     .divide(vwapUpper, 4, RoundingMode.HALF_UP);
 
             if (breakoutDistance.compareTo(BigDecimal.valueOf(0.002)) >= 0) {
-                boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
+                // USE AI-LEARNED THRESHOLD - MODIFIED
+//                double requiredVolumeRatio = attributeLearning.getOptimalThreshold(
+//                        "0DTE_VWAP_BREAKOUT_CALL", "VOLUME_THRESHOLD");
+//                boolean volumeRequirementMet = ta.getVolumeRatio() >= requiredVolumeRatio;
+                boolean volumeRequirementMet = ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
 
                 if (volumeRequirementMet) {
                     double confidence = calculateBreakoutConfidence(ta, true);
@@ -899,20 +1008,15 @@ public class ZeroDTEStrategy {
                         confidence *= 0.7;
                     }
 
-                    if (hasUnusualFlow) {
-                        confidence = Math.min(confidence * 1.15, 0.95);
-                    }
-
                     if (confidence >= 0.60) {
-                        Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_BREAKOUT_CALL", confidence, marketTrend);
+                        Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_BREAKOUT_CALL", confidence, marketTrend);
                         signal.setReason(String.format(
-                                "VWAP breakout %.2f%% above upper band with %.1fx volume%s",
+                                "VWAP breakout %.2f%% above upper band with %.1fx volume",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
-                                ta.getVolumeRatio(),
-                                hasUnusualFlow ? " (Unusual Flow)" : ""));
+                                ta.getVolumeRatio()));
                         signals.add(signal);
 
-                        log.info("[v63][{}] ✅ VWAP Breakout CALL - Confidence: {}%",
+                        log.info("[{}] ✅ VWAP Breakout CALL - Confidence: {}%",
                                 analysisId, (int)(confidence * 100));
                     }
                 }
@@ -924,7 +1028,11 @@ public class ZeroDTEStrategy {
                     .divide(vwapLower, 4, RoundingMode.HALF_UP);
 
             if (breakoutDistance.compareTo(BigDecimal.valueOf(0.002)) >= 0) {
-                boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
+                // USE AI-LEARNED THRESHOLD - MODIFIED
+//                double requiredVolumeRatio = attributeLearning.getOptimalThreshold(
+//                        "0DTE_VWAP_BREAKOUT_PUT", "VOLUME_THRESHOLD");
+//                boolean volumeRequirementMet = ta.getVolumeRatio() >= requiredVolumeRatio;
+                boolean volumeRequirementMet = ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
 
                 if (volumeRequirementMet) {
                     double confidence = calculateBreakoutConfidence(ta, false);
@@ -933,20 +1041,15 @@ public class ZeroDTEStrategy {
                         confidence *= 0.7;
                     }
 
-                    if (hasUnusualFlow) {
-                        confidence = Math.min(confidence * 1.15, 0.95);
-                    }
-
                     if (confidence >= 0.60) {
-                        Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_BREAKOUT_PUT", confidence, marketTrend);
+                        Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_BREAKOUT_PUT", confidence, marketTrend);
                         signal.setReason(String.format(
-                                "VWAP breakout %.2f%% below lower band with %.1fx volume%s",
+                                "VWAP breakout %.2f%% below lower band with %.1fx volume",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
-                                ta.getVolumeRatio(),
-                                hasUnusualFlow ? " (Unusual Flow)" : ""));
+                                ta.getVolumeRatio()));
                         signals.add(signal);
 
-                        log.info("[v63][{}] ✅ VWAP Breakout PUT - Confidence: {}%",
+                        log.info("[{}] ✅ VWAP Breakout PUT - Confidence: {}%",
                                 analysisId, (int)(confidence * 100));
                     }
                 }
@@ -954,42 +1057,29 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private void analyzeVWAPDeviationReversion(Option option,List<Option> allOptions, TechnicalAnalysis ta,
+    private void analyzeVWAPDeviationReversion(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                                List<Signal> signals, String marketTrend, String analysisId) {
         if (!ta.isExtendedFromVwap() || ta.getVwapStandardDeviation() == null ||
                 ta.getVwapStandardDeviation().compareTo(BigDecimal.ZERO) == 0) {
             return;
         }
-        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+        if (!isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId)) {
             return;
         }
 
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions,analysisId);
-
         double priceRatio = ta.getPriceToVwapRatio();
-
-        log.info("[v63][{}] Deviation Reversion - Price/VWAP: {}, Extended: {}",
-                analysisId,
-                String.format("%.3f", priceRatio),
-                ta.isExtendedFromVwap());
 
         if (priceRatio > 1.0 && "PUT".equalsIgnoreCase(option.getType()) && ta.getRsi() > 70) {
             double confidence = calculateReversionConfidence(ta, false);
 
-            if (hasUnusualFlow) {
-                confidence = Math.min(confidence * 1.15, 0.95);
-            }
-
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_REVERSION_PUT", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_REVERSION_PUT", confidence, marketTrend);
                 signal.setReason(String.format(
-                        "Extended %.2f%% above VWAP with RSI %.1f - mean reversion setup%s",
-                        (priceRatio - 1) * 100, ta.getRsi(),
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
+                        "Extended %.2f%% above VWAP with RSI %.1f - mean reversion setup",
+                        (priceRatio - 1) * 100, ta.getRsi()));
                 signals.add(signal);
 
-                log.info("[v63][{}] ✅ VWAP Reversion PUT - Confidence: {}%",
+                log.info("[{}] ✅ VWAP Reversion PUT - Confidence: {}%",
                         analysisId, (int)(confidence * 100));
             }
         }
@@ -997,87 +1087,14 @@ public class ZeroDTEStrategy {
         if (priceRatio < 1.0 && "CALL".equalsIgnoreCase(option.getType()) && ta.getRsi() < 30) {
             double confidence = calculateReversionConfidence(ta, true);
 
-            if (hasUnusualFlow) {
-                confidence = Math.min(confidence * 1.15, 0.95);
-            }
-
             if (confidence >= 0.65) {
-                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_REVERSION_CALL", confidence, marketTrend);
+                Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_REVERSION_CALL", confidence, marketTrend);
                 signal.setReason(String.format(
-                        "Extended %.2f%% below VWAP with RSI %.1f - mean reversion setup%s",
-                        (1 - priceRatio) * 100, ta.getRsi(),
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
+                        "Extended %.2f%% below VWAP with RSI %.1f - mean reversion setup",
+                        (1 - priceRatio) * 100, ta.getRsi()));
                 signals.add(signal);
 
-                log.info("[v63][{}] ✅ VWAP Reversion CALL - Confidence: {}%",
-                        analysisId, (int)(confidence * 100));
-            }
-        }
-    }
-
-    private void analyzeVolumeSpikeStrategy(Option option, List<Option> allOptions, TechnicalAnalysis ta,
-                                            List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option, allOptions,analysisId);
-        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
-            return;
-        }
-
-        double requiredVolumeRatio = hasUnusualFlow ? 1.5 : 2.0;
-
-        if (ta.getVolumeRatio() < requiredVolumeRatio && !hasUnusualFlow) {
-            log.debug("[{}] Skipping Volume Spike - Volume ratio {:.2f} < required {:.1f}",
-                    analysisId, ta.getVolumeRatio(), requiredVolumeRatio);
-            return;
-        }
-
-        log.info("[v63][{}] Volume Spike Analysis - Ratio: {}x, Trend: {}",
-                analysisId,
-                String.format("%.1f", ta.getVolumeRatio()),
-                marketTrend);
-
-        if ("CALL".equalsIgnoreCase(option.getType()) &&
-                "UP".equals(marketTrend) &&
-                ta.getMomentumStrength() > 0.3) {
-
-            double confidence = calculateVolumeSpikeConfidence(ta, true);
-
-            if (hasUnusualFlow) {
-                confidence = Math.min(confidence * 1.15, 0.95);
-            }
-
-            if (confidence >= 0.65) {
-                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VOLUME_SPIKE_CALL", confidence, marketTrend);
-                signal.setReason(String.format(
-                        "Volume spike %.1fx with bullish momentum - continuation play%s",
-                        ta.getVolumeRatio(),
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
-                signals.add(signal);
-
-                log.info("[v63][{}] ✅ Volume Spike CALL - Confidence: {}%",
-                        analysisId, (int)(confidence * 100));
-            }
-        }
-
-        if ("PUT".equalsIgnoreCase(option.getType()) &&
-                "DOWN".equals(marketTrend) &&
-                ta.getMomentumStrength() < -0.3) {
-
-            double confidence = calculateVolumeSpikeConfidence(ta, false);
-
-            if (hasUnusualFlow) {
-                confidence = Math.min(confidence * 1.15, 0.95);
-            }
-
-            if (confidence >= 0.65) {
-                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VOLUME_SPIKE_PUT", confidence, marketTrend);
-                signal.setReason(String.format(
-                        "Volume spike %.1fx with bearish momentum - continuation play%s",
-                        ta.getVolumeRatio(),
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
-                signals.add(signal);
-
-                log.info("[v63][{}] ✅ Volume Spike PUT - Confidence: {}%",
+                log.info("[{}] ✅ VWAP Reversion CALL - Confidence: {}%",
                         analysisId, (int)(confidence * 100));
             }
         }
@@ -1085,9 +1102,7 @@ public class ZeroDTEStrategy {
 
     private void analyzeVWAPSupportResistance(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                               List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions, analysisId);
-        if (!isSignalAlignedWithTrend(option,allOptions, ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+        if (!isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId)) {
             return;
         }
 
@@ -1097,24 +1112,15 @@ public class ZeroDTEStrategy {
         if (ta.isVwapAsSupport() && "CALL".equalsIgnoreCase(option.getType()) &&
                 currentPrice.compareTo(vwap) > 0) {
 
-            boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD;
-
-            if (volumeRequirementMet) {
+            if (ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD) {
                 double confidence = calculateSupportResistanceConfidence(ta, true);
 
-                if (hasUnusualFlow) {
-                    confidence = Math.min(confidence * 1.15, 0.95);
-                }
-
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_SUPPORT_CALL", confidence, marketTrend);
-                    signal.setReason(String.format(
-                            "VWAP support at $%.2f held with %d touches%s",
-                            vwap, 3,
-                            hasUnusualFlow ? " (Unusual Flow)" : ""));
+                    Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_SUPPORT_CALL", confidence, marketTrend);
+                    signal.setReason(String.format("VWAP support at $%.2f held with volume confirmation", vwap));
                     signals.add(signal);
 
-                    log.info("[v63][{}] ✅ VWAP Support CALL - Confidence: {}%",
+                    log.info("[{}] ✅ VWAP Support CALL - Confidence: {}%",
                             analysisId, (int)(confidence * 100));
                 }
             }
@@ -1123,89 +1129,207 @@ public class ZeroDTEStrategy {
         if (ta.isVwapAsResistance() && "PUT".equalsIgnoreCase(option.getType()) &&
                 currentPrice.compareTo(vwap) < 0) {
 
-            boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD;
-
-            if (volumeRequirementMet) {
+            if (ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD) {
                 double confidence = calculateSupportResistanceConfidence(ta, false);
 
-                if (hasUnusualFlow) {
-                    confidence = Math.min(confidence * 1.15, 0.95);
-                }
-
                 if (confidence >= 0.65) {
-                    Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_RESISTANCE_PUT", confidence, marketTrend);
-                    signal.setReason(String.format(
-                            "VWAP resistance at $%.2f rejected with %d touches%s",
-                            vwap, 3,
-                            hasUnusualFlow ? " (Unusual Flow)" : ""));
+                    Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_RESISTANCE_PUT", confidence, marketTrend);
+                    signal.setReason(String.format("VWAP resistance at $%.2f rejected with volume confirmation", vwap));
                     signals.add(signal);
 
-                    log.info("[v63][{}] ✅ VWAP Resistance PUT - Confidence: {}%",
+                    log.info("[{}] ✅ VWAP Resistance PUT - Confidence: {}%",
                             analysisId, (int)(confidence * 100));
                 }
             }
         }
     }
 
-    private void analyzeVWAPBounce(Option option,List<Option> allOptions, TechnicalAnalysis ta,
-                                   List<Signal> signals, String marketTrend, String analysisId) {
-        boolean hasUnusualFlow = detectUnusualOptionsFlow(option,allOptions,analysisId);
-        if (!isSignalAlignedWithTrend(option,allOptions,ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
+    private void analyzeVWAPReclaim(Option option, List<Option> allOptions,
+                                    TechnicalAnalysis ta, List<Signal> signals,
+                                    String marketTrend, String analysisId) {
+
+        if (!isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId)) {
             return;
         }
+
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal vwap = ta.getVwap();
 
+        boolean nowAboveVWAP = currentPrice.compareTo(vwap) > 0;
+        boolean nowBelowVWAP = currentPrice.compareTo(vwap) < 0;
+
+        // Get recent data for pattern confirmation
+        List<MarketData> recentData = marketDataRepository.findRecentData(ta.getSymbol(), 5);
+        if (recentData.size() < 3) return;
+
+        boolean recentlyTestedFromBelow = checkRecentVWAPTest(recentData, vwap, false);
+        boolean recentlyTestedFromAbove = checkRecentVWAPTest(recentData, vwap, true);
+
+        double penetration = Math.abs(currentPrice.subtract(vwap)
+                .divide(vwap, 4, RoundingMode.HALF_UP).doubleValue());
+
+        if (penetration < 0.0005 || penetration > 0.003) return;
+
+        // VWAP RECLAIM LONG (CALL)
+        if ("CALL".equalsIgnoreCase(option.getType()) && nowAboveVWAP && recentlyTestedFromBelow) {
+            if ("UP".equals(marketTrend) && ta.getVolumeRatio() > 1.0) {
+                double confidence = calculateVWAPReclaimConfidence(ta, penetration, true);
+
+                if (confidence >= 0.75) {
+                    Signal signal = createSignal(option, allOptions, ta, "BUY",
+                            "0DTE_VWAP_RECLAIM_CALL", confidence, marketTrend);
+
+                    signal.setReason(String.format(
+                            "VWAP reclaim after test - penetration: %.2f%%, volume: %.1fx",
+                            penetration * 100, ta.getVolumeRatio()));
+
+                    signals.add(signal);
+                    log.info("[{}] ✅ VWAP RECLAIM CALL - Confidence: {}%",
+                            analysisId, (int)(confidence * 100));
+                }
+            }
+        }
+
+        // VWAP FAILED RECLAIM (PUT)
+        if ("PUT".equalsIgnoreCase(option.getType()) && nowBelowVWAP && recentlyTestedFromAbove) {
+            if ("DOWN".equals(marketTrend) && ta.getVolumeRatio() > 1.0) {
+                double confidence = calculateVWAPReclaimConfidence(ta, penetration, false);
+
+                if (confidence >= 0.75) {
+                    Signal signal = createSignal(option, allOptions, ta, "BUY",
+                            "0DTE_VWAP_FAILED_RECLAIM_PUT", confidence, marketTrend);
+
+                    signal.setReason(String.format(
+                            "VWAP failed reclaim - rejection: %.2f%%, volume: %.1fx",
+                            penetration * 100, ta.getVolumeRatio()));
+
+                    signals.add(signal);
+                    log.info("[{}] ✅ VWAP FAILED RECLAIM PUT - Confidence: {}%",
+                            analysisId, (int)(confidence * 100));
+                }
+            }
+        }
+    }
+
+    private void analyzeVWAPBounce(Option option, List<Option> allOptions, TechnicalAnalysis ta,
+                                   List<Signal> signals, String marketTrend, String analysisId) {
+
+        if (!isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId)) {
+            return;
+        }
+
+        BigDecimal currentPrice = ta.getCurrentPrice();
+        BigDecimal vwap = ta.getVwap();
+
+        // Check if we're close to VWAP (within 0.5%)
         if (Math.abs(ta.getPriceToVwapRatio() - 1.0) > 0.005) {
             return;
         }
 
-        boolean volumeRequirementMet = hasUnusualFlow || ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD;
-
+        boolean volumeRequirementMet = ta.getVolumeRatio() >= MIN_VOLUME_RATIO_STANDARD;
         if (!volumeRequirementMet) {
-            log.debug("[{}] Skipping VWAP Bounce - Volume ratio {:.2f} < required {:.1f}",
-                    analysisId, ta.getVolumeRatio(), MIN_VOLUME_RATIO_STANDARD);
             return;
         }
 
-        if ("CALL".equalsIgnoreCase(option.getType()) && ta.getRsi() > 45 && ta.getRsi() < 55) {
+        boolean isCallOption = "CALL".equalsIgnoreCase(option.getType());
+        boolean isPutOption = "PUT".equalsIgnoreCase(option.getType());
+
+        // CALL signals when price is above VWAP and trending up
+        if (isCallOption && currentPrice.compareTo(vwap) >= 0 && "UP".equals(marketTrend)) {
             double confidence = calculateBounceConfidence(ta, true);
 
-            if (hasUnusualFlow) {
-                confidence = Math.min(confidence * 1.15, 0.95);
-            }
-
-            if (confidence >= 0.60) {
-                Signal signal = createSignal(option, allOptions,ta, "BUY", "0DTE_VWAP_BOUNCE_CALL", confidence, marketTrend);
-                signal.setReason(String.format("VWAP bounce with neutral RSI and volume confirmation%s",
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
+            if (confidence >= 0.70) {
+                Signal signal = createSignal(option, allOptions, ta, "BUY",
+                        "0DTE_VWAP_BOUNCE_CALL", confidence, marketTrend);
+                signal.setReason("VWAP support bounce with volume confirmation");
                 signals.add(signal);
 
-                log.info("[v63][{}] ✅ VWAP Bounce CALL - Confidence: {}%",
+                log.info("[{}] ✅ VWAP Bounce CALL - Confidence: {}%",
                         analysisId, (int)(confidence * 100));
             }
         }
 
-        if ("PUT".equalsIgnoreCase(option.getType()) && ta.getRsi() > 45 && ta.getRsi() < 55) {
+        // PUT signals when price is below VWAP and trending down
+        if (isPutOption && currentPrice.compareTo(vwap) <= 0 && "DOWN".equals(marketTrend)) {
             double confidence = calculateBounceConfidence(ta, false);
 
-            if (hasUnusualFlow) {
-                confidence = Math.min(confidence * 1.15, 0.95);
-            }
-
-            if (confidence >= 0.60) {
-                Signal signal = createSignal(option,allOptions, ta, "BUY", "0DTE_VWAP_BOUNCE_PUT", confidence, marketTrend);
-                signal.setReason(String.format("VWAP rejection with neutral RSI and volume confirmation%s",
-                        hasUnusualFlow ? " (Unusual Flow)" : ""));
+            if (confidence >= 0.70) {
+                Signal signal = createSignal(option, allOptions, ta, "BUY",
+                        "0DTE_VWAP_BOUNCE_PUT", confidence, marketTrend);
+                signal.setReason("VWAP resistance rejection with volume confirmation");
                 signals.add(signal);
 
-                log.info("[v63][{}] ✅ VWAP Bounce PUT - Confidence: {}%",
+                log.info("[{}] ✅ VWAP Bounce PUT - Confidence: {}%",
                         analysisId, (int)(confidence * 100));
             }
         }
     }
 
+    private void analyzeDirectionalVWAPBounce(Option option, List<Option> allOptions, TechnicalAnalysis ta,
+                                              List<Signal> signals, String marketTrend, String analysisId) {
+
+        if (!isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, analysisId)) {
+            return;
+        }
+
+        BigDecimal currentPrice = ta.getCurrentPrice();
+        BigDecimal vwap = ta.getVwap();
+
+        // Must be very close to VWAP (within 0.2%)
+        double vwapDistance = Math.abs(currentPrice.subtract(vwap)
+                .divide(vwap, 4, RoundingMode.HALF_UP).doubleValue());
+
+        if (vwapDistance > 0.002) {
+            return;
+        }
+
+        boolean isCallOption = "CALL".equalsIgnoreCase(option.getType());
+        boolean isPutOption = "PUT".equalsIgnoreCase(option.getType());
+
+        // VWAP BOUNCE LONG (CALL)
+        if (isCallOption && "UP".equals(marketTrend)) {
+            if (ta.getVolumeRatio() > 1.0) {
+                double confidence = calculateDirectionalBounceConfidence(ta, vwapDistance, true);
+
+                if (confidence >= 0.75) {
+                    Signal signal = createSignal(option, allOptions, ta, "BUY",
+                            "0DTE_VWAP_BOUNCE_CALL", confidence, marketTrend);
+
+                    signal.setReason(String.format(
+                            "VWAP bounce setup - Distance: %.2f%%, Volume: %.1fx, RSI: %.1f",
+                            vwapDistance * 100, ta.getVolumeRatio(), ta.getRsi()));
+
+                    signals.add(signal);
+                    log.info("[{}] ✅ VWAP BOUNCE CALL - Confidence: {}%",
+                            analysisId, (int)(confidence * 100));
+                }
+            }
+        }
+
+        // VWAP BOUNCE SHORT (PUT)
+        if (isPutOption && "DOWN".equals(marketTrend)) {
+            if (ta.getVolumeRatio() > 1.0) {
+                double confidence = calculateDirectionalBounceConfidence(ta, vwapDistance, false);
+
+                if (confidence >= 0.75) {
+                    Signal signal = createSignal(option, allOptions, ta, "BUY",
+                            "0DTE_VWAP_BOUNCE_PUT", confidence, marketTrend);
+
+                    signal.setReason(String.format(
+                            "VWAP rejection setup - Distance: %.2f%%, Volume: %.1fx, RSI: %.1f",
+                            vwapDistance * 100, ta.getVolumeRatio(), ta.getRsi()));
+
+                    signals.add(signal);
+                    log.info("[{}] ✅ VWAP BOUNCE PUT - Confidence: {}%",
+                            analysisId, (int)(confidence * 100));
+                }
+            }
+        }
+    }
+
+    // ================================================================================================
+    // CONFIDENCE CALCULATION METHODS
+    // ================================================================================================
 
     private double calculateBreakoutConfidence(TechnicalAnalysis ta, boolean bullish) {
         double confidence = 0.5;
@@ -1229,36 +1353,11 @@ public class ZeroDTEStrategy {
             confidence += 0.10;
         }
 
-        if (ta.getMarketRegime() == MarketRegime.TRENDING_UP && bullish ||
-                ta.getMarketRegime() == MarketRegime.TRENDING_DOWN && !bullish) {
-            confidence += 0.10;
-        }
-
         LocalTime now = LocalTime.now(ET_ZONE);
         double timeMultiplier = getTimeWindowMultiplier(now);
         confidence *= timeMultiplier;
 
         return Math.min(confidence, 0.95);
-    }
-
-    private double calculateORBConfidence(TechnicalAnalysis ta, boolean bullish) {
-        double confidence = 0.6;
-
-        if (ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT) {
-            confidence += 0.20;
-        } else if (ta.getVolumeRatio() >= 1.0) {
-            confidence += 0.10;
-        }
-
-        if (!ta.isHasRsiDivergence()) {
-            confidence += 0.10;
-        }
-
-        if (ta.getStrength() > 0.5) {
-            confidence += 0.10;
-        }
-
-        return Math.min(confidence, 0.90);
     }
 
     private double calculateReversionConfidence(TechnicalAnalysis ta, boolean bullish) {
@@ -1277,28 +1376,6 @@ public class ZeroDTEStrategy {
         }
 
         return Math.min(confidence, 0.95);
-    }
-
-    private double calculateVolumeSpikeConfidence(TechnicalAnalysis ta, boolean bullish) {
-        double confidence = 0.5;
-
-        if (ta.getVolumeRatio() > 3.0) {
-            confidence += 0.30;
-        } else if (ta.getVolumeRatio() > 2.0) {
-            confidence += 0.20;
-        } else if (ta.getVolumeRatio() > 1.5) {
-            confidence += 0.10;
-        }
-
-        if (Math.abs(ta.getMomentumStrength()) > 0.5) {
-            confidence += 0.20;
-        }
-
-        if (!ta.isExtendedFromVwap()) {
-            confidence += 0.10;
-        }
-
-        return Math.min(confidence, 0.90);
     }
 
     private double calculateSupportResistanceConfidence(TechnicalAnalysis ta, boolean support) {
@@ -1342,14 +1419,228 @@ public class ZeroDTEStrategy {
         return Math.min(confidence, 0.85);
     }
 
+    private double calculateDirectionalBounceConfidence(TechnicalAnalysis ta, double vwapDistance, boolean bullish) {
+        double confidence = 0.70;
 
-    private Signal createSignal(Option option,List<Option> allOptions, TechnicalAnalysis ta, String signalType,
+        // Distance from VWAP boost (closer = higher confidence)
+        if (vwapDistance <= 0.001) confidence += 0.15;      // Within 0.1%
+        else if (vwapDistance <= 0.002) confidence += 0.10; // Within 0.2%
+
+        // Volume confirmation
+        if (ta.getVolumeRatio() >= 2.0) confidence += 0.10;
+        else if (ta.getVolumeRatio() >= 1.5) confidence += 0.07;
+        else if (ta.getVolumeRatio() >= 1.2) confidence += 0.03;
+
+        // RSI confirmation (not oversold/overbought)
+        if (ta.getRsi() > 40 && ta.getRsi() < 60) {
+            confidence += 0.05;
+        }
+
+        // Time of day adjustment
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (isOptimalVWAPTime(now)) {
+            confidence += 0.05;
+        }
+
+        return Math.min(confidence, 0.95);
+    }
+
+    private boolean isOptimalVWAPTime(LocalTime now) {
+        // Morning momentum window (9:50-11:30 AM)
+        if (now.isAfter(LocalTime.of(9, 50)) && now.isBefore(LocalTime.of(11, 30))) {
+            return true;
+        }
+
+        // Afternoon momentum window (1:00-3:00 PM)
+        if (now.isAfter(LocalTime.of(13, 0)) && now.isBefore(LocalTime.of(15, 0))) {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ================================================================================================
+    // HELPER AND UTILITY METHODS
+    // ================================================================================================
+
+    private Option getOptionFromSignal(Signal signal, List<Option> options) {
+        return options.stream()
+                .filter(opt -> opt.getSymbol().equals(signal.getOptionSymbol()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private List<Option> selectStrikesBasedOnVolatility(List<Option> options, TechnicalAnalysis ta, String analysisId) {
+        BigDecimal currentPrice = ta.getCurrentPrice();
+        BigDecimal dayRange = BigDecimal.ZERO;
+
+        // Calculate day's range
+        QuoteResponse qqqQuote = tradierService.getQuote("QQQ");
+        if (qqqQuote != null && qqqQuote.getQuote() != null) {
+            Quote quote = qqqQuote.getQuote();
+            if (quote.getHigh() != null && quote.getLow() != null) {
+                dayRange = quote.getHigh().subtract(quote.getLow());
+            }
+        }
+
+        // Calculate price movement percentage
+        BigDecimal priceMove = BigDecimal.ZERO;
+        if (ta.getPreviousClose() != null && ta.getPreviousClose().compareTo(BigDecimal.ZERO) > 0) {
+            priceMove = currentPrice.subtract(ta.getPreviousClose())
+                    .abs()
+                    .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP);
+        }
+
+        // Determine strike range based on volatility
+        int strikesFromATM;
+        if (priceMove.compareTo(BigDecimal.valueOf(0.005)) > 0 ||
+                dayRange.compareTo(currentPrice.multiply(BigDecimal.valueOf(0.01))) > 0) {
+            strikesFromATM = 4; // High volatility - wider strikes
+            log.info("[{}] High volatility detected - selecting up to {} strikes from ATM",
+                    analysisId, strikesFromATM);
+        } else {
+            strikesFromATM = 2; // Normal volatility - tighter strikes
+            log.info("[{}] Normal volatility - selecting up to {} strikes from ATM",
+                    analysisId, strikesFromATM);
+        }
+
+        // Filter options by strike distance
+        List<Option> selected = options.stream()
+                .filter(option -> {
+                    BigDecimal strike = option.getStrikePrice();
+                    boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+                    boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+
+                    if (isCall) {
+                        return strike.compareTo(currentPrice) >= 0 &&
+                                strike.compareTo(currentPrice.add(BigDecimal.valueOf(strikesFromATM))) <= 0;
+                    } else if (isPut) {
+                        return strike.compareTo(currentPrice.subtract(BigDecimal.valueOf(strikesFromATM))) >= 0 &&
+                                strike.compareTo(currentPrice) <= 0;
+                    }
+                    return false;
+                })
+                .sorted((o1, o2) -> {
+                    BigDecimal dist1 = o1.getStrikePrice().subtract(currentPrice).abs();
+                    BigDecimal dist2 = o2.getStrikePrice().subtract(currentPrice).abs();
+                    return dist1.compareTo(dist2);
+                })
+                .collect(Collectors.toList());
+
+        // Log selected strikes
+        selected.forEach(opt -> {
+            BigDecimal distance = opt.getStrikePrice().subtract(currentPrice);
+            log.info("[{}] Selected: {} ${} (${} from current, Vol: {}, OI: {})",
+                    analysisId, opt.getType(), opt.getStrikePrice(),
+                    distance.compareTo(BigDecimal.ZERO) > 0 ? "+" + distance : distance,
+                    opt.getVolume(), opt.getOpenInterest());
+        });
+
+        return selected;
+    }
+
+    private void saveSignalsAfterConfirmation(List<Signal> signals, TechnicalAnalysis ta,
+                                              String marketTrend, String analysisId) {
+        for (Signal signal : signals) {
+            // FINAL EXPIRATION CHECK
+            LocalDate today = LocalDate.now(ET_ZONE);
+            LocalDate signalExpiration = extractExpirationFromOptionSymbol(signal.getOptionSymbol());
+
+            if (!today.equals(signalExpiration)) {
+                log.warn("[{}] ❌ Signal REJECTED in final check: {} - Not 0DTE",
+                        analysisId, signal.getOptionSymbol());
+                continue;
+            }
+
+            // SHAP EXPLANATION & VALIDATION
+            SHAPExplainerService.SHAPExplanation explanation =
+                    shapExplainerService.explainSignal(signal, ta, marketTrend);
+
+            boolean shapValid = shapExplainerService.validateSignalWithExplanation(signal, ta, marketTrend);
+            if (!shapValid) {
+                log.warn("[SHAP-FILTER][{}] ❌ Signal REJECTED: {} - Weak explanation ({}%)",
+                        analysisId, signal.getOptionSymbol(),
+                        (int)(explanation.getExplanationStrength() * 100));
+                continue;
+            }
+
+            // Set signal properties
+            signal.setCreatedAt(LocalDateTime.now());
+            signal.setEntryAssumptionPrice(ta.getCurrentPrice());
+            signal.setMarketTrend(marketTrend);
+            signal.setOriginalOptionPrice(signal.getEntryPrice());
+            LocalDateTime expirationTime = LocalDateTime.now().plusSeconds(30);
+            signal.setExpirationTime(expirationTime);
+
+            log.info("[{}] SIGNAL PREPARED FOR EXECUTION: {} - {} {}, Confidence: {}%",
+                    analysisId, signal.getStrategy(), signal.getSignalType(),
+                    signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
+
+            // CAPTURE ATTRIBUTES FOR AI LEARNING - ADD THIS
+            attributeLearning.captureSignalGeneration(signal, ta, analysisId);
+
+            // Execute signal immediately
+            executeSignalImmediately(signal, explanation, analysisId);
+
+            // START VERIFICATION PROCESS - ADD THIS
+            if (signal.getId() != null) {
+                attributeLearning.verifyAndLearn(signal.getId().toString());
+            }
+        }
+
+        // CAPTURE MISSED OPPORTUNITIES - ADD THIS
+        if (signals.isEmpty() && !ta.getMarketRegime().equals(MarketRegime.CHOPPY)) {
+            attributeLearning.captureMissedOpportunity(ta, marketTrend, analysisId);
+        }
+    }
+
+    private LocalDate extractExpirationFromOptionSymbol(String optionSymbol) {
+        try {
+            if (optionSymbol == null || optionSymbol.length() < 10) {
+                return LocalDate.now(ET_ZONE);
+            }
+
+            String datePart;
+            if (optionSymbol.contains("_")) {
+                String afterUnderscore = optionSymbol.split("_")[1];
+                datePart = afterUnderscore.substring(0, 6); // MMDDYY
+
+                int month = Integer.parseInt(datePart.substring(0, 2));
+                int day = Integer.parseInt(datePart.substring(2, 4));
+                int year = 2000 + Integer.parseInt(datePart.substring(4, 6));
+
+                return LocalDate.of(year, month, day);
+            } else {
+                datePart = optionSymbol.substring(3, 9); // YYMMDD
+
+                int year = 2000 + Integer.parseInt(datePart.substring(0, 2));
+                int month = Integer.parseInt(datePart.substring(2, 4));
+                int day = Integer.parseInt(datePart.substring(4, 6));
+
+                return LocalDate.of(year, month, day);
+            }
+
+        } catch (Exception e) {
+            log.warn("Could not extract expiration from option symbol: {} - Error: {}",
+                    optionSymbol, e.getMessage());
+            return LocalDate.now(ET_ZONE);
+        }
+    }
+
+// ================================================================================================
+    // SIGNAL CREATION AND TRADE MANAGEMENT
+    // ================================================================================================
+
+    private Signal createSignal(Option option, List<Option> allOptions, TechnicalAnalysis ta, String signalType,
                                 String strategy, double confidence, String marketTrend) {
         if (option == null || ta == null || signalType == null || strategy == null) {
             log.error("Cannot create signal with null parameters");
             return null;
         }
-        if (!isSignalAlignedWithTrend(option, allOptions,ta, marketTrend, "signal-creation")) {
+
+        // For non-AI signals, check trend alignment
+        if (!strategy.contains("AI_LEADER_LAG") &&
+                !isSignalAlignedWithTrend(option, allOptions, ta, marketTrend, "signal-creation")) {
             log.info("[BLOCKED] {} {} not aligned with {} trend",
                     option.getType(), option.getStrikePrice(), marketTrend);
             return null;
@@ -1368,7 +1659,7 @@ public class ZeroDTEStrategy {
             signal.setExecuted(false);
             signal.setEntryAssumptionPrice(ta.getCurrentPrice());
             signal.setMarketRegime(ta.getMarketRegime());
-            signal.setMarketTrend(marketTrend); // Store market trend
+            signal.setMarketTrend(marketTrend);
 
             BigDecimal atr = ta.getAverageTrueRange();
             if (atr == null || atr.compareTo(BigDecimal.ZERO) <= 0) {
@@ -1398,72 +1689,6 @@ public class ZeroDTEStrategy {
         }
     }
 
-    private BigDecimal calculateDynamicStopLoss(BigDecimal entryPrice, BigDecimal atr, String strategy,
-                                                TechnicalAnalysis ta, String marketTrend, Option option) {
-        if (entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0) {
-            return BigDecimal.ZERO;
-        }
-
-        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
-        boolean isAligned = (isPut && "DOWN".equals(marketTrend)) || (!isPut && "UP".equals(marketTrend));
-
-        // Base stop loss percentages
-        BigDecimal baseStopPercentage;
-
-        if (isAligned) {
-            // WIDER stops for trend-aligned positions
-            switch (strategy) {
-                case "0DTE_UNUSUAL_FLOW_CALL":
-                case "0DTE_UNUSUAL_FLOW_PUT":
-                    baseStopPercentage = BigDecimal.valueOf(0.40); // 40% stop for high conviction
-                    break;
-                case "0DTE_OPENING_DRIVE_CALL":
-                case "0DTE_OPENING_DRIVE_PUT":
-                    baseStopPercentage = BigDecimal.valueOf(0.45); // 45% for opening drive
-                    break;
-                case "0DTE_VWAP_BREAKOUT_CALL":
-                case "0DTE_VWAP_BREAKOUT_PUT":
-                    baseStopPercentage = BigDecimal.valueOf(0.35); // 35% for breakouts
-                    break;
-                case "0DTE_VWAP_REVERSION_CALL":
-                case "0DTE_VWAP_REVERSION_PUT":
-                    baseStopPercentage = BigDecimal.valueOf(0.50); // 50% for reversions (need room)
-                    break;
-                default:
-                    baseStopPercentage = BigDecimal.valueOf(0.40); // 40% default
-            }
-        } else {
-            // TIGHTER stops for counter-trend positions
-            baseStopPercentage = BigDecimal.valueOf(0.25); // 25% tight stop
-        }
-
-        // Adjust for volatility
-        if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
-            baseStopPercentage = baseStopPercentage.multiply(BigDecimal.valueOf(1.2)); // 20% wider in high vol
-        }
-
-        // Adjust for time of day
-        LocalTime now = LocalTime.now(ET_ZONE);
-        if (now.isAfter(LocalTime.of(14, 30))) {
-            baseStopPercentage = baseStopPercentage.multiply(BigDecimal.valueOf(0.8)); // Tighter near close
-        }
-
-        BigDecimal stopLoss = entryPrice.multiply(BigDecimal.ONE.subtract(baseStopPercentage));
-
-        // Minimum stop of $0.05
-        if (stopLoss.compareTo(BigDecimal.valueOf(0.05)) < 0) {
-            stopLoss = BigDecimal.valueOf(0.05);
-        }
-
-        log.info("[STOP] {} position {} trend - Stop: {}% (${} -> ${})",
-                option.getType(),
-                isAligned ? "WITH" : "AGAINST",
-                baseStopPercentage.multiply(BigDecimal.valueOf(100)),
-                entryPrice, stopLoss);
-
-        return stopLoss.setScale(2, RoundingMode.HALF_UP);
-    }
-
     private BigDecimal calculateDynamicTargetPrice(BigDecimal entryPrice, BigDecimal atr, String strategy,
                                                    TechnicalAnalysis ta, String marketTrend, Option option) {
         if (entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0) {
@@ -1471,189 +1696,1710 @@ public class ZeroDTEStrategy {
         }
 
         boolean isPut = "PUT".equalsIgnoreCase(option.getType());
-        boolean isAligned = (isPut && "DOWN".equals(marketTrend)) || (!isPut && "UP".equals(marketTrend));
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+        boolean isAISignal = strategy.contains("AI_LEADER_LAG");
 
-        // Base target multipliers
+        // AI signals can be counter-trend, traditional signals must be aligned
+        boolean isAligned = isAISignal ||
+                ((isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend)));
+
         BigDecimal targetMultiplier;
 
         if (isAligned) {
-            // BIGGER targets for trend-aligned positions
-            switch (strategy) {
-                case "0DTE_UNUSUAL_FLOW_CALL":
-                case "0DTE_UNUSUAL_FLOW_PUT":
-                    targetMultiplier = BigDecimal.valueOf(2.5); // 150% gain for unusual flow
-                    break;
-                case "0DTE_OPENING_DRIVE_CALL":
-                case "0DTE_OPENING_DRIVE_PUT":
-                    targetMultiplier = BigDecimal.valueOf(2.2); // 120% gain for opening drive
-                    break;
-                case "0DTE_VWAP_BREAKOUT_CALL":
-                case "0DTE_VWAP_BREAKOUT_PUT":
-                    targetMultiplier = BigDecimal.valueOf(2.0); // 100% gain for breakouts
-                    break;
-                case "0DTE_VOLUME_SPIKE_CALL":
-                case "0DTE_VOLUME_SPIKE_PUT":
-                    targetMultiplier = BigDecimal.valueOf(2.0); // 100% for volume spikes
-                    break;
-                case "0DTE_VWAP_REVERSION_CALL":
-                case "0DTE_VWAP_REVERSION_PUT":
-                    targetMultiplier = BigDecimal.valueOf(1.7); // 70% for reversions
-                    break;
-                default:
-                    targetMultiplier = BigDecimal.valueOf(1.8); // 80% default
-            }
-
-            // Extra boost for strong trends
-            if ("UP".equals(marketTrend) && ta.getMomentumStrength() > 0.7) {
-                targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(1.2));
-            } else if ("DOWN".equals(marketTrend) && ta.getMomentumStrength() < -0.7) {
-                targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(1.2));
+            // Bigger targets for aligned positions
+            if (strategy.contains("AI_LEADER_LAG")) {
+                targetMultiplier = BigDecimal.valueOf(2.5); // AI gets aggressive targets
+            } else if (strategy.contains("30MIN_ORB")) {
+                targetMultiplier = BigDecimal.valueOf(2.2);
+            } else if (strategy.contains("VWAP_BREAKOUT")) {
+                targetMultiplier = BigDecimal.valueOf(2.0);
+            } else if (strategy.contains("VWAP_REVERSION")) {
+                targetMultiplier = BigDecimal.valueOf(1.7);
+            } else {
+                targetMultiplier = BigDecimal.valueOf(1.8); // Default
             }
         } else {
-            // SMALLER targets for counter-trend positions
-            targetMultiplier = BigDecimal.valueOf(1.4); // 40% gain max
+            // Smaller targets for counter-trend (shouldn't happen for traditional signals)
+            targetMultiplier = BigDecimal.valueOf(1.4);
         }
 
-        // Adjust for time decay
+        // Time decay for 0DTE
         LocalTime now = LocalTime.now(ET_ZONE);
         long minutesToClose = Duration.between(now, LocalTime.of(16, 0)).toMinutes();
 
-        if (minutesToClose < 120) { // Less than 2 hours
-            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(0.7)); // Reduce by 30%
-        } else if (minutesToClose < 180) { // Less than 3 hours
-            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(0.85)); // Reduce by 15%
+        if (minutesToClose < 120) {
+            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(0.7));
+        } else if (minutesToClose < 180) {
+            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(0.85));
         }
 
-        // Adjust for volatility
+        // Volatility adjustment
         if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
-            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(1.15)); // 15% higher in vol
+            targetMultiplier = targetMultiplier.multiply(BigDecimal.valueOf(1.15));
         }
 
         BigDecimal targetPrice = entryPrice.multiply(targetMultiplier);
-
-        log.info("[TARGET] {} position {} trend - Target: {}% (${} -> ${})",
-                option.getType(),
-                isAligned ? "WITH" : "AGAINST",
-                targetMultiplier.subtract(BigDecimal.ONE).multiply(BigDecimal.valueOf(100)),
-                entryPrice, targetPrice);
-
         return targetPrice.setScale(2, RoundingMode.HALF_UP);
     }
 
-    private void analyzeUnusualFlow(Option option, List<Option> allOptions, TechnicalAnalysis ta,
-                                    List<Signal> signals, String marketTrend, String analysisId) {
-        if (!detectUnusualOptionsFlow(option,allOptions,analysisId)) {
-            return;
+    private BigDecimal calculateDynamicStopLoss(BigDecimal entryPrice, BigDecimal atr, String strategy,
+                                                TechnicalAnalysis ta, String marketTrend, Option option) {
+        if (entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0) {
+            return BigDecimal.ZERO;
         }
-        if (!isSignalAlignedWithTrend(option, allOptions,ta, marketTrend, analysisId)) {
-            log.debug("[{}] Strategy blocked due to trend misalignment", analysisId);
-            return;
-        }
-
-        double confidence = 0.85;
-
-        BigDecimal premium = option.getMidPrice()
-                .multiply(BigDecimal.valueOf(option.getVolume()))
-                .multiply(BigDecimal.valueOf(100));
-
-        if (premium.compareTo(BigDecimal.valueOf(100000)) > 0) {
-            confidence = 0.90;
-        }
-
-        String strategyName = "PUT".equalsIgnoreCase(option.getType()) ?
-                "0DTE_UNUSUAL_FLOW_PUT" : "0DTE_UNUSUAL_FLOW_CALL";
-
-        Signal signal = createSignal(option, allOptions,ta, "BUY", strategyName, confidence, marketTrend);
-        signal.setReason(String.format(
-                "🎯 Unusual flow detected - %s %s Vol: %d Premium: $%.0f (%.1fx OI)",
-                option.getType(), option.getStrikePrice(),
-                option.getVolume(), premium.doubleValue(),
-                (double)option.getVolume() / option.getOpenInterest()
-        ));
-
-        signals.add(signal);
-        log.info("[v63][{}] ✅ Created {} signal - Confidence: {}%",
-                analysisId, strategyName, (int)(confidence * 100));
-    }
-
-    private boolean isSignalAlignedWithTrend(Option option, List<Option> allOptions, TechnicalAnalysis ta,
-                                             String marketTrend, String analysisId) {
-        log.info("[{}] Market trend: {}, TA trend: {}, Price: ${}, VWAP: ${}",
-                analysisId, marketTrend, ta.getTrend(), ta.getCurrentPrice(), ta.getVwap());
 
         boolean isPut = "PUT".equalsIgnoreCase(option.getType());
         boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+        boolean isAISignal = strategy.contains("AI_LEADER_LAG");
 
-        // STRICT RULE 1: Block ALL signals in NEUTRAL trend - NO EXCEPTIONS
-        if ("NEUTRAL".equals(marketTrend)) {
-            log.warn("[{}] ❌ BLOCKED: {} {} - Market is NEUTRAL (NO TRADES ALLOWED)",
-                    analysisId, option.getType(), option.getStrikePrice());
-            return false;
+        // AI signals can be counter-trend
+        boolean isAligned = isAISignal ||
+                ((isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend)));
+
+        BigDecimal baseStopPercentage;
+
+        if (isAligned) {
+            if (strategy.contains("AI_LEADER_LAG")) {
+                baseStopPercentage = BigDecimal.valueOf(0.30); // AI gets optimized stops
+            } else if (strategy.contains("30MIN_ORB")) {
+                baseStopPercentage = BigDecimal.valueOf(0.45);
+            } else if (strategy.contains("VWAP_BREAKOUT")) {
+                baseStopPercentage = BigDecimal.valueOf(0.35);
+            } else if (strategy.contains("VWAP_REVERSION")) {
+                baseStopPercentage = BigDecimal.valueOf(0.50);
+            } else if (strategy.contains("VWAP_RECLAIM")) {
+                baseStopPercentage = BigDecimal.valueOf(0.30);
+            } else {
+                baseStopPercentage = BigDecimal.valueOf(0.40);
+            }
+        } else {
+            baseStopPercentage = BigDecimal.valueOf(0.25); // Tight stop for counter-trend
         }
 
-        // STRICT RULE 2: Enforce trend alignment for ALL signals including unusual flow
-        boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
+        // Volatility adjustment
+        if (ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY) {
+            baseStopPercentage = baseStopPercentage.multiply(BigDecimal.valueOf(1.2));
+        }
 
-        if (detectUnusualOptionsFlow(option, allOptions,analysisId)) {
-            BigDecimal premium = option.getMidPrice()
-                    .multiply(BigDecimal.valueOf(option.getVolume()))
-                    .multiply(BigDecimal.valueOf(100));
+        // Time adjustment
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isAfter(LocalTime.of(14, 30))) {
+            baseStopPercentage = baseStopPercentage.multiply(BigDecimal.valueOf(0.8));
+        }
 
-            if (!aligned) {
-                log.warn("[{}] ⚠️ UNUSUAL FLOW BLOCKED: {} {} with ${} premium - AGAINST {} trend",
-                        analysisId, option.getType(), option.getStrikePrice(), premium, marketTrend);
+        BigDecimal stopLoss = entryPrice.multiply(BigDecimal.ONE.subtract(baseStopPercentage));
 
-                // Alert for massive blocked flows
-                if (premium.compareTo(BigDecimal.valueOf(1000000)) > 0) {
-                    telegramService.sendMessage(String.format(
-                            "🚫 MASSIVE FLOW BLOCKED\n" +
-                                    "Type: %s %s\n" +
-                                    "Premium: $%,.0f\n" +
-                                    "Reason: Against %s trend - STAYING DISCIPLINED!",
-                            option.getType(), option.getStrikePrice(),
-                            premium.doubleValue(), marketTrend
-                    ));
-                }
+        if (stopLoss.compareTo(BigDecimal.valueOf(0.05)) < 0) {
+            stopLoss = BigDecimal.valueOf(0.05);
+        }
+
+        return stopLoss.setScale(2, RoundingMode.HALF_UP);
+    }
+
+    private Trade createSuccessfulTrade(Signal signal, BigDecimal fillPrice, String analysisId) {
+        Trade trade = new Trade();
+
+        trade.setSymbol(signal.getSymbol());
+        trade.setOptionSymbol(signal.getOptionSymbol());
+        trade.setStrategy(signal.getStrategy());
+        trade.setQuantity(1);
+        trade.setEntryPrice(fillPrice);
+        trade.setEntryTime(LocalDateTime.now());
+        trade.setCreatedAt(ZonedDateTime.now());
+        trade.setStatus("OPEN");
+        trade.setCurrentPrice(fillPrice);
+        trade.setTargetPrice(signal.getTargetPrice());
+        trade.setStopLoss(signal.getStopLoss());
+
+        String orderId = signal.getMetadata().get("orderId");
+        trade.setOrderId(orderId);
+        trade.setSignalId(signal.getId());
+        trade.setOrderStatus("FILLED");
+        trade.setOrderType("MARKET");
+        trade.setOrderSide("buy_to_open");
+
+        trade.setMarketTrend(signal.getMarketTrend());
+        trade.setTimeSlot(determineTimeSlot(LocalTime.now()));
+        trade.setExpirationDate(signal.getExpirationDate());
+        trade.setDaysToExpiry(signal.getDaysToExpiry());
+
+        trade.setImpliedVolatility(signal.getImpliedVolatility());
+        trade.setDelta(signal.getDelta());
+        trade.setGamma(signal.getGamma());
+        trade.setTheta(signal.getTheta());
+        trade.setVega(signal.getVega());
+
+        BigDecimal positionValue = fillPrice.multiply(BigDecimal.valueOf(100));
+        trade.setMaxRisk(positionValue);
+        trade.setMaxProfitPotential(signal.getTargetPrice().multiply(BigDecimal.valueOf(100)));
+
+        trade.setSignalGeneratedAt(signal.getCreatedAt());
+        trade.setExecutionAttemptedAt(LocalDateTime.now());
+        trade.setOrderFilledAt(LocalDateTime.now());
+
+        log.info("[TRADE-CREATE][{}] Created SUCCESSFUL trade: {} - Status: OPEN",
+                analysisId, trade.getOptionSymbol());
+
+        return trade;
+    }
+
+    private void enrichTradeWithBayesianData(Trade trade, Signal signal) {
+        String bayesianConfidence = signal.getMetadata().get("bayesianConfidence");
+        if (bayesianConfidence != null) {
+            trade.setBayesianProbability(Double.valueOf(bayesianConfidence));
+            trade.setAdjustedConfidence(Double.valueOf(bayesianConfidence));
+        }
+
+        trade.setSignalConfidence(signal.getConfidence());
+        trade.setOriginalConfidence(signal.getConfidence());
+
+        String learningPhase = signal.getMetadata().get("learningPhase");
+        if (learningPhase != null) {
+            trade.setLearningPhase(learningPhase);
+        }
+
+        String thresholdMethod = signal.getMetadata().get("thresholdMethod");
+        if (thresholdMethod != null) {
+            trade.setThresholdOptimizationMethod(thresholdMethod);
+        }
+
+        trade.setBayesianAnalysisTimestamp(ZonedDateTime.now());
+    }
+
+    private void saveFailedTrade(Signal signal, String failureReason, String errorMessage, String analysisId) {
+        Trade trade = new Trade();
+
+        trade.setSymbol(signal.getSymbol());
+        trade.setOptionSymbol(signal.getOptionSymbol());
+        trade.setStrategy(signal.getStrategy());
+        trade.setQuantity(1);
+        trade.setEntryPrice(BigDecimal.ZERO);
+        trade.setEntryTime(LocalDateTime.now());
+        trade.setStatus("FAILED");
+        trade.setExitReason(failureReason);
+        trade.setSignalId(signal.getId());
+        trade.setFailureReason(failureReason);
+        trade.setErrorMessage(errorMessage);
+
+        tradeRepository.save(trade);
+
+        log.warn("[TRADE-CREATE][{}] Created FAILED trade: {} - Status: FAILED, Reason: {}",
+                analysisId, trade.getOptionSymbol(), failureReason);
+    }
+
+    private void saveFailedSignal(Signal signal, String failureReason, String errorMessage) {
+        signal.setStatus("FAILED");
+        signal.setFailureReason(failureReason);
+        signal.setErrorMessage(errorMessage);
+        signal.getMetadata().put("failedAt", LocalDateTime.now().toString());
+
+        signalRepository.save(signal);
+    }
+
+    private void saveBayesianRejectedSignal(Signal signal, IntegratedBayesianMLSystem.ExecutionDecision decision, String analysisId) {
+        signal.setStatus("BAYESIAN_REJECTED");
+        signal.setFailureReason(decision.getDecision());
+        signal.setErrorMessage(decision.getReasoning());
+        signal.getMetadata().put("rejectedAt", LocalDateTime.now().toString());
+        signal.getMetadata().put("confidenceGap", String.valueOf(decision.getConfidenceGap()));
+
+        signalRepository.save(signal);
+
+        Trade rejectedTrade = new Trade();
+        rejectedTrade.setSymbol(signal.getSymbol());
+        rejectedTrade.setOptionSymbol(signal.getOptionSymbol());
+        rejectedTrade.setStrategy(signal.getStrategy());
+        rejectedTrade.setQuantity(1);
+        rejectedTrade.setEntryPrice(BigDecimal.ZERO);
+        rejectedTrade.setEntryTime(LocalDateTime.now());
+        rejectedTrade.setStatus("BAYESIAN_REJECTED");
+        rejectedTrade.setExitReason(decision.getDecision());
+        rejectedTrade.setSignalId(signal.getId());
+        rejectedTrade.setFailureReason("BAYESIAN_FILTER");
+        rejectedTrade.setErrorMessage(decision.getReasoning());
+
+        tradeRepository.save(rejectedTrade);
+
+        log.warn("[BAYESIAN-REJECT][{}] Saved rejected signal and trade: {} - Reason: {}",
+                analysisId, signal.getOptionSymbol(), decision.getReasoning());
+    }
+
+    private boolean attemptSignalExecution(Signal signal, String analysisId) {
+        try {
+            signal.setStatus("ATTEMPTING");
+
+            OrderRequest orderRequest = new OrderRequest();
+            orderRequest.setSymbol(signal.getOptionSymbol());
+            orderRequest.setSide("buy_to_open");
+            orderRequest.setQuantity(1);
+            orderRequest.setType("market");
+            orderRequest.setDuration("day");
+
+            log.info("[EXECUTION][{}] Placing BUY_TO_OPEN order for: {}", analysisId, signal.getOptionSymbol());
+
+            OrderResponse orderResponse = tradierService.placeOrder(orderRequest);
+
+            if (orderResponse != null && isOrderSuccessful(orderResponse)) {
+                String orderId = getOrderId(orderResponse);
+
+                log.info("[EXECUTION][{}] ✅ BUY_TO_OPEN order placed: {} (Order ID: {})",
+                        analysisId, signal.getOptionSymbol(), orderId);
+
+                signal.setFillPrice(getCurrentPrice(signal.getOptionSymbol()));
+                signal.setActualQuantity(1);
+                signal.getMetadata().put("orderId", orderId);
+
+                return true;
+
+            } else {
+                log.warn("[EXECUTION][{}] ❌ BUY_TO_OPEN Order REJECTED: {} - Response: {}",
+                        analysisId, signal.getOptionSymbol(), orderResponse);
                 return false;
             }
-        }
 
-        log.info(" Trend alignment check - {} option, {} trend: {}",
-                analysisId, option.getType(), marketTrend, aligned ? "PASS" : "FAIL");
-
-        return aligned;
-    }
-
-    private boolean quickSignalValidation(Option option, List<Option> allOptions, TechnicalAnalysis ta,
-                                          String marketTrend, String analysisId) {
-        // Ultra-fast pre-checks before creating signal
-
-        // 1. Neutral market - instant reject
-        if ("NEUTRAL".equals(marketTrend)) {
+        } catch (Exception e) {
+            log.error("[EXECUTION][{}] ❌ BUY_TO_OPEN Order placement exception: {} - {}",
+                    analysisId, signal.getOptionSymbol(), e.getMessage(), e);
             return false;
         }
+    }
 
-        // 2. Option type alignment
-        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
-        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
-        boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
+    private void sendSuccessNotification(Trade trade, Signal signal, SHAPExplainerService.SHAPExplanation explanation, String analysisId) {
+        if (signal.getConfidence() >= 0.70) {
+            String leaderInfo = "";
+            if (signal.getStrategy().contains("AI_LEADER_LAG")) {
+                String leader = signal.getMetadata().get("leaderStock");
+                leaderInfo = leader != null ? "\nLeader: " + leader : "";
+            }
 
-        if (!aligned && !detectUnusualOptionsFlow(option, allOptions,analysisId)) {
-            return false; // Not aligned and not unusual flow
+            telegramService.sendMessage(String.format(
+                    "✅ EXECUTION SUCCESS\n" +
+                            "Strategy: %s\n" +
+                            "Option: %s\n" +
+                            "Entry: $%.2f\n" +
+                            "Confidence: %d%% (SHAP: %d%%)\n" +
+                            "Target: $%.2f | Stop: $%.2f\n" +
+                            "Trade ID: %s%s\n\n" +
+                            "🧠 AI Explanation:\n" +
+                            "Top Factors: %s\n" +
+                            "✅ Position LIVE - Monitoring active",
+                    signal.getStrategy(), signal.getOptionSymbol(),
+                    signal.getEntryPrice(),
+                    (int)(signal.getConfidence() * 100),
+                    (int)(explanation.getExplanationStrength() * 100),
+                    signal.getTargetPrice(), signal.getStopLoss(),
+                    trade.getId(), leaderInfo,
+                    String.join(", ", explanation.getTopPositiveFactors())
+            ));
         }
+    }
 
-        // 3. Minimum liquidity check
-        if (option.getVolume() < 50 && option.getOpenInterest() < 100) {
-            return false; // Too illiquid
-        }
+    // ================================================================================================
+    // ORB SPECIFIC METHODS
+    // ================================================================================================
 
-        // 4. Spread check
-        if (option.getSpreadPercentage() > 15.0) {
-            return false; // Spread too wide
+    private Signal createAdvancedORBSignal(Option option, List<Option> allOptions, TechnicalAnalysis ta, String signalType,
+                                           String strategy, double confidence, String marketTrend, OpeningRange range, VolumeRequirement volReq) {
+        Signal signal = createSignal(option, allOptions, ta, signalType, strategy, confidence, marketTrend);
+        if (signal == null) return null;
+
+        BigDecimal entryPrice = signal.getEntryPrice();
+        boolean isHighVol = ta.getMarketRegime() == MarketRegime.HIGH_VOLATILITY;
+
+        double targetMultiplier = "EXCEPTIONAL".equals(volReq.getTier()) ? 2.5 : isHighVol ? 2.2 : 1.8;
+        signal.setTargetPrice(entryPrice.multiply(BigDecimal.valueOf(targetMultiplier)));
+
+        double stopPercentage = "EXCEPTIONAL".equals(volReq.getTier()) ? 0.25 : isHighVol ? 0.35 : 0.30;
+        signal.setStopLoss(entryPrice.multiply(BigDecimal.ONE.subtract(BigDecimal.valueOf(stopPercentage))));
+
+        return signal;
+    }
+
+    private VolumeRequirement calculateBreakoutCandleVolume(TechnicalAnalysis ta) {
+        double volumeRatio = ta.getVolumeRatio();
+
+        if (volumeRatio >= 2.0) return new VolumeRequirement("EXCEPTIONAL", true, 1.0, 0.95);
+        if (volumeRatio >= 1.5) return new VolumeRequirement("STRONG", true, 0.8, 0.85);
+        if (volumeRatio >= 1.2) return new VolumeRequirement("ADEQUATE", true, 0.6, 0.75);
+        return new VolumeRequirement("WEAK", false, 0.0, 0.0);
+    }
+
+    private boolean validateEnhancedBreakout(BigDecimal currentPrice, OpeningRange range, TechnicalAnalysis ta, LocalTime now) {
+        BigDecimal rangeSize = range.getHigh().subtract(range.getLow());
+        BigDecimal minRangeSize = currentPrice.multiply(BigDecimal.valueOf(0.005));
+        if (rangeSize.compareTo(minRangeSize) < 0) return false;
+
+        BigDecimal minPenetration = currentPrice.multiply(BigDecimal.valueOf(0.001));
+        BigDecimal actualPenetration = currentPrice.compareTo(range.getHigh()) > 0 ?
+                currentPrice.subtract(range.getHigh()) : range.getLow().subtract(currentPrice);
+        if (actualPenetration.compareTo(minPenetration) < 0) return false;
+
+        if (now.isAfter(LocalTime.of(10, 0)) && now.isBefore(LocalTime.of(10, 3))) {
+            return ta.getMomentumStrength() > 0.4;
         }
 
         return true;
     }
 
+    private GapAnalysis analyzeGapConditions(TechnicalAnalysis ta) {
+        if (ta.getPreviousClose() == null) return new GapAnalysis(0.0, false, 0.0, "NONE");
 
+        BigDecimal gap = ta.getCurrentPrice().subtract(ta.getPreviousClose())
+                .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP);
+        double gapPercentage = gap.doubleValue();
+
+        boolean isSignificant = Math.abs(gapPercentage) > 0.015;
+        boolean isModerate = Math.abs(gapPercentage) > 0.005;
+
+        double confidenceBoost = 0.0;
+        if (isSignificant) confidenceBoost = 0.20;
+        else if (isModerate) confidenceBoost = 0.10;
+
+        String direction = gapPercentage > 0 ? "UP" : gapPercentage < 0 ? "DOWN" : "FLAT";
+
+        return new GapAnalysis(gapPercentage, isSignificant, confidenceBoost, direction);
+    }
+
+    private double calculateEnhancedORBConfidence(TechnicalAnalysis ta, VolumeRequirement volReq,
+                                                  GapAnalysis gapAnalysis, boolean bullish, LocalTime now) {
+        double confidence = 0.75;
+
+        confidence = Math.min(confidence + 0.15, volReq.getMaxConfidence());
+        confidence += gapAnalysis.getConfidenceBoost();
+        confidence *= getTimeBasedMultiplier(now);
+
+        if ((bullish && ta.getMomentumStrength() > 0.4) || (!bullish && ta.getMomentumStrength() < -0.4)) {
+            confidence += 0.10;
+        }
+
+        if (ta.getRsi() > 45 && ta.getRsi() < 65) confidence += 0.05;
+
+        return Math.min(confidence, 0.95);
+    }
+
+    private double getTimeBasedMultiplier(LocalTime now) {
+        if (now.isBefore(LocalTime.of(10, 15))) return 1.15;
+        if (now.isBefore(LocalTime.of(10, 30))) return 1.10;
+        if (now.isAfter(LocalTime.of(15, 0))) return 0.85;
+        return 1.0;
+    }
+
+    private double calculateDynamicThreshold(LocalTime now, VolumeRequirement volReq) {
+        double baseThreshold = 0.80;
+
+        if (now.isAfter(LocalTime.of(15, 0))) {
+            baseThreshold += 0.10;
+        }
+
+        switch (volReq.getTier()) {
+            case "EXCEPTIONAL": return baseThreshold - 0.05;
+            case "STRONG": return baseThreshold;
+            case "ADEQUATE": return baseThreshold + 0.05;
+            default: return 0.95;
+        }
+    }
+
+    private OpeningRange calculate30MinuteRange(TechnicalAnalysis ta) {
+        try {
+            List<MarketData> recentData = marketDataRepository.findRecentData(ta.getSymbol(), 100);
+
+            if (recentData.isEmpty()) {
+                return null;
+            }
+
+            LocalDate today = LocalDate.now(ET_ZONE);
+            LocalDateTime rangeStart = today.atTime(9, 30);
+            LocalDateTime rangeEnd = today.atTime(10, 0);
+
+            List<MarketData> rangeData = recentData.stream()
+                    .filter(data -> data.getTimestamp() != null)
+                    .filter(data -> {
+                        LocalDateTime timestamp = data.getTimestamp();
+                        return !timestamp.isBefore(rangeStart) && !timestamp.isAfter(rangeEnd);
+                    })
+                    .collect(Collectors.toList());
+
+            if (rangeData.isEmpty()) {
+                return null;
+            }
+
+            BigDecimal high = rangeData.stream()
+                    .map(MarketData::getHigh)
+                    .filter(Objects::nonNull)
+                    .max(BigDecimal::compareTo)
+                    .orElse(null);
+
+            BigDecimal low = rangeData.stream()
+                    .map(MarketData::getLow)
+                    .filter(Objects::nonNull)
+                    .min(BigDecimal::compareTo)
+                    .orElse(null);
+
+            if (high != null && low != null) {
+                return new OpeningRange(high, low);
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            log.error("Error calculating 30-minute opening range: {}", e.getMessage(), e);
+            return null;
+        }
+    }
+
+    // ================================================================================================
+    // VWAP SPECIFIC METHODS
+    // ================================================================================================
+
+    private boolean checkRecentVWAPTest(List<MarketData> data, BigDecimal vwap, boolean testFromAbove) {
+        if (data.size() < 3) return false;
+
+        for (int i = data.size() - 3; i < data.size() - 1; i++) {
+            MarketData bar = data.get(i);
+            if (bar.getPrice() == null) continue;
+
+            if (testFromAbove) {
+                if (bar.getPrice().compareTo(vwap) > 0) return true;
+            } else {
+                if (bar.getPrice().compareTo(vwap) < 0) return true;
+            }
+        }
+        return false;
+    }
+
+    private double calculateVWAPReclaimConfidence(TechnicalAnalysis ta, double penetration, boolean isCall) {
+        double confidence = 0.70;
+
+        if (penetration >= 0.001 && penetration <= 0.002) {
+            confidence += 0.10;
+        } else if (penetration <= 0.001) {
+            confidence += 0.05;
+        }
+
+        if (ta.getVolumeRatio() > 1.5) confidence += 0.10;
+        else if (ta.getVolumeRatio() > 1.2) confidence += 0.05;
+
+        if (ta.getRsi() > 35 && ta.getRsi() < 65) confidence += 0.05;
+
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isAfter(LocalTime.of(10, 25)) && now.isBefore(LocalTime.of(10, 45))) {
+            confidence += 0.10;
+        }
+
+        return Math.min(confidence, 0.95);
+    }
+
+    private VWAPPattern detectMultiCandleVWAPPattern(List<MarketData> data, TechnicalAnalysis ta) {
+        if (data.size() < 5) return VWAPPattern.NONE;
+
+        BigDecimal vwap = ta.getVwap();
+
+        if (detectVWAPCompression(data, vwap)) {
+            return VWAPPattern.COMPRESSION;
+        } else if (detectFailedBreakdownRecovery(data, vwap)) {
+            return VWAPPattern.FAILED_BREAKDOWN;
+        } else if (detectStairStepPattern(data, vwap)) {
+            return VWAPPattern.STAIR_STEP;
+        }
+
+        return VWAPPattern.NONE;
+    }
+
+    private boolean detectVWAPCompression(List<MarketData> data, BigDecimal vwap) {
+        double maxDeviation = 0;
+
+        for (int i = data.size() - 5; i < data.size(); i++) {
+            double deviation = Math.abs(
+                    data.get(i).getPrice().subtract(vwap)
+                            .divide(vwap, 4, RoundingMode.HALF_UP).doubleValue()
+            );
+            maxDeviation = Math.max(maxDeviation, deviation);
+        }
+
+        return maxDeviation < 0.0015;
+    }
+
+    private boolean detectFailedBreakdownRecovery(List<MarketData> data, BigDecimal vwap) {
+        if (data.size() < 4) return false;
+
+        MarketData bar1 = data.get(data.size() - 4);
+        MarketData bar2 = data.get(data.size() - 3);
+        MarketData bar3 = data.get(data.size() - 2);
+        MarketData current = data.get(data.size() - 1);
+
+        boolean wasAbove = bar1.getPrice().compareTo(vwap) > 0;
+        boolean brokeBelow = bar2.getLow().compareTo(vwap) < 0 &&
+                bar3.getLow().compareTo(vwap) < 0;
+        boolean recovered = current.getPrice().compareTo(vwap) > 0 &&
+                current.getLow().compareTo(vwap) >= 0;
+
+        return wasAbove && brokeBelow && recovered;
+    }
+
+    private boolean detectStairStepPattern(List<MarketData> data, BigDecimal vwap) {
+        if (data.size() < 4) return false;
+
+        boolean allAboveVWAP = true;
+        boolean higherLows = true;
+
+        for (int i = data.size() - 4; i < data.size(); i++) {
+            if (data.get(i).getLow().compareTo(vwap) < 0) {
+                allAboveVWAP = false;
+                break;
+            }
+
+            if (i > data.size() - 4) {
+                if (data.get(i).getLow().compareTo(data.get(i-1).getLow()) <= 0) {
+                    higherLows = false;
+                }
+            }
+        }
+
+        return allAboveVWAP && higherLows;
+    }
+
+    // ================================================================================================
+    // UTILITY AND HELPER METHODS
+    // ================================================================================================
+
+    private int getAdjustedMinVolume(LocalTime now) {
+        if (now.isBefore(LocalTime.of(10, 30))) {
+            return minVolume / 2;
+        } else if (now.isAfter(LocalTime.of(15, 0))) {
+            return minVolume / 2;
+        }
+        return minVolume;
+    }
+
+    private MarketConditions getMarketConditions() {
+        MarketConditions conditions = new MarketConditions();
+        conditions.setVix(getVixLevel());
+        conditions.setMarketBreadth(calculateMarketBreadth());
+        conditions.setInternals(getMarketInternals());
+        return conditions;
+    }
+
+    private double getVixLevel() {
+        return 18.0;
+    }
+
+    private double calculateMarketBreadth() {
+        return 0.5;
+    }
+
+    private MarketInternals getMarketInternals() {
+        return new MarketInternals();
+    }
+
+    private boolean isGoodTradingTime(LocalTime now) {
+        return (now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END)) ||
+                (now.isAfter(PRIME_WINDOW_2_START) && now.isBefore(PRIME_WINDOW_2_END)) ||
+                (now.isAfter(PRIME_WINDOW_3_START) && now.isBefore(PRIME_WINDOW_3_END)) ||
+                (now.isAfter(FINAL_WINDOW_START) && now.isBefore(FINAL_WINDOW_END));
+    }
+
+    private double getTimeWindowMultiplier(LocalTime now) {
+        if ((now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END))) {
+            return 1.15;
+        } else if ((now.isAfter(PRIME_WINDOW_2_START) && now.isBefore(PRIME_WINDOW_2_END))) {
+            return 1.10;
+        } else if ((now.isAfter(PRIME_WINDOW_3_START) && now.isBefore(PRIME_WINDOW_3_END))) {
+            return 1.20;
+        } else if ((now.isAfter(FINAL_WINDOW_START) && now.isBefore(FINAL_WINDOW_END))) {
+            return 1.05;
+        }
+        return 0.8;
+    }
+
+    private void logTechnicalAnalysis(TechnicalAnalysis ta, String analysisId) {
+        log.info("[{}] TA Results - Price: ${}, VWAP: ${}, Regime: {}",
+                analysisId, ta.getCurrentPrice(), ta.getVwap(), ta.getMarketRegime());
+        log.info("[{}] Volume - Current: {}, Ratio: {}, High: {}",
+                analysisId, ta.getCurrentVolume(),
+                String.format("%.2f", ta.getVolumeRatio()),
+                ta.isHighVolume());
+        log.info("[{}] Momentum - RSI: {}, MACD: {}, Divergence: {}",
+                analysisId,
+                String.format("%.1f", ta.getRsi()),
+                ta.getMacdSignal(),
+                ta.isHasRsiDivergence() || ta.isHasMacdDivergence());
+    }
+
+    private List<Option> filterOptionsByMarketRegime(List<Option> options, TechnicalAnalysis ta, String analysisId) {
+        MarketRegime regime = ta.getMarketRegime();
+        DynamicParameters params = ta.getDynamicParameters();
+
+        LocalTime now = LocalTime.now(ET_ZONE);
+        int adjustedMinVolume = getAdjustedMinVolume(now);
+        double adjustedMinIV = minIV;
+
+        switch (regime) {
+            case HIGH_VOLATILITY:
+                adjustedMinVolume = (int)(adjustedMinVolume * 0.7);
+                adjustedMinIV = minIV * 1.2;
+                break;
+            case LOW_VOLATILITY:
+                adjustedMinVolume = (int)(adjustedMinVolume * 1.3);
+                adjustedMinIV = minIV * 0.8;
+                break;
+            case OPENING_RANGE:
+                adjustedMinVolume = (int)(adjustedMinVolume * 0.5);
+                break;
+            default:
+                break;
+        }
+
+        if (params != null) {
+            adjustedMinVolume = (int)(adjustedMinVolume * params.getMinVolumeMultiplier());
+            adjustedMinIV = adjustedMinIV * params.getMinIVMultiplier();
+        }
+
+        log.info("[{}] Base filtering - Volume: {}, IV: {:.3f}",
+                analysisId, adjustedMinVolume, adjustedMinIV);
+
+        List<Option> basicFiltered = options.stream()
+                .filter(Option::isValid)
+                .collect(Collectors.toList());
+
+        log.info("[{}] After basic filtering: {} options", analysisId, basicFiltered.size());
+
+        return filterByConfidenceAdjustedStrikes(basicFiltered, ta, 0.0, analysisId);
+    }
+
+    private List<Option> filterByConfidenceAdjustedStrikes(List<Option> options,
+                                                           TechnicalAnalysis ta,
+                                                           double expectedConfidence,
+                                                           String analysisId) {
+        BigDecimal currentPrice = ta.getCurrentPrice();
+
+        List<Option> atmOptions = options.stream()
+                .filter(option -> {
+                    BigDecimal strike = option.getStrikePrice();
+                    if (strike == null) return false;
+
+                    double distanceFromPrice = Math.abs(strike.doubleValue() - currentPrice.doubleValue());
+                    return distanceFromPrice <= 0.50;
+                })
+                .filter(option -> option.getVolume() >= 100)
+                .filter(option -> option.getOpenInterest() >= 500)
+                .sorted((o1, o2) -> {
+                    double dist1 = Math.abs(o1.getStrikePrice().doubleValue() - currentPrice.doubleValue());
+                    double dist2 = Math.abs(o2.getStrikePrice().doubleValue() - currentPrice.doubleValue());
+                    return Double.compare(dist1, dist2);
+                })
+                .collect(Collectors.toList());
+
+        log.info("[ATM-FILTER][{}] ATM filtering result: {} options selected (from {} total)",
+                analysisId, atmOptions.size(), options.size());
+
+        if (atmOptions.isEmpty()) {
+            log.warn("[ATM-FILTER][{}] No ATM options found - expanding to $1.00 range", analysisId);
+
+            return options.stream()
+                    .filter(option -> {
+                        BigDecimal strike = option.getStrikePrice();
+                        return strike != null &&
+                                Math.abs(strike.doubleValue() - currentPrice.doubleValue()) <= 1.00;
+                    })
+                    .collect(Collectors.toList());
+        }
+
+        return atmOptions;
+    }
+
+    private boolean quickSignalValidation(Option option, List<Option> allOptions, TechnicalAnalysis ta,
+                                          String marketTrend, String analysisId) {
+        if ("NEUTRAL".equals(marketTrend)) {
+            return false;
+        }
+
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+        boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
+
+        // Allow AI signals to be counter-trend (will be handled in createSignal)
+        if (!aligned) {
+            return false;
+        }
+
+        if (option.getVolume() < 10 && option.getOpenInterest() < 50) {
+            return false;
+        }
+
+        if (option.getSpreadPercentage() > 15.0) {
+            return false;
+        }
+
+        return true;
+    }
+
+    private String determineTimeSlot(LocalTime time) {
+        if (time.isAfter(LocalTime.of(9, 30)) && time.isBefore(LocalTime.of(10, 30))) {
+            return "MORNING";
+        } else if (time.isAfter(LocalTime.of(10, 30)) && time.isBefore(LocalTime.of(14, 0))) {
+            return "MIDDAY";
+        } else if (time.isAfter(LocalTime.of(14, 0)) && time.isBefore(LocalTime.of(15, 0))) {
+            return "AFTERNOON";
+        } else {
+            return "CLOSE";
+        }
+    }
+
+    private boolean isOrderSuccessful(OrderResponse response) {
+        return response != null &&
+                (response.getStatus() == null || !"error".equals(response.getStatus()));
+    }
+
+    public String getOrderId(OrderResponse response) {
+        return response.getOrder() != null ? response.getId() : "unknown";
+    }
+
+    private BigDecimal getCurrentPrice(String optionSymbol) {
+        try {
+            QuoteResponse quote = tradierService.getQuote(optionSymbol);
+            return quote != null && quote.getQuote() != null ?
+                    quote.getQuote().getLast() : BigDecimal.ZERO;
+        } catch (Exception e) {
+            return BigDecimal.ZERO;
+        }
+    }
+
+    private double calculateTradePerformance(Trade trade) {
+        if (trade.getExitPrice() != null && trade.getEntryPrice() != null) {
+            return trade.getExitPrice().subtract(trade.getEntryPrice())
+                    .divide(trade.getEntryPrice(), 4, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100)).doubleValue();
+        }
+        return 0.0;
+    }
+
+    // ================================================================================================
+    // AI LEARNING ENGINE - PERSISTENT VERSION
+    // ================================================================================================
+
+    public class AILearningEngine {
+        private final Map<String, List<TradeOutcome>> performanceHistory = new ConcurrentHashMap<>();
+        private final Map<String, Double> qTable = new ConcurrentHashMap<>();
+        private double explorationRate = 0.15;
+        private final double learningRate = 0.2;
+        private int totalTrades = 0;
+        private int successfulTrades = 0;
+
+        public void loadAIState() {
+            try {
+                // Load Q-table entries
+                List<AIState> qEntries = aiStateRepository.findByStrategyTypeOrderByLastUpdatedDesc("Q_TABLE");
+                for (AIState entry : qEntries) {
+                    if (entry.getStateKey() != null && entry.getActionKey() != null && entry.getQValue() != null) {
+                        String key = entry.getStateKey() + "_" + entry.getActionKey();
+                        qTable.put(key, entry.getQValue());
+                    }
+                }
+
+                // Load exploration rate and stats
+                List<AIState> configEntries = aiStateRepository.findByStrategyTypeOrderByLastUpdatedDesc("CONFIG");
+                if (!configEntries.isEmpty()) {
+                    AIState config = configEntries.get(0);
+                    if (config.getExplorationRate() != null) {
+                        explorationRate = config.getExplorationRate();
+                    }
+                    if (config.getTotalTrades() != null) {
+                        totalTrades = config.getTotalTrades();
+                    }
+                    if (config.getSuccessfulTrades() != null) {
+                        successfulTrades = config.getSuccessfulTrades();
+                    }
+                }
+
+                // Load performance history from recent successful trades
+                loadPerformanceHistoryFromTrades();
+
+                log.info("[AI-LOAD] Loaded AI state - Q-table: {} entries, Exploration: {:.3f}, Trades: {}/{}",
+                        qTable.size(), explorationRate, successfulTrades, totalTrades);
+
+            } catch (Exception e) {
+                log.error("[AI-LOAD] Error loading AI state: {}", e.getMessage());
+                // Initialize with defaults
+                explorationRate = 0.15;
+                totalTrades = 0;
+                successfulTrades = 0;
+            }
+        }
+
+        public void saveAIState() {
+            try {
+                // Save Q-table entries
+                for (Map.Entry<String, Double> entry : qTable.entrySet()) {
+                    String[] parts = entry.getKey().split("_");
+                    if (parts.length >= 2) {
+                        String stateKey = parts[0];
+                        String actionKey = parts[1];
+
+                        Optional<AIState> existing = aiStateRepository.findByStateAndAction(stateKey, actionKey);
+                        AIState aiState = existing.orElse(new AIState());
+
+                        aiState.setStateKey(stateKey);
+                        aiState.setActionKey(actionKey);
+                        aiState.setQValue(entry.getValue());
+                        aiState.setStrategyType("Q_TABLE");
+                        aiState.setLastUpdated(LocalDateTime.now());
+
+                        aiStateRepository.save(aiState);
+                    }
+                }
+
+                // Save configuration
+                AIState config = new AIState();
+                config.setStrategyType("CONFIG");
+                config.setExplorationRate(explorationRate);
+                config.setTotalTrades(totalTrades);
+                config.setSuccessfulTrades(successfulTrades);
+                config.setLastUpdated(LocalDateTime.now());
+                config.setLearningPhase(determineLearningPhase());
+
+                aiStateRepository.save(config);
+
+                log.debug("[AI-SAVE] Saved AI state - Q-table: {} entries, Config updated", qTable.size());
+
+            } catch (Exception e) {
+                log.error("[AI-SAVE] Error saving AI state: {}", e.getMessage());
+            }
+        }
+
+        private void loadPerformanceHistoryFromTrades() {
+            try {
+                LocalDateTime since = LocalDateTime.now().minusDays(30); // Last 30 days
+                List<Trade> recentAITrades = tradeRepository.findAll().stream()
+                        .filter(trade -> trade.getStrategy() != null && trade.getStrategy().contains("AI_LEADER_LAG"))
+                        .filter(trade -> trade.getEntryTime() != null && trade.getEntryTime().isAfter(since))
+                        .filter(trade -> "CLOSED".equals(trade.getStatus()) || "FAILED".equals(trade.getStatus()))
+                        .collect(Collectors.toList());
+
+                for (Trade trade : recentAITrades) {
+                    LeaderLagStrategy strategy = trade.getStrategy().contains("REVERSE") ?
+                            LeaderLagStrategy.REVERSE : LeaderLagStrategy.STANDARD;
+
+                    double pnlPercent = calculateTradePerformance(trade);
+                    boolean isWinner = pnlPercent > 0;
+
+                    // Reconstruct simplified features
+                    MarketFeatures features = new MarketFeatures(0, 0, 0, 18,
+                            trade.getEntryTime().getHour() * 60, 1, 1.0, 0);
+
+                    TradeOutcome outcome = new TradeOutcome(strategy, features, pnlPercent, isWinner, trade.getEntryTime());
+                    performanceHistory.computeIfAbsent(strategy.toString(), k -> new ArrayList<>()).add(outcome);
+                }
+
+                log.info("[AI-LOAD] Loaded {} recent AI trades into performance history", recentAITrades.size());
+
+            } catch (Exception e) {
+                log.error("[AI-LOAD] Error loading performance history: {}", e.getMessage());
+            }
+        }
+
+        private String determineLearningPhase() {
+            if (totalTrades < 50) return "EXPLORATION";
+            if (totalTrades < 200) return "LEARNING";
+            return "EXPLOITATION";
+        }
+
+        public AIDecision decideStrategy(MarketContext context, String analysisId) {
+            MarketFeatures features = extractFeatures(context);
+            String regime = classifyRegime(features);
+
+            double standardScore = getPerformanceScore("STANDARD", features);
+            double reverseScore = getPerformanceScore("REVERSE", features);
+
+            String stateKey = encodeState(features);
+            double qStandard = qTable.getOrDefault(stateKey + "_STANDARD", 0.5);
+            double qReverse = qTable.getOrDefault(stateKey + "_REVERSE", 0.5);
+
+            double combinedStandard = (standardScore * 0.4) + (qStandard * 0.6);
+            double combinedReverse = (reverseScore * 0.4) + (qReverse * 0.6);
+
+            LeaderLagStrategy selectedStrategy;
+            double confidence;
+
+            if (Math.random() < explorationRate) {
+                selectedStrategy = Math.random() < 0.5 ? LeaderLagStrategy.STANDARD : LeaderLagStrategy.REVERSE;
+                confidence = 0.6;
+                log.info("[AI-EXPLORE][{}] Exploring with {} (ε={})", analysisId, selectedStrategy, explorationRate);
+            } else {
+                if (combinedStandard > combinedReverse) {
+                    selectedStrategy = LeaderLagStrategy.STANDARD;
+                    confidence = Math.min(0.95, 0.5 + (combinedStandard - combinedReverse));
+                } else {
+                    selectedStrategy = LeaderLagStrategy.REVERSE;
+                    confidence = Math.min(0.95, 0.5 + (combinedReverse - combinedStandard));
+                }
+            }
+
+            if (confidence < 0.4) {
+                selectedStrategy = LeaderLagStrategy.NONE;
+            }
+
+            String reasoning = generateReasoning(features, regime, standardScore, reverseScore,
+                    qStandard, qReverse, selectedStrategy, context);
+
+            return new AIDecision(selectedStrategy, confidence, reasoning, regime, features);
+        }
+
+        public void updateFromTrade(Trade trade, Signal signal) {
+            try {
+                if (!signal.getStrategy().contains("AI_LEADER_LAG")) return;
+
+                totalTrades++;
+                MarketFeatures features = reconstructFeatures(signal);
+                LeaderLagStrategy strategy = signal.getStrategy().contains("REVERSE") ?
+                        LeaderLagStrategy.REVERSE : LeaderLagStrategy.STANDARD;
+
+                double pnlPercent = calculatePnLPercent(trade);
+                boolean isWinner = pnlPercent > 0;
+
+                if (isWinner) successfulTrades++;
+
+                // Update Q-table
+                String stateKey = encodeState(features);
+                String actionKey = stateKey + "_" + strategy.toString();
+                double currentQ = qTable.getOrDefault(actionKey, 0.5);
+                double reward = Math.max(-1.0, Math.min(1.0, pnlPercent / 50.0));
+                double newQ = currentQ + learningRate * (reward - currentQ);
+                qTable.put(actionKey, newQ);
+
+                // Update performance history
+                TradeOutcome outcome = new TradeOutcome(strategy, features, pnlPercent, isWinner, trade.getEntryTime());
+                performanceHistory.computeIfAbsent(strategy.toString(), k -> new ArrayList<>()).add(outcome);
+
+                // Decay exploration
+                explorationRate = Math.max(0.05, explorationRate * 0.995);
+
+                log.info("[AI-LEARN] Updated from trade: {} P&L: {}%, Reward: {:.3f}, New Q: {:.3f}",
+                        trade.getOptionSymbol(), String.format("%.2f", pnlPercent), reward, newQ);
+
+            } catch (Exception e) {
+                log.error("[AI-LEARN] Error updating from trade: {}", e.getMessage());
+            }
+        }
+
+        private MarketFeatures extractFeatures(MarketContext context) {
+            return new MarketFeatures(
+                    context.spyMomentum, // This is actually strongest leader momentum
+                    context.qqqMomentum,
+                    context.correlation,
+                    context.vixLevel,
+                    context.timeOfDay,
+                    context.dayOfWeek,
+                    context.volumeRatio,
+                    context.momentumDivergence
+            );
+        }
+
+        private String classifyRegime(MarketFeatures features) {
+            if (features.momentumDivergence > 0.4) return "MOMENTUM_DIVERGENCE";
+            if (features.vixLevel > 25) return "HIGH_VOLATILITY";
+            if (features.timeOfDay > 930) return "POWER_HOUR";
+            if (features.spyMomentum > 0.3) return "TRENDING_UP";
+            if (features.spyMomentum < -0.3) return "TRENDING_DOWN";
+            return "NEUTRAL";
+        }
+
+        private double getPerformanceScore(String strategy, MarketFeatures features) {
+            List<TradeOutcome> outcomes = performanceHistory.get(strategy);
+            if (outcomes == null || outcomes.isEmpty()) return 0.5;
+
+            List<TradeOutcome> similar = outcomes.stream()
+                    .filter(o -> isSimilarCondition(o.features, features))
+                    .sorted((a, b) -> b.timestamp.compareTo(a.timestamp))
+                    .limit(20)
+                    .collect(Collectors.toList());
+
+            if (similar.isEmpty()) return 0.5;
+
+            double avgPnL = similar.stream().mapToDouble(o -> o.pnlPercent).average().orElse(0);
+            double winRate = similar.stream().mapToDouble(o -> o.isWinner ? 1.0 : 0.0).average().orElse(0);
+
+            return Math.max(0.1, Math.min(0.9, 0.5 + (avgPnL / 100.0) + (winRate - 0.5)));
+        }
+
+        private boolean isSimilarCondition(MarketFeatures a, MarketFeatures b) {
+            return Math.abs(a.spyMomentum - b.spyMomentum) < 0.3 &&
+                    Math.abs(a.momentumDivergence - b.momentumDivergence) < 0.2 &&
+                    Math.abs(a.correlation - b.correlation) < 0.3 &&
+                    Math.abs(a.timeOfDay - b.timeOfDay) < 120;
+        }
+
+        private String encodeState(MarketFeatures features) {
+            int momentumBin = Math.max(0, Math.min(3, (int)((features.spyMomentum + 1) * 2)));
+            int divergenceBin = Math.max(0, Math.min(2, (int)(features.momentumDivergence * 3)));
+            int timeBin = features.timeOfDay / 240;
+            int correlationBin = Math.max(0, Math.min(1, (int)(features.correlation * 2)));
+
+            return String.format("%d_%d_%d_%d", momentumBin, divergenceBin, timeBin, correlationBin);
+        }
+
+        private String generateReasoning(MarketFeatures features, String regime, double standardScore,
+                                         double reverseScore, double qStandard, double qReverse,
+                                         LeaderLagStrategy selected, MarketContext context) {
+            StringBuilder reasoning = new StringBuilder();
+
+            reasoning.append(String.format("Regime: %s. ", regime));
+            reasoning.append(String.format("Leader %s momentum: %.2f vs QQQ: %.2f. ",
+                    context.strongestLeader, features.spyMomentum, features.qqqMomentum));
+            reasoning.append(String.format("Performance: Std=%.2f, Rev=%.2f. ", standardScore, reverseScore));
+            reasoning.append(String.format("Q-Values: Std=%.2f, Rev=%.2f. ", qStandard, qReverse));
+
+            if ("MOMENTUM_DIVERGENCE".equals(regime)) {
+                reasoning.append("High leader-QQQ divergence favors strategy selection. ");
+            } else if ("TRENDING_UP".equals(regime) || "TRENDING_DOWN".equals(regime)) {
+                reasoning.append("Strong trend detected in analysis. ");
+            }
+
+            reasoning.append(String.format("Selected: %s", selected));
+
+            return reasoning.toString();
+        }
+
+        private MarketFeatures reconstructFeatures(Signal signal) {
+            // Simplified reconstruction from signal metadata
+            String leaderStock = signal.getMetadata().getOrDefault("leaderStock", "AAPL");
+            return new MarketFeatures(0, 0, 0, 18, LocalTime.now().getHour() * 60, 1, 1.0, 0);
+        }
+
+        private double calculatePnLPercent(Trade trade) {
+            if (trade.getExitPrice() != null && trade.getEntryPrice() != null &&
+                    trade.getEntryPrice().compareTo(BigDecimal.ZERO) > 0) {
+                return trade.getExitPrice().subtract(trade.getEntryPrice())
+                        .divide(trade.getEntryPrice(), 4, RoundingMode.HALF_UP)
+                        .multiply(BigDecimal.valueOf(100)).doubleValue();
+            }
+            return 0.0;
+        }
+    }
+
+    // ================================================================================================
+    // CORRELATION DETECTOR - LEADER STOCK ANALYSIS
+    // ================================================================================================
+
+    private class CorrelationDetector {
+        private final Map<String, List<PricePoint>> priceHistory = new ConcurrentHashMap<>();
+        private LeaderCorrelationMetrics lastMetrics;
+
+        public LeaderCorrelationMetrics getLeaderMetrics(String analysisId) {
+            try {
+                // Get QQQ prices
+                List<PricePoint> qqqPrices = getRecentPrices("QQQ", 15, analysisId);
+                if (qqqPrices.size() < 10) {
+                    log.warn("[CORRELATION][{}] Insufficient QQQ data: {} points", analysisId, qqqPrices.size());
+                    return lastMetrics;
+                }
+
+                String strongestLeader = null;
+                double strongestCorrelation = 0.0;
+                Map<String, Double> leaderCorrelations = new HashMap<>();
+
+                // Analyze each leader stock
+                for (String leaderSymbol : LEADER_STOCKS) {
+                    List<PricePoint> leaderPrices = getRecentPrices(leaderSymbol, 15, analysisId);
+
+                    if (leaderPrices.size() >= 10) {
+                        double correlation = calculateCorrelation(leaderPrices, qqqPrices);
+                        leaderCorrelations.put(leaderSymbol, correlation);
+
+                        if (correlation > strongestCorrelation) {
+                            strongestCorrelation = correlation;
+                            strongestLeader = leaderSymbol;
+                        }
+                    } else {
+                        log.warn("[CORRELATION][{}] Insufficient {} data: {} points",
+                                analysisId, leaderSymbol, leaderPrices.size());
+                    }
+                }
+
+                if (strongestLeader == null) {
+                    log.warn("[CORRELATION][{}] No valid leader correlations found", analysisId);
+                    return lastMetrics;
+                }
+
+                lastMetrics = new LeaderCorrelationMetrics(strongestLeader, strongestCorrelation, leaderCorrelations);
+
+                log.info("[CORRELATION][{}] Leader analysis - Strongest: {} ({}%), All: {}",
+                        analysisId, strongestLeader, (int)(strongestCorrelation * 100),
+                        leaderCorrelations.entrySet().stream()
+                                .map(e -> e.getKey() + ":" + (int)(e.getValue() * 100) + "%")
+                                .collect(Collectors.joining(", ")));
+
+                return lastMetrics;
+
+            } catch (Exception e) {
+                log.error("[CORRELATION][{}] Error calculating leader metrics: {}", analysisId, e.getMessage());
+                return lastMetrics;
+            }
+        }
+
+        public double getLeaderQQQCorrelation(String leaderSymbol) {
+            try {
+                List<PricePoint> leaderPrices = getRecentPrices(leaderSymbol, 15, "correlation-check");
+                List<PricePoint> qqqPrices = getRecentPrices("QQQ", 15, "correlation-check");
+
+                if (leaderPrices.size() >= 5 && qqqPrices.size() >= 5) {
+                    return calculateCorrelation(leaderPrices, qqqPrices);
+                }
+                return 0.5;
+
+            } catch (Exception e) {
+                log.debug("Error calculating correlation for {}: {}", leaderSymbol, e.getMessage());
+                return 0.5;
+            }
+        }
+
+        private List<PricePoint> getRecentPrices(String symbol, int periods, String analysisId) {
+            List<PricePoint> prices = new ArrayList<>();
+            try {
+                // Get actual market data
+                List<MarketData> marketData = marketDataRepository.findRecentData(symbol, periods);
+
+                if (marketData.size() < periods / 2) {
+                    log.warn("[PRICE-DATA][{}] Limited {} data: {} of {} requested",
+                            analysisId, symbol, marketData.size(), periods);
+                }
+
+                for (MarketData data : marketData) {
+                    if (data.getPrice() != null && data.getTimestamp() != null) {
+                        prices.add(new PricePoint(data.getPrice().doubleValue(), data.getTimestamp()));
+                    }
+                }
+
+                // Sort by timestamp (most recent first)
+                prices.sort((a, b) -> b.timestamp.compareTo(a.timestamp));
+
+            } catch (Exception e) {
+                log.debug("[PRICE-DATA][{}] Error getting prices for {}: {}", analysisId, symbol, e.getMessage());
+            }
+            return prices;
+        }
+
+        private double calculateCorrelation(List<PricePoint> prices1, List<PricePoint> prices2) {
+            int n = Math.min(prices1.size(), prices2.size());
+            if (n < 3) return 0.5;
+
+            double sum1 = prices1.stream().limit(n).mapToDouble(p -> p.price).sum();
+            double sum2 = prices2.stream().limit(n).mapToDouble(p -> p.price).sum();
+            double sum1Sq = prices1.stream().limit(n).mapToDouble(p -> p.price * p.price).sum();
+            double sum2Sq = prices2.stream().limit(n).mapToDouble(p -> p.price * p.price).sum();
+            double sum1Sum2 = 0;
+
+            for (int i = 0; i < n; i++) {
+                sum1Sum2 += prices1.get(i).price * prices2.get(i).price;
+            }
+
+            double numerator = n * sum1Sum2 - sum1 * sum2;
+            double denominator = Math.sqrt((n * sum1Sq - sum1 * sum1) * (n * sum2Sq - sum2 * sum2));
+
+            return denominator != 0 ? Math.abs(numerator / denominator) : 0.5;
+        }
+    }
+
+    // ================================================================================================
+    // SUPPORTING CLASSES AND ENUMS
+    // ================================================================================================
+
+    private enum LeaderLagStrategy { STANDARD, REVERSE, NONE }
+    private enum VWAPPattern { NONE, COMPRESSION, FAILED_BREAKDOWN, STAIR_STEP }
+
+    @Getter @Setter
+    private static class MarketContext {
+        final double spyMomentum, qqqMomentum, correlation, vixLevel;
+        final String marketTrend, volatilityRegime, strongestLeader;
+        final int timeOfDay, dayOfWeek;
+        final double volumeRatio, momentumDivergence, rsi;
+        final BigDecimal currentPrice;
+
+        public MarketContext(double spyMomentum, double qqqMomentum, double correlation, double vixLevel,
+                             String marketTrend, String volatilityRegime, int timeOfDay, int dayOfWeek,
+                             double volumeRatio, double momentumDivergence, double rsi, BigDecimal currentPrice,
+                             String strongestLeader) {
+            this.spyMomentum = spyMomentum; this.qqqMomentum = qqqMomentum; this.correlation = correlation;
+            this.vixLevel = vixLevel; this.marketTrend = marketTrend; this.volatilityRegime = volatilityRegime;
+            this.timeOfDay = timeOfDay; this.dayOfWeek = dayOfWeek; this.volumeRatio = volumeRatio;
+            this.momentumDivergence = momentumDivergence; this.rsi = rsi; this.currentPrice = currentPrice;
+            this.strongestLeader = strongestLeader;
+        }
+    }
+
+    @Getter @Setter
+    private static class AIDecision {
+        final LeaderLagStrategy strategy;
+        final double confidence;
+        final String reasoning, marketRegime;
+        final MarketFeatures features;
+
+        public AIDecision(LeaderLagStrategy strategy, double confidence, String reasoning,
+                          String marketRegime, MarketFeatures features) {
+            this.strategy = strategy; this.confidence = confidence; this.reasoning = reasoning;
+            this.marketRegime = marketRegime; this.features = features;
+        }
+    }
+
+    @Getter @Setter
+    private static class AILeaderLagSignal {
+        final LeaderLagStrategy leaderLagStrategy;
+        final String signalType, strategy, reason, marketRegime, leaderStock;
+        final double confidence, correlation, signalStrength;
+
+        public AILeaderLagSignal(LeaderLagStrategy leaderLagStrategy, String signalType, String strategy,
+                                 double confidence, double correlation, double signalStrength,
+                                 String reason, String marketRegime, String leaderStock) {
+            this.leaderLagStrategy = leaderLagStrategy; this.signalType = signalType; this.strategy = strategy;
+            this.confidence = confidence; this.correlation = correlation; this.signalStrength = signalStrength;
+            this.reason = reason; this.marketRegime = marketRegime; this.leaderStock = leaderStock;
+        }
+    }
+
+    @Getter @Setter
+    private static class LeaderCorrelationMetrics {
+        final String strongestLeader;
+        final double strongestCorrelation;
+        final Map<String, Double> allCorrelations;
+
+        public LeaderCorrelationMetrics(String strongestLeader, double strongestCorrelation, Map<String, Double> allCorrelations) {
+            this.strongestLeader = strongestLeader;
+            this.strongestCorrelation = strongestCorrelation;
+            this.allCorrelations = allCorrelations;
+        }
+    }
+
+    @Getter @Setter
+    private static class MarketFeatures {
+        final double spyMomentum, qqqMomentum, correlation, vixLevel, volumeRatio, momentumDivergence;
+        final int timeOfDay, dayOfWeek;
+
+        public MarketFeatures(double spyMomentum, double qqqMomentum, double correlation, double vixLevel,
+                              int timeOfDay, int dayOfWeek, double volumeRatio, double momentumDivergence) {
+            this.spyMomentum = spyMomentum; this.qqqMomentum = qqqMomentum; this.correlation = correlation;
+            this.vixLevel = vixLevel; this.timeOfDay = timeOfDay; this.dayOfWeek = dayOfWeek;
+            this.volumeRatio = volumeRatio; this.momentumDivergence = momentumDivergence;
+        }
+    }
+
+    @Getter @Setter
+    private static class TradeOutcome {
+        final LeaderLagStrategy strategy;
+        final MarketFeatures features;
+        final double pnlPercent;
+        final boolean isWinner;
+        final LocalDateTime timestamp;
+
+        public TradeOutcome(LeaderLagStrategy strategy, MarketFeatures features, double pnlPercent,
+                            boolean isWinner, LocalDateTime timestamp) {
+            this.strategy = strategy; this.features = features; this.pnlPercent = pnlPercent;
+            this.isWinner = isWinner; this.timestamp = timestamp;
+        }
+    }
+
+    @Getter @Setter
+    private static class PricePoint {
+        final double price;
+        final LocalDateTime timestamp;
+
+        public PricePoint(double price, LocalDateTime timestamp) {
+            this.price = price; this.timestamp = timestamp;
+        }
+    }
+
+    @Getter @Setter
+    private static class VolumeRequirement {
+        private final String tier;
+        private final boolean met;
+        private final double multiplier;
+        private final double maxConfidence;
+
+        public VolumeRequirement(String tier, boolean met, double multiplier, double maxConfidence) {
+            this.tier = tier; this.met = met; this.multiplier = multiplier; this.maxConfidence = maxConfidence;
+        }
+    }
+
+    @Getter @Setter
+    private static class GapAnalysis {
+        private final double gapPercentage;
+        private final boolean isSignificant;
+        private final double confidenceBoost;
+        private final String direction;
+
+        public GapAnalysis(double gapPercentage, boolean isSignificant, double confidenceBoost, String direction) {
+            this.gapPercentage = gapPercentage;
+            this.isSignificant = isSignificant;
+            this.confidenceBoost = confidenceBoost;
+            this.direction = direction;
+        }
+    }
+
+    private static class OpeningRange {
+        private final BigDecimal high, low;
+
+        public OpeningRange(BigDecimal high, BigDecimal low) {
+            this.high = high; this.low = low;
+        }
+
+        public BigDecimal getHigh() { return high; }
+        public BigDecimal getLow() { return low; }
+    }
+
+    // PUBLIC METHODS FOR AI LEARNING INTEGRATION
+    public void updateAIFromTrade(Trade trade, Signal signal) {
+        if (signal.getStrategy().contains("AI_LEADER_LAG")) {
+            aiLearning.updateFromTrade(trade, signal);
+            log.info("[AI-UPDATE] Updated AI learning from trade: {} P&L: {}%",
+                    trade.getOptionSymbol(), calculateTradePerformance(trade));
+        }
+    }
+
+
+    // ================================================================================================
+// META AI LEARNING - SIGNAL ATTRIBUTE OPTIMIZATION
+// ================================================================================================
+
+    public class SignalAttributeLearning {
+        private final Map<String, AttributePattern> successfulPatterns = new ConcurrentHashMap<>();
+        private final Map<String, Double> dynamicThresholds = new ConcurrentHashMap<>();
+        private final Map<String, SignalVerification> pendingVerifications = new ConcurrentHashMap<>();
+
+        public void captureSignalGeneration(Signal signal, TechnicalAnalysis ta, String analysisId) {
+            try {
+                SignalVerification verification = new SignalVerification();
+                verification.signalId = signal.getId();
+                verification.strategy = signal.getStrategy();
+                verification.generatedAt = LocalDateTime.now();
+                verification.confidence = signal.getConfidence();
+
+                // Capture ALL technical attributes
+                verification.attributes = new TechnicalAttributes();
+                verification.attributes.vwapDistance = ta.getPriceToVwapRatio();
+                verification.attributes.vwapTrend = ta.getVwapTrend();
+                verification.attributes.rsi = ta.getRsi();
+                verification.attributes.macdSignal = ta.getMacdSignal() != null ? ta.getMacdSignal() : "NEUTRAL";
+                verification.attributes.volumeRatio = ta.getVolumeRatio();
+                verification.attributes.momentumStrength = ta.getMomentumStrength();
+                verification.attributes.marketRegime = ta.getMarketRegime().toString();
+                verification.attributes.extendedFromVwap = ta.isExtendedFromVwap();
+                verification.attributes.hasRsiDivergence = ta.isHasRsiDivergence();
+                verification.attributes.hasMacdDivergence = ta.isHasMacdDivergence();
+                verification.attributes.priceLevel = ta.getCurrentPrice().doubleValue();
+                verification.attributes.atr = ta.getAverageTrueRange() != null ? ta.getAverageTrueRange().doubleValue() : 0;
+                verification.attributes.strength = ta.getStrength();
+                verification.attributes.timeOfDay = LocalTime.now(ET_ZONE).toSecondOfDay();
+
+                // Capture POC data if available
+                Optional<POCData> pocData = pocDataRepository.findLatestPOCByTimeframe(ta.getSymbol(), "30m");
+                if (!pocData.isEmpty()) {
+                    POCData latest = pocData.get();
+                    verification.attributes.pocLevel = latest.getPocPrice().doubleValue();
+                    verification.attributes.pocDistance = Math.abs(ta.getCurrentPrice().subtract(latest.getPocPrice())
+                            .divide(latest.getPocPrice(), 4, RoundingMode.HALF_UP).doubleValue());
+                }
+
+                // Store for verification
+                pendingVerifications.put(signal.getId().toString(), verification);
+
+                log.debug("[AI-CAPTURE][{}] Captured attributes for signal {}", analysisId, signal.getId());
+
+            } catch (Exception e) {
+                log.error("[AI-CAPTURE][{}] Error capturing signal attributes: {}", analysisId, e.getMessage());
+            }
+        }
+
+        public void captureMissedOpportunity(TechnicalAnalysis ta, String marketTrend, String analysisId) {
+            try {
+                // Track when we DIDN'T generate a signal but market moved favorably
+                String missedKey = "MISSED_" + UUID.randomUUID().toString().substring(0, 8);
+
+                SignalVerification missed = new SignalVerification();
+                missed.signalId = null; // No signal was generated
+                missed.strategy = "NO_SIGNAL";
+                missed.generatedAt = LocalDateTime.now();
+                missed.confidence = 0.0;
+
+                // Capture attributes when we didn't signal
+                missed.attributes = new TechnicalAttributes();
+                missed.attributes.vwapDistance = ta.getPriceToVwapRatio();
+                missed.attributes.rsi = ta.getRsi();
+                missed.attributes.volumeRatio = ta.getVolumeRatio();
+                missed.attributes.momentumStrength = ta.getMomentumStrength();
+                missed.attributes.marketRegime = ta.getMarketRegime().toString();
+                missed.attributes.timeOfDay = LocalTime.now(ET_ZONE).toSecondOfDay();
+
+                pendingVerifications.put(missedKey, missed);
+
+            } catch (Exception e) {
+                log.debug("[AI-MISSED] Error capturing missed opportunity: {}", e.getMessage());
+            }
+        }
+
+        @Async
+        public void verifyAndLearn(String verificationId) {
+            try {
+                Thread.sleep(300000); // Wait 5 minutes for position to develop
+
+                SignalVerification verification = pendingVerifications.get(verificationId);
+                if (verification == null) return;
+
+                boolean wasSuccessful = false;
+                double actualPnL = 0.0;
+
+                if (verification.signalId != null) {
+                    // Check trade outcome
+                    Optional<Trade> trade = tradeRepository.findBySignalId(verification.signalId);
+                    if (trade.isPresent()) {
+                        Trade t = trade.get();
+                        wasSuccessful = t.getExitPrice() != null &&
+                                t.getExitPrice().compareTo(t.getEntryPrice()) > 0;
+                        actualPnL = calculateTradePerformance(t);
+                    }
+                } else {
+                    // Check if market moved favorably for missed opportunity
+                    QuoteResponse quote = tradierService.getQuote("QQQ");
+                    if (quote != null && quote.getQuote() != null) {
+                        double priceChange = quote.getQuote().getLast()
+                                .subtract(BigDecimal.valueOf(verification.attributes.priceLevel))
+                                .doubleValue();
+                        wasSuccessful = Math.abs(priceChange) > 0.50; // Missed $0.50+ move
+                    }
+                }
+
+                // Update pattern learning
+                updatePatternLearning(verification, wasSuccessful, actualPnL);
+
+                // Adjust thresholds if pattern is significant
+                adjustDynamicThresholds(verification, wasSuccessful);
+
+                // Persist learning
+                persistLearning(verification, wasSuccessful, actualPnL);
+
+                pendingVerifications.remove(verificationId);
+
+            } catch (Exception e) {
+                log.error("[AI-VERIFY] Error in verification: {}", e.getMessage());
+            }
+        }
+
+        private void updatePatternLearning(SignalVerification verification, boolean success, double pnl) {
+            String patternKey = encodeAttributePattern(verification.attributes);
+
+            AttributePattern pattern = successfulPatterns.computeIfAbsent(patternKey,
+                    k -> new AttributePattern());
+
+            pattern.occurrences++;
+            if (success) pattern.successes++;
+            pattern.totalPnL += pnl;
+            pattern.lastSeen = LocalDateTime.now();
+            pattern.successRate = (double) pattern.successes / pattern.occurrences;
+
+            // Store exact attributes if this is a high-performing pattern
+            if (pattern.successRate > 0.75 && pattern.occurrences >= 5) {
+                pattern.idealAttributes = verification.attributes;
+
+                log.info("[AI-PATTERN] High-performing pattern discovered: {} ({}% win rate, {} trades)",
+                        patternKey, (int)(pattern.successRate * 100), pattern.occurrences);
+            }
+        }
+
+        private void adjustDynamicThresholds(SignalVerification verification, boolean success) {
+            if (verification.attributes.volumeRatio > 0) {
+                String key = verification.strategy + "_VOLUME_THRESHOLD";
+                Double current = dynamicThresholds.getOrDefault(key, 1.2);
+
+                if (success && verification.attributes.volumeRatio < current) {
+                    // Lower threshold if successful with lower volume
+                    dynamicThresholds.put(key, current * 0.95);
+                } else if (!success && verification.attributes.volumeRatio > current) {
+                    // Raise threshold if failed despite high volume
+                    dynamicThresholds.put(key, current * 1.05);
+                }
+            }
+
+            // Adjust RSI thresholds
+            if ("VWAP_REVERSION".contains(verification.strategy)) {
+                String rsiKey = verification.strategy + "_RSI_THRESHOLD";
+                Double currentRsi = dynamicThresholds.getOrDefault(rsiKey, 70.0);
+
+                if (success) {
+                    dynamicThresholds.put(rsiKey,
+                            currentRsi * 0.9 + verification.attributes.rsi * 0.1);
+                }
+            }
+        }
+
+        private void persistLearning(SignalVerification verification, boolean success, double pnl) {
+            try {
+                String patternKey = encodeAttributePattern(verification.attributes);
+
+                AIState learning = new AIState();
+                learning.setStrategyType("ATTRIBUTE_LEARNING");
+                learning.setStateKey(patternKey);
+                learning.setActionKey(verification.strategy);
+                learning.setQValue(success ? 1.0 : 0.0);
+                learning.setLastUpdated(LocalDateTime.now());
+                learning.setLearningPhase("PATTERN_DISCOVERY");
+
+                // Store detailed attributes as JSON in a metadata field
+                learning.setMetadata(serializeAttributes(verification.attributes));
+                learning.setPerformanceMetric(pnl);
+
+                aiStateRepository.save(learning);
+
+            } catch (Exception e) {
+                log.error("[AI-PERSIST] Error persisting learning: {}", e.getMessage());
+            }
+        }
+
+        private String encodeAttributePattern(TechnicalAttributes attrs) {
+            // Create a pattern key based on attribute ranges
+            StringBuilder key = new StringBuilder();
+
+            // Encode key attributes into ranges
+            key.append(attrs.marketRegime).append("_");
+            key.append(getRangeKey("RSI", attrs.rsi, 10)).append("_");
+            key.append(getRangeKey("VOL", attrs.volumeRatio, 0.5)).append("_");
+            key.append(getRangeKey("VWAP", attrs.vwapDistance, 0.005)).append("_");
+            key.append(getTimeSlot(attrs.timeOfDay));
+
+            return key.toString();
+        }
+
+        private String getRangeKey(String prefix, double value, double binSize) {
+            int bin = (int)(value / binSize);
+            return prefix + bin;
+        }
+
+        private String getTimeSlot(int secondsOfDay) {
+            int hour = secondsOfDay / 3600;
+            if (hour < 10) return "OPEN";
+            if (hour < 12) return "MORNING";
+            if (hour < 14) return "MIDDAY";
+            if (hour < 15) return "AFTERNOON";
+            return "CLOSE";
+        }
+
+        private String serializeAttributes(TechnicalAttributes attrs) {
+            // Simple JSON-like serialization
+            return String.format(
+                    "{\"rsi\":%.2f,\"vwap\":%.4f,\"vol\":%.2f,\"momentum\":%.2f,\"poc\":%.2f}",
+                    attrs.rsi, attrs.vwapDistance, attrs.volumeRatio,
+                    attrs.momentumStrength, attrs.pocDistance
+            );
+        }
+
+        public double getOptimalThreshold(String strategy, String thresholdType) {
+            String key = strategy + "_" + thresholdType;
+            return dynamicThresholds.getOrDefault(key, getDefaultThreshold(thresholdType));
+        }
+
+        private double getDefaultThreshold(String type) {
+            switch(type) {
+                case "VOLUME_THRESHOLD": return 1.2;
+                case "RSI_THRESHOLD": return 70.0;
+                case "VWAP_DISTANCE": return 0.005;
+                default: return 1.0;
+            }
+        }
+
+        public void loadLearnedPatterns() {
+            try {
+                List<AIState> patterns = aiStateRepository.findByStrategyTypeOrderByLastUpdatedDesc("ATTRIBUTE_LEARNING");
+
+                for (AIState state : patterns) {
+                    if (state.getQValue() != null && state.getQValue() > 0.7) {
+                        AttributePattern pattern = new AttributePattern();
+                        pattern.successRate = state.getQValue();
+                        pattern.lastSeen = state.getLastUpdated();
+                        successfulPatterns.put(state.getStateKey(), pattern);
+                    }
+                }
+
+                log.info("[AI-LOAD] Loaded {} learned patterns", successfulPatterns.size());
+
+            } catch (Exception e) {
+                log.error("[AI-LOAD] Error loading patterns: {}", e.getMessage());
+            }
+        }
+
+        @Async
+        public void sendDailySummary() {
+            try {
+                StringBuilder summary = new StringBuilder();
+                summary.append("🤖 AI Learning Summary\n\n");
+
+                // Find top performing patterns
+                List<Map.Entry<String, AttributePattern>> topPatterns = successfulPatterns.entrySet().stream()
+                        .filter(e -> e.getValue().occurrences >= 3)
+                        .sorted((a, b) -> Double.compare(b.getValue().successRate, a.getValue().successRate))
+                        .limit(3)
+                        .collect(Collectors.toList());
+
+                if (!topPatterns.isEmpty()) {
+                    summary.append("Top Patterns:\n");
+                    for (Map.Entry<String, AttributePattern> entry : topPatterns) {
+                        summary.append(String.format("• %s: %.0f%% win rate (%d trades)\n",
+                                entry.getKey().substring(0, Math.min(20, entry.getKey().length())),
+                                entry.getValue().successRate * 100,
+                                entry.getValue().occurrences));
+                    }
+                }
+
+                // Threshold adjustments
+                summary.append("\nThreshold Adjustments:\n");
+                dynamicThresholds.forEach((key, value) -> {
+                    if (key.contains("VOLUME")) {
+                        summary.append(String.format("• Volume: %.2f\n", value));
+                    } else if (key.contains("RSI")) {
+                        summary.append(String.format("• RSI: %.1f\n", value));
+                    }
+                });
+
+                if (summary.length() > 50) {
+                    telegramService.sendMessage(summary.toString());
+                }
+
+            } catch (Exception e) {
+                log.error("[AI-SUMMARY] Error sending summary: {}", e.getMessage());
+            }
+        }
+    }
+
+    private static class SignalVerification {
+        Long signalId;
+        String strategy;
+        LocalDateTime generatedAt;
+        double confidence;
+        TechnicalAttributes attributes;
+        boolean verified = false;
+        double actualOutcome = 0.0;
+    }
+
+    private class TechnicalAttributes {
+        double vwapDistance;
+        String vwapTrend;
+        double rsi;
+        String macdSignal;
+        double volumeRatio;
+        double momentumStrength;
+        String marketRegime;
+        boolean extendedFromVwap;
+        boolean hasRsiDivergence;
+        boolean hasMacdDivergence;
+        double priceLevel;
+        double atr;
+        double strength;
+        int timeOfDay;
+        double pocLevel;
+        double pocDistance;
+    }
+
+    private class AttributePattern {
+        int occurrences = 0;
+        int successes = 0;
+        double successRate = 0.0;
+        double totalPnL = 0.0;
+        LocalDateTime lastSeen;
+        TechnicalAttributes idealAttributes;
+    }
 }

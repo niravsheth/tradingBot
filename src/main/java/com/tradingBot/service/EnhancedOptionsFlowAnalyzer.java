@@ -1,7 +1,7 @@
 package com.tradingBot.service;
 
 import com.tradingBot.model.Option;
-import com.tradingBot.model.Greeks;
+import com.tradingBot.model.OptionGreeks;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -37,7 +37,7 @@ public class EnhancedOptionsFlowAnalyzer {
         private int contracts;
         private BigDecimal delta;
         private BigDecimal gamma;
-        private BigDecimal vega;
+        private Double vega;
         private BigDecimal impliedVolatility;
         private boolean isSweep;
         private boolean isBlock;
@@ -63,7 +63,7 @@ public class EnhancedOptionsFlowAnalyzer {
 
             // Greeks analysis
             if (option.getGreeks() != null) {
-                Greeks greeks = option.getGreeks();
+                OptionGreeks greeks = option.getGreeks();
                 analysis.setDelta(greeks.getDelta());
                 analysis.setGamma(greeks.getGamma());
                 analysis.setVega(greeks.getVega());
@@ -350,7 +350,7 @@ public class EnhancedOptionsFlowAnalyzer {
 
             for (Option option : options) {
                 if (option.getGreeks() != null && option.getOpenInterest() > 0) {
-                    Greeks greeks = option.getGreeks();
+                    OptionGreeks greeks = option.getGreeks();
                     int multiplier = option.getOpenInterest() * 100;
 
                     // Net dealer gamma (negative for sold options)
@@ -361,7 +361,7 @@ public class EnhancedOptionsFlowAnalyzer {
                     totalGamma = totalGamma.add(optionGamma);
 
                     // Vega exposure
-                    BigDecimal optionVega = greeks.getVega()
+                    BigDecimal optionVega = BigDecimal.valueOf(greeks.getVega())
                             .multiply(BigDecimal.valueOf(multiplier))
                             .negate();
 

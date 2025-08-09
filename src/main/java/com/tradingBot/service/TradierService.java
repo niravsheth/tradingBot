@@ -2,30 +2,19 @@ package com.tradingBot.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
-import com.tradingBot.entity.Trade;
 import com.tradingBot.model.*;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
-import java.net.URI;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Service
@@ -70,7 +59,7 @@ public class TradierService {
         long startTime = System.currentTimeMillis();
         CachedQuote cached = quoteCache.get(symbol);
         if (cached != null && !cached.isExpired()) {
-            log.debug("Using cached quote for {}: Last=${}", symbol, cached.getQuote().getQuote().getLast());
+            //log.debug("Using cached quote for {}: Last=${}", symbol, cached.getQuote().getQuote().getLast());
             return cached.getQuote();
         }
         // Fetch new quote if not in cache or expired
@@ -102,7 +91,6 @@ public class TradierService {
                 return null;
             }
             QuoteResponse quoteResponse = objectMapper.readValue(responseBody, QuoteResponse.class);
-            log.debug("Fetched quote for {}: ${}", symbol, quoteResponse.getQuote().getLast());
             return quoteResponse;
         } catch (Exception e) {
             log.error("Error fetching quote for {}: {}", symbol, e.getMessage());
@@ -173,112 +161,165 @@ public class TradierService {
 
     // Method to place an order via Tradier API, accepting a single OrderRequest parameter
     public OrderResponse placeOrder(OrderRequest orderRequest) {
+        String trackingId = UUID.randomUUID().toString().substring(0, 8);
+
         try {
-            // Log the entire OrderRequest object for debugging
-            log.info("Attempting to place order with OrderRequest: {}", orderRequest);
+            log.info("[ORDER][{}] Attempting to place order with OrderRequest: {}", trackingId, orderRequest);
 
             // Validate mandatory fields with null checks
             String optionSymbol = orderRequest.getSymbol();
             if (optionSymbol == null || optionSymbol.isEmpty()) {
-                log.error("Symbol is null or empty in OrderRequest");
+                log.error("[ORDER][{}] Symbol is null or empty in OrderRequest", trackingId);
                 return null;
             }
 
-            // Extract underlying symbol from option symbol (e.g., QQQ from QQQ250611P00531000)
-            String underlyingSymbol = extractUnderlyingSymbol(optionSymbol);
-            if (underlyingSymbol == null || underlyingSymbol.isEmpty()) {
-                log.error("Could not extract underlying symbol from option symbol: {}", optionSymbol);
-                return null;
-            }
-            log.debug("Extracted underlying symbol: {} from option symbol: {}", underlyingSymbol, optionSymbol);
+            //           String underlyingSymbol = extractUnderlyingSymbol(optionSymbol);
+//            if (underlyingSymbol == null || underlyingSymbol.isEmpty()) {
+//                log.error("[ORDER][{}] Could not extract underlying symbol from option symbol: {}", trackingId, optionSymbol);
+//                return null;
+//            }
+//            log.debug("[ORDER][{}] Extracted underlying symbol: {} from option symbol: {}", trackingId, underlyingSymbol, optionSymbol);
 
             String side = orderRequest.getSide();
             if (side == null || side.isEmpty()) {
-                log.error("Side is null or empty in OrderRequest");
+                log.error("[ORDER][{}] Side is null or empty in OrderRequest", trackingId);
                 return null;
             }
 
-            // Validate side parameter for option orders
             if (!side.equals("buy_to_open") && !side.equals("buy_to_close") &&
                     !side.equals("sell_to_open") && !side.equals("sell_to_close")) {
-                log.error("Invalid side value: {}. Valid values are buy_to_open, buy_to_close, sell_to_open, sell_to_close", side);
+                log.error("[ORDER][{}] Invalid side value: {}. Valid values are buy_to_open, buy_to_close, sell_to_open, sell_to_close", trackingId, side);
                 return null;
             }
 
             int quantity = orderRequest.getQuantity();
             if (quantity <= 0) {
-                log.error("Invalid quantity value: {}", quantity);
+                log.error("[ORDER][{}] Invalid quantity value: {}", trackingId, quantity);
                 return null;
             }
 
             String type = orderRequest.getType();
             if (type == null || type.isEmpty()) {
-                log.warn("Type is null or empty in OrderRequest, defaulting to 'market'");
+                log.warn("[ORDER][{}] Type is null or empty in OrderRequest, defaulting to 'market'", trackingId);
                 type = "market";
             }
 
             String duration = orderRequest.getDuration();
             if (duration == null || duration.isEmpty()) {
-                log.warn("Duration is null or empty in OrderRequest, defaulting to 'day'");
+                log.warn("[ORDER][{}] Duration is null or empty in OrderRequest, defaulting to 'day'", trackingId);
                 duration = "day";
             }
 
-            // Build the order payload from OrderRequest with null-safe checks
-            FormBody.Builder formBuilder = new FormBody.Builder()
-                    .add("class", "option")
-                    .add("symbol", underlyingSymbol) // Underlying symbol (e.g., QQQ)
-                    .add("option_symbol", optionSymbol) // Full OCC option symbol (e.g., QQQ250611P00531000)
-                    .add("side", side)
-                    .add("quantity", String.valueOf(quantity))
-                    .add("type", type)
-                    .add("duration", duration);
+//            FormBody.Builder formBuilder = new FormBody.Builder()
+//                    .add("class", "option")
+//                    .add("symbol", underlyingSymbol)
+//                    .add("option_symbol", optionSymbol)
+//                    .add("side", side)
+//                    .add("quantity", String.valueOf(quantity))
+//                    .add("type", type)
+//                    .add("duration", duration);
 
-            // Add limit price if available and applicable
-            try {
-                BigDecimal limitPrice = null;
-                // Check for common getter names for limit price
-                try {
-                    limitPrice = orderRequest.getPrice();
-                } catch (Exception e) {
-                    log.debug("No getPrice() method found or error retrieving limit price: {}", e.getMessage());
-                }
-                if (limitPrice != null && limitPrice.compareTo(BigDecimal.ZERO) > 0) {
-                    formBuilder.add("price", limitPrice.toString());
-                    log.debug("Added limit price: ${}", limitPrice);
-                } else {
-                    log.debug("Limit price not set or invalid, skipping price field");
-                }
-            } catch (Exception e) {
-                log.warn("Failed to retrieve limit price from OrderRequest: {}", e.getMessage());
-            }
+//            try {
+//                BigDecimal limitPrice = orderRequest.getPrice();
+//                if (limitPrice != null && limitPrice.compareTo(BigDecimal.ZERO) > 0) {
+//                    formBuilder.add("price", limitPrice.toString());
+//                    log.debug("[ORDER][{}] Added limit price: ${}", trackingId, limitPrice);
+//                }
+//            } catch (Exception e) {
+//                log.warn("[ORDER][{}] Failed to retrieve limit price from OrderRequest: {}", trackingId, e.getMessage());
+//            }
+//
+//            RequestBody requestBody = formBuilder.build();
+//            Request request = new Request.Builder()
+//                    .url(baseUrl + "/accounts/" + accountId + "/orders")
+//                    .addHeader("Authorization", "Bearer " + apiKey)
+//                    .addHeader("Accept", "application/json")
+//                    .addHeader("Content-Type", "application/x-www-form-urlencoded")
+//                    .post(requestBody)
+//                    .build();
+//
+//            Response response = client.newCall(request).execute();
+//            String responseBody = response.body().string();
+//
+//            if (!response.isSuccessful()) {
+//                log.error("[ORDER][{}] Failed to place order. Status: {}, Body: {}", trackingId, response.code(), responseBody);
+//                return null;
+//            }
+//
+//            OrderResponse orderResponse = objectMapper.readValue(responseBody, OrderResponse.class);
+//
+//            if (orderResponse == null) {
+//                log.error("[ORDER][{}] Null order response from Tradier", trackingId);
+//                return null;
+//            }
+//
+//            if ("error".equalsIgnoreCase(orderResponse.getStatus())) {
+//                log.error("[ORDER][{}] Order rejected by Tradier: Status = {}", trackingId, orderResponse.getStatus());
+//                return null;
+//            }
+//
+//            if (orderResponse.getOrder() == null) {
+//                log.error("[ORDER][{}] No order object in response", trackingId);
+//                return null;
+//            }
+//
+//            String orderId = orderResponse.getId();
+//            if (orderId == null || orderId.trim().isEmpty()) {
+//                log.error("[ORDER][{}] No valid order ID in response", trackingId);
+//                return null;
+//            }
+//
+//            if ("market".equalsIgnoreCase(type)) {
+//                Thread.sleep(1000);
+//                String orderStatus = getOrderStatus(orderId);
+//                if (!isOrderStatusValid(orderStatus)) {
+//                    log.error("[ORDER][{}] Market order not properly accepted. Status: {}", trackingId, orderStatus);
+//                    return null;
+//                }
+//            }
+//
+//            log.info("[ORDER][{}] ✅ Successfully placed order for {}: Side={}, Quantity={}, Order ID={}",
+//                    trackingId, optionSymbol, side, quantity, orderId);
+//            return orderResponse;
+//
+//        }
+        }
+        catch (Exception e) {
+            log.error("[ORDER][{}] ❌ Error placing order for {}: {}", trackingId,
+                    orderRequest != null ? orderRequest.getSymbol() : "unknown", e.getMessage(), e);
+            return null;
+        }
+         return null;
+    }
 
-            // Skip stop price since getStop() is not available as per user feedback
-            log.debug("Stop price retrieval skipped as getStop() is not available");
-
-            RequestBody requestBody = formBuilder.build();
+    private String getOrderStatus(String orderId) {
+        try {
             Request request = new Request.Builder()
-                    .url(baseUrl + "/accounts/" + accountId + "/orders")
+                    .url(baseUrl + "/accounts/" + accountId + "/orders/" + orderId)
                     .addHeader("Authorization", "Bearer " + apiKey)
                     .addHeader("Accept", "application/json")
-                    .addHeader("Content-Type", "application/x-www-form-urlencoded")
-                    .post(requestBody)
                     .build();
 
             Response response = client.newCall(request).execute();
             String responseBody = response.body().string();
-            if (!response.isSuccessful()) {
-                log.error("Failed to place order. Status: {}, Body: {}", response.code(), responseBody);
-                return null;
+
+            if (response.isSuccessful()) {
+                JsonNode rootNode = objectMapper.readTree(responseBody);
+                JsonNode orderNode = rootNode.path("order");
+                return orderNode.path("status").asText("unknown");
             }
 
-            OrderResponse orderResponse = objectMapper.readValue(responseBody, OrderResponse.class);
-            log.info("Successfully placed order for {}: Side={}, Quantity={}, Type={}",
-                    optionSymbol, side, quantity, type);
-            return orderResponse;
         } catch (Exception e) {
-            log.error("Error placing order for {}: {}", orderRequest != null ? orderRequest.getSymbol() : "unknown", e.getMessage(), e);
-            return null;
+            log.error("Error getting order status for {}: {}", orderId, e.getMessage());
         }
+        return "unknown";
+    }
+
+    private boolean isOrderStatusValid(String status) {
+        if (status == null) return false;
+        String lowerStatus = status.toLowerCase();
+        return Arrays.asList("pending", "submitted", "accepted", "open", "filled", "partially_filled")
+                .contains(lowerStatus);
     }
 
     // Helper method to extract underlying symbol from option symbol
@@ -327,7 +368,7 @@ public class TradierService {
 
         public boolean isExpired() {
             // Cache expires after 10 seconds
-            return LocalDateTime.now().isAfter(timestamp.plusSeconds(10));
+            return LocalDateTime.now().isAfter(timestamp.plusSeconds(2));
         }
     }
     // Add this method to get positions from Tradier
@@ -425,7 +466,6 @@ public class TradierService {
                         Quote quote = objectMapper.treeToValue(quoteNode, Quote.class);
                         String symbol = quoteNode.path("symbol").asText();
                         quotes.put(symbol, quote);
-                        log.debug("Parsed quote for {}: ${}", symbol, quote.getLast());
                     } catch (Exception e) {
                         log.error("Error parsing quote node: {}", e.getMessage());
                     }

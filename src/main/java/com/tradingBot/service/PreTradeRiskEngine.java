@@ -48,7 +48,7 @@ public class PreTradeRiskEngine {
                     log.warn("[PRE-TRADE][{}] VIX too high: {} > {}", checkId, vixLevel, maxVix);
                     return false;
                 }
-                log.info("[PRE-TRADE][{}] VIX check passed: {}", checkId, vixLevel);
+                //log.info("[PRE-TRADE][{}] VIX check passed: {}", checkId, vixLevel);
             }
         } catch (Exception e) {
             log.error("[PRE-TRADE][{}] VIX check failed: {}", checkId, e.getMessage());
@@ -67,7 +67,7 @@ public class PreTradeRiskEngine {
                                 checkId, breadth, minMarketBreadth);
                         return false;
                     }
-                    log.info("[PRE-TRADE][{}] Market breadth check passed: {}", checkId, breadth);
+                    //log.info("[PRE-TRADE][{}] Market breadth check passed: {}", checkId, breadth);
                 }
             }
         } catch (Exception e) {
@@ -107,8 +107,8 @@ public class PreTradeRiskEngine {
         log.debug("[PRE-TRADE][{}] Checking strike suitability", checkId);
 
         // 1. Volume check
-        if (option.getVolume() < 500) {
-            log.debug("[PRE-TRADE][{}] Volume too low: {} < 500", checkId, option.getVolume());
+        if (option.getVolume() < 50) {
+            log.debug("[PRE-TRADE][{}] Volume too low: {} < 50", checkId, option.getVolume());
             return false;
         }
 

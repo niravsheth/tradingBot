@@ -165,8 +165,12 @@ public class KellyPositionSizer {
         // Ensure positive and reasonable
         kellyAdjusted = Math.max(0.01, Math.min(kellyAdjusted, 0.10)); // 1% to 10%
 
-        log.info("Kelly calculation - Strategy: {}, WinRate: {:.1f}%, AvgWin: {:.1f}%, AvgLoss: {:.1f}%, Kelly: {:.2f}%",
-                strategy, winRate * 100, avgWinPercent * 100, avgLossPercent * 100, kellyAdjusted * 100);
+        log.info("Kelly calculation - Strategy: {}, WinRate: {}%, AvgWin: {}%, AvgLoss: {}%, Kelly: {}%",
+                strategy,
+                String.format("%.1f", winRate * 100),
+                String.format("%.1f", avgWinPercent * 100),
+                String.format("%.1f", avgLossPercent * 100),
+                String.format("%.2f", kellyAdjusted * 100));
 
         return kellyAdjusted;
     }
