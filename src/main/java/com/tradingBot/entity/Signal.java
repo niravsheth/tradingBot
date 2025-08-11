@@ -5,7 +5,9 @@ import jakarta.persistence.*;
 import lombok.Data;
 import java.time.LocalDateTime;
 import java.time.ZonedDateTime;
+import java.time.Duration;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -132,7 +134,7 @@ public class Signal {
     private String optionType;
 
     // =====================================
-    // OPTION GREEKS AND DETAILS
+    // OPTION GREEKS AND DETAILS - FIXED: All using Double for consistency
     // =====================================
     @Column(name = "implied_volatility")
     private Double impliedVolatility;
@@ -442,6 +444,36 @@ public class Signal {
     private Boolean mtfValidationPassed;
 
     // =====================================
+    // AI-SPECIFIC FIELDS - ADDED FOR COMPLETE INTEGRATION
+    // =====================================
+    @Column(name = "ai_strategy")
+    private String aiStrategy;
+
+    @Column(name = "ai_correlation")
+    private Double aiCorrelation;
+
+    @Column(name = "ai_signal_strength")
+    private Double aiSignalStrength;
+
+    @Column(name = "ai_market_regime")
+    private String aiMarketRegime;
+
+    @Column(name = "leader_stock")
+    private String leaderStock;
+
+    @Column(name = "leader_momentum")
+    private Double leaderMomentum;
+
+    @Column(name = "qqq_momentum")
+    private Double qqqMomentum;
+
+    @Column(name = "momentum_divergence")
+    private Double momentumDivergence;
+
+    @Column(name = "correlation_strength")
+    private Double correlationStrength;
+
+    // =====================================
     // METADATA STORAGE
     // =====================================
     @ElementCollection
@@ -451,7 +483,7 @@ public class Signal {
     private Map<String, String> metadata = new HashMap<>();
 
     // =====================================
-    // HELPER METHODS
+    // HELPER METHODS - ENHANCED FOR AI INTEGRATION
     // =====================================
 
     /**
@@ -499,8 +531,7 @@ public class Signal {
         if (daysToExpiry != null) return daysToExpiry;
 
         if (expirationDate != null) {
-            long days = java.time.Duration.between(
-                    ZonedDateTime.now(), expirationDate).toDays();
+            long days = Duration.between(ZonedDateTime.now(), expirationDate).toDays();
             return (int) Math.max(0, days);
         }
 
@@ -514,8 +545,7 @@ public class Signal {
         if (minutesToExpiry != null) return minutesToExpiry;
 
         if (expirationDate != null) {
-            long minutes = java.time.Duration.between(
-                    ZonedDateTime.now(), expirationDate).toMinutes();
+            long minutes = Duration.between(ZonedDateTime.now(), expirationDate).toMinutes();
             return (int) Math.max(0, minutes);
         }
 
@@ -616,7 +646,7 @@ public class Signal {
     public Long getSignalAgeMinutes() {
         LocalDateTime created = createdAt != null ? createdAt : signalGeneratedAt;
         if (created == null) return 0L;
-        return java.time.Duration.between(created, LocalDateTime.now()).toMinutes();
+        return Duration.between(created, LocalDateTime.now()).toMinutes();
     }
 
     /**
@@ -629,7 +659,7 @@ public class Signal {
         BigDecimal spread = askAtSignal.subtract(bidAtSignal);
         BigDecimal midPrice = bidAtSignal.add(askAtSignal).divide(BigDecimal.valueOf(2));
 
-        return spread.divide(midPrice, 4, java.math.RoundingMode.HALF_UP).doubleValue() * 100;
+        return spread.divide(midPrice, 4, RoundingMode.HALF_UP).doubleValue() * 100;
     }
 
     /**
@@ -640,6 +670,148 @@ public class Signal {
                 Boolean.TRUE.equals(passedBayesianFilter) &&
                 Boolean.TRUE.equals(passedRiskChecks) &&
                 Boolean.TRUE.equals(passedTrendAlignment);
+    }
+
+    // =====================================
+    // AI-SPECIFIC HELPER METHODS
+    // =====================================
+
+    /**
+     * Get Greeks from the signal with null safety
+     */
+    public Map<String, Double> getGreeksMap() {
+        Map<String, Double> greeksMap = new HashMap<>();
+        if (delta != null) greeksMap.put("delta", delta);
+        if (gamma != null) greeksMap.put("gamma", gamma);
+        if (theta != null) greeksMap.put("theta", theta);
+        if (vega != null) greeksMap.put("vega", vega);
+        if (rho != null) greeksMap.put("rho", rho);
+        return greeksMap;
+    }
+
+    /**
+     * Set Greeks from a map (useful for AI data loading)
+     */
+    public void setGreeksFromMap(Map<String, Double> greeksMap) {
+        if (greeksMap != null) {
+            this.delta = greeksMap.get("delta");
+            this.gamma = greeksMap.get("gamma");
+            this.theta = greeksMap.get("theta");
+            this.vega = greeksMap.get("vega");
+            this.rho = greeksMap.get("rho");
+        }
+    }
+
+    /**
+     * AI-specific getters with proper type conversion
+     */
+    public Double getAiCorrelationFromMetadata() {
+        try {
+            String value = getMetadata("aiCorrelation");
+            return value != null ? Double.valueOf(value) : aiCorrelation;
+        } catch (NumberFormatException e) {
+            return aiCorrelation;
+        }
+    }
+
+    public Double getAiSignalStrengthFromMetadata() {
+        try {
+            String value = getMetadata("aiSignalStrength");
+            return value != null ? Double.valueOf(value) : aiSignalStrength;
+        } catch (NumberFormatException e) {
+            return aiSignalStrength;
+        }
+    }
+
+    public String getAiStrategyFromMetadata() {
+        String value = getMetadata("aiStrategy");
+        return value != null ? value : aiStrategy;
+    }
+
+    public String getAiMarketRegimeFromMetadata() {
+        String value = getMetadata("aiMarketRegime");
+        return value != null ? value : aiMarketRegime;
+    }
+
+    public String getLeaderStockFromMetadata() {
+        String value = getMetadata("leaderStock");
+        return value != null ? value : leaderStock;
+    }
+
+    /**
+     * Calculate time-based metrics
+     */
+    public long getMinutesSinceGeneration() {
+        if (signalGeneratedAt != null) {
+            return Duration.between(signalGeneratedAt, LocalDateTime.now()).toMinutes();
+        } else if (createdAt != null) {
+            return Duration.between(createdAt, LocalDateTime.now()).toMinutes();
+        }
+        return 0L;
+    }
+
+    /**
+     * Risk metrics calculations
+     */
+    public Double getMaxRiskPercentage() {
+        if (maxRisk != null && entryPrice != null && entryPrice.compareTo(BigDecimal.ZERO) > 0) {
+            return maxRisk.divide(entryPrice.multiply(BigDecimal.valueOf(100)), 4, RoundingMode.HALF_UP).doubleValue();
+        }
+        return null;
+    }
+
+    public Double getTargetReturnPercentage() {
+        if (targetPrice != null && entryPrice != null && entryPrice.compareTo(BigDecimal.ZERO) > 0) {
+            return targetPrice.subtract(entryPrice)
+                    .divide(entryPrice, 4, RoundingMode.HALF_UP)
+                    .multiply(BigDecimal.valueOf(100))
+                    .doubleValue();
+        }
+        return null;
+    }
+
+    /**
+     * Enhanced validation helpers
+     */
+    public boolean hasValidGreeks() {
+        return delta != null && gamma != null && theta != null;
+    }
+
+    public boolean isHighConfidence() {
+        return getEffectiveConfidence() >= 0.80;
+    }
+
+    public boolean isAIGenerated() {
+        return "AI_LEARNING_ENGINE".equals(getMetadata("signalSource")) ||
+                aiStrategy != null ||
+                strategy != null && strategy.contains("AI_LEADER_LAG");
+    }
+
+    public boolean isLowLatency() {
+        return getMinutesSinceGeneration() <= 2;
+    }
+
+    public boolean hasAIMetadata() {
+        return aiCorrelation != null || aiSignalStrength != null ||
+                getMetadata("aiStrategy") != null;
+    }
+
+    /**
+     * Type-safe metadata operations
+     */
+    public void setDoubleMetadata(String key, Double value) {
+        if (value != null && !value.isNaN() && !value.isInfinite()) {
+            addMetadata(key, String.valueOf(value));
+        }
+    }
+
+    public Double getDoubleMetadata(String key) {
+        try {
+            String value = getMetadata(key);
+            return value != null ? Double.valueOf(value) : null;
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     // =====================================
@@ -693,20 +865,6 @@ public class Signal {
         return mtfValidationPassed != null ? mtfValidationPassed : false;
     }
 
-    @Column(name = "ai_strategy")
-    private String aiStrategy;
-
-    @Column(name = "ai_correlation", precision = 5)
-    private Double aiCorrelation;
-
-    @Column(name = "ai_signal_strength", precision = 5)
-    private Double aiSignalStrength;
-
-    @Column(name = "ai_market_regime")
-    private String aiMarketRegime;
-
-
-
     // =====================================
     // STATUS ENUMS
     // =====================================
@@ -750,6 +908,7 @@ public class Signal {
         FLOW,
         BAYESIAN,
         HYBRID,
-        MANUAL
+        MANUAL,
+        AI_LEARNING_ENGINE
     }
 }

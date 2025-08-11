@@ -62,4 +62,12 @@ public class Quote {
     public Integer getOpenInterest() {
         return openInterest;
     }
+
+    @JsonProperty("greeks")
+    private OptionGreeks greeks;
+
+    // ADDED: Greeks accessor
+    public OptionGreeks getGreeks() {
+        return greeks;
+    }
 }

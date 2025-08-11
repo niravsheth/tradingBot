@@ -59,6 +59,13 @@ public class ZeroDTEStrategy {
     // Leader stocks for AI analysis
     private static final List<String> LEADER_STOCKS = Arrays.asList("AAPL", "MSFT", "NVDA");
 
+    // Leader weights for direction validation
+    private static final Map<String, Double> LEADER_WEIGHTS = new HashMap<String, Double>() {{
+        put("NVDA", 0.5);  // Strongest correlation to QQQ
+        put("MSFT", 0.3);
+        put("AAPL", 0.2);
+    }};
+
     // Updated strategy thresholds
     private static final double MIN_VOLUME_RATIO_BREAKOUT = 1.2;
     private static final double MIN_VOLUME_RATIO_STANDARD = 0.8;
@@ -75,14 +82,15 @@ public class ZeroDTEStrategy {
     // AI LEARNING COMPONENTS - PERSISTENT
     private final AILearningEngine aiLearning = new AILearningEngine();
     private final CorrelationDetector correlationDetector = new CorrelationDetector();
-
     private final SignalAttributeLearning attributeLearning = new SignalAttributeLearning();
+    private final LeaderDirectionValidator leaderValidator = new LeaderDirectionValidator();
+    private final GreeksValidator greeksValidator = new GreeksValidator();
 
     @PostConstruct
     public void initializeAI() {
         try {
             aiLearning.loadAIState();
-            attributeLearning.loadLearnedPatterns(); // ADD THIS
+            attributeLearning.loadLearnedPatterns();
             log.info("AI Learning Engine initialized with persistent state");
         } catch (Exception e) {
             log.error("Error initializing AI Learning Engine: {}", e.getMessage());
@@ -105,6 +113,15 @@ public class ZeroDTEStrategy {
             aiLearning.saveAIState();
         } catch (Exception e) {
             log.debug("Error in periodic AI state save: {}", e.getMessage());
+        }
+    }
+
+    @Scheduled(cron = "0 30 16 * * MON-FRI", zone = "America/New_York") // 4:30 PM ET daily
+    public void sendAILearningSummary() {
+        try {
+            attributeLearning.sendDailySummary();
+        } catch (Exception e) {
+            log.error("Error sending AI learning summary: {}", e.getMessage());
         }
     }
 
@@ -342,7 +359,7 @@ public class ZeroDTEStrategy {
                                                       String marketTrend, String analysisId) {
         List<Signal> leaderLagSignals = new ArrayList<>();
         LocalTime now = LocalTime.now(ET_ZONE);
-
+        marketTrend = ta.getTrend();
         try {
             // Build comprehensive market context for AI with leader stocks
             MarketContext context = buildEnhancedMarketContext(ta, marketTrend, now, analysisId);
@@ -562,6 +579,20 @@ public class ZeroDTEStrategy {
         signal.getMetadata().put("priority", "HIGHEST"); // AI gets highest priority
         signal.getMetadata().put("signalSource", "AI_LEARNING_ENGINE");
 
+        // Store option Greeks for later validation - FIXED: Use proper conversion
+        if (option.getDelta() != null) {
+            signal.setDelta(option.getDelta());
+        }
+        if (option.getGamma() != null) {
+            signal.setGamma(option.getGamma());
+        }
+        if (option.getTheta() != null) {
+            signal.setTheta(option.getTheta());
+        }
+        if (option.getVega() != null) {
+            signal.setVega(option.getVega());
+        }
+
         // AI-optimized risk management
         signal.setTargetPrice(calculateAITarget(signal.getEntryPrice(), aiSignal, ta));
         signal.setStopLoss(calculateAIStop(signal.getEntryPrice(), aiSignal, ta));
@@ -735,7 +766,7 @@ public class ZeroDTEStrategy {
     }
 
     // ================================================================================================
-    // EXECUTION WITH PRICE LEVEL VALIDATION
+    // EXECUTION WITH ENHANCED VALIDATION (LEADER DIRECTION + GREEKS)
     // ================================================================================================
 
     private void executeSignalImmediately(Signal signal, SHAPExplainerService.SHAPExplanation explanation, String analysisId) {
@@ -752,6 +783,39 @@ public class ZeroDTEStrategy {
             }
 
             BigDecimal currentPrice = quote.getQuote().getLast();
+            if (currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                // Try mid price if last is not available
+                currentPrice = quote.getQuote().getMidPrice();
+                if (currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                    log.error("[EXECUTION][{}] ❌ Invalid option price - saving as PRICE_INVALID", analysisId);
+                    saveFailedTrade(signal, "PRICE_INVALID", "Option price is null or zero", analysisId);
+                    saveFailedSignal(signal, "PRICE_INVALID", "Option price is null or zero");
+                    return;
+                }
+            }
+
+            // FIXED: Update Greeks from fresh quote with proper null checks and type handling
+            Quote freshQuote = quote.getQuote();
+            if (freshQuote.getGreeks() != null) {
+                OptionGreeks greeks = freshQuote.getGreeks();
+
+                // Convert BigDecimal Greeks to Double for Signal entity
+                if (greeks.getDelta() != null) {
+                    signal.setDelta(greeks.getDelta().doubleValue());
+                }
+                if (greeks.getGamma() != null) {
+                    signal.setGamma(greeks.getGamma().doubleValue());
+                }
+                if (greeks.getTheta() != null) {
+                    signal.setTheta(greeks.getTheta());
+                }
+                if (greeks.getVega() != null) {
+                    signal.setVega(greeks.getVega());
+                }
+                if (greeks.getRho() != null) {
+                    signal.setRho(greeks.getRho());
+                }
+            }
 
             // 2. PRICE LEVEL RISK ASSESSMENT
             PriceLevelRiskService.PriceLevelRisk priceLevelRisk =
@@ -781,8 +845,68 @@ public class ZeroDTEStrategy {
                 return;
             }
 
-            // 3. PROCEED WITH EXECUTION IF LEVELS ARE CLEAR
-            log.info("[EXECUTION][{}] ✅ Price levels CLEAR - proceeding with execution", analysisId);
+            // 3. LEADER DIRECTION VALIDATION (Skip for AI Leader-Lag strategies)
+            if (!signal.getStrategy().contains("AI_LEADER_LAG")) {
+                LeaderDirectionValidator.ValidationResult leaderValidation =
+                        leaderValidator.validateLeaderDirection(signal, analysisId);
+
+                if (!leaderValidation.shouldProceed) {
+                    // Check if it's just confidence reduction or hard block
+                    if (leaderValidation.confidenceAdjustment < 0.8) {
+                        log.warn("[EXECUTION][{}] ❌ Leader opposition - HARD BLOCK: {}",
+                                analysisId, leaderValidation.reason);
+
+                        saveFailedTrade(signal, "LEADER_BLOCKED", leaderValidation.reason, analysisId);
+                        saveFailedSignal(signal, "LEADER_BLOCKED", leaderValidation.reason);
+
+                        telegramService.sendMessage(String.format(
+                                "🚫 SIGNAL BLOCKED - LEADER OPPOSITION\n" +
+                                        "Option: %s\n" +
+                                        "Reason: %s\n" +
+                                        "Leaders: %s\n" +
+                                        "Status: Saved for analysis",
+                                signal.getOptionSymbol(),
+                                leaderValidation.reason,
+                                leaderValidation.details
+                        ));
+                        return;
+                    } else {
+                        // Just reduce confidence
+                        signal.setConfidence(signal.getConfidence() * leaderValidation.confidenceAdjustment);
+                        log.info("[EXECUTION][{}] ⚠️ Leader caution - confidence reduced to {}%",
+                                analysisId, (int)(signal.getConfidence() * 100));
+                    }
+                }
+            }
+
+            // 4. GREEKS VALIDATION
+            GreeksValidator.GreeksValidationResult greeksValidation =
+                    greeksValidator.validateGreeks(signal, analysisId);
+
+            if (!greeksValidation.isValid) {
+                log.warn("[EXECUTION][{}] ❌ Greeks validation failed: {}",
+                        analysisId, greeksValidation.reason);
+
+                saveFailedTrade(signal, "GREEKS_BLOCKED", greeksValidation.reason, analysisId);
+                saveFailedSignal(signal, "GREEKS_BLOCKED", greeksValidation.reason);
+
+                telegramService.sendMessage(String.format(
+                        "🚫 SIGNAL BLOCKED - GREEKS RISK\n" +
+                                "Option: %s\n" +
+                                "Reason: %s\n" +
+                                "Delta: %.3f, Gamma: %.3f, Theta: %.3f\n" +
+                                "Status: Saved for analysis",
+                        signal.getOptionSymbol(),
+                        greeksValidation.reason,
+                        signal.getDelta() != null ? signal.getDelta() : 0.0,
+                        signal.getGamma() != null ? signal.getGamma() : 0.0,
+                        signal.getTheta() != null ? signal.getTheta() : 0.0
+                ));
+                return;
+            }
+
+            // 5. PROCEED WITH EXECUTION IF ALL CHECKS PASS
+            log.info("[EXECUTION][{}] ✅ All validations PASSED - proceeding with execution", analysisId);
 
             boolean orderSuccessful = attemptSignalExecution(signal, analysisId);
 
@@ -799,6 +923,8 @@ public class ZeroDTEStrategy {
                 signal.getMetadata().put("tradeId", trade.getId().toString());
                 signal.getMetadata().put("executedAt", LocalDateTime.now().toString());
                 signal.getMetadata().put("priceLevelClear", "true");
+                signal.getMetadata().put("leaderValidation", "passed");
+                signal.getMetadata().put("greeksValidation", "passed");
                 signalRepository.save(signal);
 
                 log.info("[EXECUTION][{}] ✅ SUCCESS SAVED - Trade ID: {} (OPEN), Signal (EXECUTED)",
@@ -830,7 +956,6 @@ public class ZeroDTEStrategy {
             saveFailedSignal(signal, "EXECUTION_ERROR", e.getMessage());
         }
     }
-
     @Async
     public void updateAIFromTradeAsync(Trade trade, Signal signal) {
         try {
@@ -841,6 +966,307 @@ public class ZeroDTEStrategy {
             }
         } catch (Exception e) {
             log.error("[AI-UPDATE] Error updating AI from trade: {}", e.getMessage());
+        }
+    }
+
+    // ================================================================================================
+    // LEADER DIRECTION VALIDATOR
+    // ================================================================================================
+
+    private class LeaderDirectionValidator {
+
+        @Getter @Setter
+        class ValidationResult {
+            boolean shouldProceed;
+            double confidenceAdjustment;
+            String reason;
+            String details;
+
+            ValidationResult(boolean proceed, double adjustment, String reason, String details) {
+                this.shouldProceed = proceed;
+                this.confidenceAdjustment = adjustment;
+                this.reason = reason;
+                this.details = details;
+            }
+        }
+
+        @Getter @Setter
+        class LeaderMomentum {
+            String symbol;
+            double momentum5min;
+            double momentum10min;
+            double momentum15min;
+            boolean isOpposing;
+            double weight;
+
+            LeaderMomentum(String symbol, double weight) {
+                this.symbol = symbol;
+                this.weight = weight;
+            }
+        }
+
+        public ValidationResult validateLeaderDirection(Signal signal, String analysisId) {
+            try {
+                LocalTime now = LocalTime.now(ET_ZONE);
+
+                // Skip validation in first 30 minutes (too noisy)
+                if (now.isBefore(LocalTime.of(10, 0))) {
+                    return new ValidationResult(true, 1.0, "Early session - skipping leader check", "");
+                }
+
+                // Skip for very high confidence signals
+                if (signal.getConfidence() >= 0.85) {
+                    return new ValidationResult(true, 1.0, "High confidence signal - leader check bypassed", "");
+                }
+
+                // Skip for reversion plays
+                if (signal.getStrategy().contains("REVERSION")) {
+                    return new ValidationResult(true, 1.0, "Reversion play - leaders may be extended", "");
+                }
+
+                // Check if QQQ volume is 2x+ normal (QQQ leading)
+                TechnicalAnalysis qqqTA = technicalAnalysisService.analyze("QQQ");
+                if (qqqTA != null && qqqTA.getVolumeRatio() > 2.0) {
+                    return new ValidationResult(true, 1.0, "QQQ leading with high volume", "");
+                }
+
+                boolean isCallSignal = signal.getStrategy().contains("CALL");
+                Map<String, LeaderMomentum> leaderAnalysis = analyzeLeaderMomentum(isCallSignal, now);
+
+                // Count opposing leaders
+                long opposingCount = leaderAnalysis.values().stream()
+                        .filter(l -> l.isOpposing)
+                        .count();
+
+                // Calculate weighted opposition score
+                double oppositionScore = leaderAnalysis.values().stream()
+                        .filter(l -> l.isOpposing)
+                        .mapToDouble(l -> l.weight)
+                        .sum();
+
+                // Build details string
+                String details = leaderAnalysis.entrySet().stream()
+                        .map(e -> String.format("%s: 5m=%.2f%%, 10m=%.2f%%, 15m=%.2f%%",
+                                e.getKey(),
+                                e.getValue().momentum5min * 100,
+                                e.getValue().momentum10min * 100,
+                                e.getValue().momentum15min * 100))
+                        .collect(Collectors.joining(", "));
+
+                // Decision logic
+                if (opposingCount >= 2 || oppositionScore >= 0.7) {
+                    // Hard block
+                    return new ValidationResult(false, 0.0,
+                            String.format("%d/3 leaders opposing direction (weighted: %.0f%%)",
+                                    opposingCount, oppositionScore * 100),
+                            details);
+                } else if (opposingCount == 1 && oppositionScore >= 0.4) {
+                    // Reduce confidence by 20%
+                    return new ValidationResult(true, 0.8,
+                            "1 leader opposing - confidence reduced",
+                            details);
+                }
+
+                return new ValidationResult(true, 1.0, "Leaders aligned", details);
+
+            } catch (Exception e) {
+                log.error("[LEADER-VALIDATOR][{}] Error validating leader direction: {}",
+                        analysisId, e.getMessage());
+                // Fail open - don't block on error
+                return new ValidationResult(true, 1.0, "Validation error - proceeding", "");
+            }
+        }
+
+        private Map<String, LeaderMomentum> analyzeLeaderMomentum(boolean isCallSignal, LocalTime now) {
+            Map<String, LeaderMomentum> results = new HashMap<>();
+
+            for (String leader : LEADER_STOCKS) {
+                LeaderMomentum momentum = new LeaderMomentum(leader, LEADER_WEIGHTS.get(leader));
+
+                // Get recent data
+                List<MarketData> data5min = marketDataRepository.findRecentData(leader, 5);
+                List<MarketData> data10min = marketDataRepository.findRecentData(leader, 10);
+                List<MarketData> data15min = marketDataRepository.findRecentData(leader, 15);
+
+                // Calculate momentum for each timeframe
+                momentum.momentum5min = calculateMomentum(data5min);
+                momentum.momentum10min = calculateMomentum(data10min);
+                momentum.momentum15min = calculateMomentum(data15min);
+
+                // Adjust thresholds based on time of day
+                double threshold5min = now.isAfter(POWER_HOUR_START) ? 0.0010 : 0.0015;  // 0.10% or 0.15%
+                double threshold10min = now.isAfter(POWER_HOUR_START) ? 0.0020 : 0.0025; // 0.20% or 0.25%
+                double threshold15min = now.isAfter(POWER_HOUR_START) ? 0.0030 : 0.0035; // 0.30% or 0.35%
+
+                // Check if opposing with weighted importance
+                boolean opposing5min = isCallSignal ?
+                        momentum.momentum5min < -threshold5min : momentum.momentum5min > threshold5min;
+                boolean opposing10min = isCallSignal ?
+                        momentum.momentum10min < -threshold10min : momentum.momentum10min > threshold10min;
+                boolean opposing15min = isCallSignal ?
+                        momentum.momentum15min < -threshold15min : momentum.momentum15min > threshold15min;
+
+                // 5-min has highest weight for 0DTE
+                momentum.isOpposing = (opposing5min && opposing10min) ||
+                        (opposing5min && opposing15min) ||
+                        (opposing5min && Math.abs(momentum.momentum5min) > threshold5min * 2);
+
+                results.put(leader, momentum);
+            }
+
+            return results;
+        }
+
+        private double calculateMomentum(List<MarketData> data) {
+            if (data.isEmpty()) return 0.0;
+
+            MarketData firstData = data.get(data.size() - 1); // Oldest
+            MarketData lastData = data.get(0); // Most recent
+
+            if (firstData.getPrice() == null || lastData.getPrice() == null ||
+                    firstData.getPrice().compareTo(BigDecimal.ZERO) == 0) {
+                return 0.0;
+            }
+
+            return lastData.getPrice().subtract(firstData.getPrice())
+                    .divide(firstData.getPrice(), 6, RoundingMode.HALF_UP)
+                    .doubleValue();
+        }
+    }
+
+    // ================================================================================================
+    // GREEKS VALIDATOR
+    // ================================================================================================
+
+    private class GreeksValidator {
+
+        @Getter @Setter
+        class GreeksValidationResult {
+            boolean isValid;
+            String reason;
+
+            GreeksValidationResult(boolean valid, String reason) {
+                this.isValid = valid;
+                this.reason = reason;
+            }
+        }
+
+        public GreeksValidationResult validateGreeks(Signal signal, String analysisId) {
+            try {
+                LocalTime now = LocalTime.now(ET_ZONE);
+                long minutesToClose = Duration.between(now, LocalTime.of(16, 0)).toMinutes();
+
+                Double delta = signal.getDelta();
+                Double gamma = signal.getGamma();
+                Double theta = signal.getTheta();
+
+                // Check if Greeks are available
+                if (delta == null || gamma == null || theta == null) {
+                    log.warn("[GREEKS-VALIDATOR][{}] Greeks not available - using defaults", analysisId);
+                    // Don't block if Greeks unavailable
+                    return new GreeksValidationResult(true, "Greeks unavailable - proceeding with caution");
+                }
+
+                // Get option price for theta ratio calculation
+                BigDecimal optionPrice = signal.getEntryPrice();
+                if (optionPrice == null || optionPrice.compareTo(BigDecimal.ZERO) <= 0) {
+                    return new GreeksValidationResult(true, "Unable to calculate theta ratio");
+                }
+
+                // Strategy-specific adjustments
+                boolean isBreakout = signal.getStrategy().contains("BREAKOUT") ||
+                        signal.getStrategy().contains("ORB");
+                boolean isReversion = signal.getStrategy().contains("REVERSION");
+
+                // DELTA VALIDATION - FIXED: Proper double handling
+                double minDelta, maxDelta;
+                if (minutesToClose < 120) { // Final 2 hours
+                    minDelta = 0.30;
+                    maxDelta = 0.45;
+                } else if (now.isBefore(LocalTime.of(11, 0))) { // Morning
+                    minDelta = isBreakout ? 0.20 : 0.25;
+                    maxDelta = 0.50;
+                } else { // Midday
+                    minDelta = 0.25;
+                    maxDelta = 0.45;
+                }
+
+                // Strategy adjustments
+                if (isBreakout) minDelta -= 0.05;
+                if (isReversion) {
+                    minDelta = 0.35;
+                    maxDelta = 0.45;
+                }
+
+                double deltaAbs = Math.abs(delta);
+                if (deltaAbs < minDelta) {
+                    return new GreeksValidationResult(false,
+                            String.format("Delta too low (%.3f < %.3f) - lottery ticket",
+                                    deltaAbs, minDelta));
+                }
+
+                if (deltaAbs > maxDelta) {
+                    return new GreeksValidationResult(false,
+                            String.format("Delta too high (%.3f > %.3f) - poor risk/reward",
+                                    deltaAbs, maxDelta));
+                }
+
+                // GAMMA VALIDATION - FIXED: Proper double handling
+                double maxGamma = minutesToClose < 60 ? 0.10 : // Final hour
+                        minutesToClose < 120 ? 0.12 : // Final 2 hours
+                                0.15; // Earlier
+
+                double gammaAbs = Math.abs(gamma);
+                if (gammaAbs > maxGamma) {
+                    // Extra strict for ultra-high gamma
+                    if (gammaAbs > 0.20) {
+                        return new GreeksValidationResult(false,
+                                String.format("Gamma too high (%.3f) - position unstable", gammaAbs));
+                    }
+                    // Warning level - only block if close to expiry
+                    if (minutesToClose < 120) {
+                        return new GreeksValidationResult(false,
+                                String.format("High gamma (%.3f) near expiry - whipsaw risk", gammaAbs));
+                    }
+                }
+
+                // GAMMA/DELTA RATIO - FIXED: Proper division with null check
+                if (deltaAbs > 0.001) { // Avoid division by very small numbers
+                    double gammaDeltaRatio = gammaAbs / deltaAbs;
+                    if (gammaDeltaRatio > 0.5) {
+                        return new GreeksValidationResult(false,
+                                String.format("Gamma/Delta ratio too high (%.2f) - unstable position", gammaDeltaRatio));
+                    }
+                }
+
+                // THETA VALIDATION - FIXED: Proper calculation with null checks
+                double thetaAbs = Math.abs(theta);
+                double optionPriceDouble = optionPrice.doubleValue();
+
+                if (optionPriceDouble > 0.001) { // Avoid division by very small numbers
+                    double thetaRatio = thetaAbs / optionPriceDouble;
+                    double maxThetaRatio = minutesToClose < 60 ? 0.30 : // 30% in final hour
+                            minutesToClose < 120 ? 0.40 : // 40% in final 2 hours
+                                    0.50; // 50% earlier
+
+                    if (thetaRatio > maxThetaRatio) {
+                        return new GreeksValidationResult(false,
+                                String.format("Theta decay too high (%.0f%% of premium) - melting ice cube",
+                                        thetaRatio * 100));
+                    }
+                }
+
+                // All checks passed
+                log.info("[GREEKS-VALIDATOR][{}] Greeks validated - Delta: {:.3f}, Gamma: {:.3f}, Theta: {:.3f}",
+                        analysisId, deltaAbs, gammaAbs, thetaAbs);
+
+                return new GreeksValidationResult(true, "Greeks within acceptable ranges");
+
+            } catch (Exception e) {
+                log.error("[GREEKS-VALIDATOR][{}] Error validating Greeks: {}", analysisId, e.getMessage());
+                // Fail open - don't block on error
+                return new GreeksValidationResult(true, "Validation error - proceeding");
+            }
         }
     }
 
@@ -995,11 +1421,10 @@ public class ZeroDTEStrategy {
                     .divide(vwapUpper, 4, RoundingMode.HALF_UP);
 
             if (breakoutDistance.compareTo(BigDecimal.valueOf(0.002)) >= 0) {
-                // USE AI-LEARNED THRESHOLD - MODIFIED
-//                double requiredVolumeRatio = attributeLearning.getOptimalThreshold(
-//                        "0DTE_VWAP_BREAKOUT_CALL", "VOLUME_THRESHOLD");
-//                boolean volumeRequirementMet = ta.getVolumeRatio() >= requiredVolumeRatio;
-                boolean volumeRequirementMet = ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
+                // USE AI-LEARNED THRESHOLD
+                double requiredVolumeRatio = attributeLearning.getOptimalThreshold(
+                        "0DTE_VWAP_BREAKOUT_CALL", "VOLUME_THRESHOLD");
+                boolean volumeRequirementMet = ta.getVolumeRatio() >= requiredVolumeRatio;
 
                 if (volumeRequirementMet) {
                     double confidence = calculateBreakoutConfidence(ta, true);
@@ -1011,13 +1436,13 @@ public class ZeroDTEStrategy {
                     if (confidence >= 0.60) {
                         Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_BREAKOUT_CALL", confidence, marketTrend);
                         signal.setReason(String.format(
-                                "VWAP breakout %.2f%% above upper band with %.1fx volume",
+                                "VWAP breakout %.2f%% above upper band with %.1fx volume (AI threshold: %.2f)",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
-                                ta.getVolumeRatio()));
+                                ta.getVolumeRatio(), requiredVolumeRatio));
                         signals.add(signal);
 
-                        log.info("[{}] ✅ VWAP Breakout CALL - Confidence: {}%",
-                                analysisId, (int)(confidence * 100));
+                        log.info("[{}] ✅ VWAP Breakout CALL - Confidence: {}% (AI Volume Threshold: {})",
+                                analysisId, (int)(confidence * 100), requiredVolumeRatio);
                     }
                 }
             }
@@ -1028,11 +1453,10 @@ public class ZeroDTEStrategy {
                     .divide(vwapLower, 4, RoundingMode.HALF_UP);
 
             if (breakoutDistance.compareTo(BigDecimal.valueOf(0.002)) >= 0) {
-                // USE AI-LEARNED THRESHOLD - MODIFIED
-//                double requiredVolumeRatio = attributeLearning.getOptimalThreshold(
-//                        "0DTE_VWAP_BREAKOUT_PUT", "VOLUME_THRESHOLD");
-//                boolean volumeRequirementMet = ta.getVolumeRatio() >= requiredVolumeRatio;
-                boolean volumeRequirementMet = ta.getVolumeRatio() >= MIN_VOLUME_RATIO_BREAKOUT;
+                // USE AI-LEARNED THRESHOLD
+                double requiredVolumeRatio = attributeLearning.getOptimalThreshold(
+                        "0DTE_VWAP_BREAKOUT_PUT", "VOLUME_THRESHOLD");
+                boolean volumeRequirementMet = ta.getVolumeRatio() >= requiredVolumeRatio;
 
                 if (volumeRequirementMet) {
                     double confidence = calculateBreakoutConfidence(ta, false);
@@ -1044,13 +1468,13 @@ public class ZeroDTEStrategy {
                     if (confidence >= 0.60) {
                         Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_BREAKOUT_PUT", confidence, marketTrend);
                         signal.setReason(String.format(
-                                "VWAP breakout %.2f%% below lower band with %.1fx volume",
+                                "VWAP breakout %.2f%% below lower band with %.1fx volume (AI threshold: %.2f)",
                                 breakoutDistance.multiply(BigDecimal.valueOf(100)).doubleValue(),
-                                ta.getVolumeRatio()));
+                                ta.getVolumeRatio(), requiredVolumeRatio));
                         signals.add(signal);
 
-                        log.info("[{}] ✅ VWAP Breakout PUT - Confidence: {}%",
-                                analysisId, (int)(confidence * 100));
+                        log.info("[{}] ✅ VWAP Breakout PUT - Confidence: {}% (AI Volume Threshold: {})",
+                                analysisId, (int)(confidence * 100), requiredVolumeRatio);
                     }
                 }
             }
@@ -1117,7 +1541,7 @@ public class ZeroDTEStrategy {
 
                 if (confidence >= 0.65) {
                     Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_SUPPORT_CALL", confidence, marketTrend);
-                    signal.setReason(String.format("VWAP support at $%.2f held with volume confirmation", vwap));
+                    signal.setReason(String.format("VWAP support at $%.2f held with volume confirmation", vwap.doubleValue()));
                     signals.add(signal);
 
                     log.info("[{}] ✅ VWAP Support CALL - Confidence: {}%",
@@ -1134,7 +1558,7 @@ public class ZeroDTEStrategy {
 
                 if (confidence >= 0.65) {
                     Signal signal = createSignal(option, allOptions, ta, "BUY", "0DTE_VWAP_RESISTANCE_PUT", confidence, marketTrend);
-                    signal.setReason(String.format("VWAP resistance at $%.2f rejected with volume confirmation", vwap));
+                    signal.setReason(String.format("VWAP resistance at $%.2f rejected with volume confirmation", vwap.doubleValue()));
                     signals.add(signal);
 
                     log.info("[{}] ✅ VWAP Resistance PUT - Confidence: {}%",
@@ -1576,19 +2000,19 @@ public class ZeroDTEStrategy {
                     analysisId, signal.getStrategy(), signal.getSignalType(),
                     signal.getOptionSymbol(), (int)(signal.getConfidence() * 100));
 
-            // CAPTURE ATTRIBUTES FOR AI LEARNING - ADD THIS
+            // CAPTURE ATTRIBUTES FOR AI LEARNING
             attributeLearning.captureSignalGeneration(signal, ta, analysisId);
 
             // Execute signal immediately
             executeSignalImmediately(signal, explanation, analysisId);
 
-            // START VERIFICATION PROCESS - ADD THIS
+            // START VERIFICATION PROCESS
             if (signal.getId() != null) {
                 attributeLearning.verifyAndLearn(signal.getId().toString());
             }
         }
 
-        // CAPTURE MISSED OPPORTUNITIES - ADD THIS
+        // CAPTURE MISSED OPPORTUNITIES
         if (signals.isEmpty() && !ta.getMarketRegime().equals(MarketRegime.CHOPPY)) {
             attributeLearning.captureMissedOpportunity(ta, marketTrend, analysisId);
         }
@@ -1627,7 +2051,7 @@ public class ZeroDTEStrategy {
         }
     }
 
-// ================================================================================================
+    // ================================================================================================
     // SIGNAL CREATION AND TRADE MANAGEMENT
     // ================================================================================================
 
@@ -1660,6 +2084,23 @@ public class ZeroDTEStrategy {
             signal.setEntryAssumptionPrice(ta.getCurrentPrice());
             signal.setMarketRegime(ta.getMarketRegime());
             signal.setMarketTrend(marketTrend);
+
+            // Store Greeks from option with proper null checks
+            if (option.getDelta() != null) {
+                signal.setDelta(option.getDelta());
+            }
+            if (option.getGamma() != null) {
+                signal.setGamma(option.getGamma());
+            }
+            if (option.getTheta() != null) {
+                signal.setTheta(option.getTheta());
+            }
+            if (option.getVega() != null) {
+                signal.setVega(option.getVega());
+            }
+            if (option.getImpliedVolatility() != null) {
+                signal.setImpliedVolatility(option.getImpliedVolatility());
+            }
 
             BigDecimal atr = ta.getAverageTrueRange();
             if (atr == null || atr.compareTo(BigDecimal.ZERO) <= 0) {
@@ -1846,8 +2287,12 @@ public class ZeroDTEStrategy {
     private void enrichTradeWithBayesianData(Trade trade, Signal signal) {
         String bayesianConfidence = signal.getMetadata().get("bayesianConfidence");
         if (bayesianConfidence != null) {
-            trade.setBayesianProbability(Double.valueOf(bayesianConfidence));
-            trade.setAdjustedConfidence(Double.valueOf(bayesianConfidence));
+            try {
+                trade.setBayesianProbability(Double.valueOf(bayesianConfidence));
+                trade.setAdjustedConfidence(Double.valueOf(bayesianConfidence));
+            } catch (NumberFormatException e) {
+                log.warn("Invalid bayesian confidence format: {}", bayesianConfidence);
+            }
         }
 
         trade.setSignalConfidence(signal.getConfidence());
@@ -1984,10 +2429,11 @@ public class ZeroDTEStrategy {
                             "Top Factors: %s\n" +
                             "✅ Position LIVE - Monitoring active",
                     signal.getStrategy(), signal.getOptionSymbol(),
-                    signal.getEntryPrice(),
+                    signal.getEntryPrice().doubleValue(),
                     (int)(signal.getConfidence() * 100),
                     (int)(explanation.getExplanationStrength() * 100),
-                    signal.getTargetPrice(), signal.getStopLoss(),
+                    signal.getTargetPrice().doubleValue(),
+                    signal.getStopLoss().doubleValue(),
                     trade.getId(), leaderInfo,
                     String.join(", ", explanation.getTopPositiveFactors())
             ));
@@ -2209,6 +2655,9 @@ public class ZeroDTEStrategy {
         double maxDeviation = 0;
 
         for (int i = data.size() - 5; i < data.size(); i++) {
+            if (data.get(i).getPrice() == null || vwap == null || vwap.compareTo(BigDecimal.ZERO) == 0) {
+                continue;
+            }
             double deviation = Math.abs(
                     data.get(i).getPrice().subtract(vwap)
                             .divide(vwap, 4, RoundingMode.HALF_UP).doubleValue()
@@ -2227,6 +2676,12 @@ public class ZeroDTEStrategy {
         MarketData bar3 = data.get(data.size() - 2);
         MarketData current = data.get(data.size() - 1);
 
+        // Null checks
+        if (bar1.getPrice() == null || bar2.getLow() == null || bar3.getLow() == null ||
+                current.getPrice() == null || current.getLow() == null || vwap == null) {
+            return false;
+        }
+
         boolean wasAbove = bar1.getPrice().compareTo(vwap) > 0;
         boolean brokeBelow = bar2.getLow().compareTo(vwap) < 0 &&
                 bar3.getLow().compareTo(vwap) < 0;
@@ -2243,13 +2698,18 @@ public class ZeroDTEStrategy {
         boolean higherLows = true;
 
         for (int i = data.size() - 4; i < data.size(); i++) {
+            if (data.get(i).getLow() == null || vwap == null) {
+                return false;
+            }
+
             if (data.get(i).getLow().compareTo(vwap) < 0) {
                 allAboveVWAP = false;
                 break;
             }
 
             if (i > data.size() - 4) {
-                if (data.get(i).getLow().compareTo(data.get(i-1).getLow()) <= 0) {
+                if (data.get(i-1).getLow() == null ||
+                        data.get(i).getLow().compareTo(data.get(i-1).getLow()) <= 0) {
                     higherLows = false;
                 }
             }
@@ -2380,8 +2840,8 @@ public class ZeroDTEStrategy {
                     double distanceFromPrice = Math.abs(strike.doubleValue() - currentPrice.doubleValue());
                     return distanceFromPrice <= 0.50;
                 })
-                .filter(option -> option.getVolume() >= 100)
-                .filter(option -> option.getOpenInterest() >= 500)
+                .filter(option -> option.getVolume() != null && option.getVolume() >= 100)
+                .filter(option -> option.getOpenInterest() != null && option.getOpenInterest() >= 500)
                 .sorted((o1, o2) -> {
                     double dist1 = Math.abs(o1.getStrikePrice().doubleValue() - currentPrice.doubleValue());
                     double dist2 = Math.abs(o2.getStrikePrice().doubleValue() - currentPrice.doubleValue());
@@ -2412,7 +2872,10 @@ public class ZeroDTEStrategy {
         if ("NEUTRAL".equals(marketTrend)) {
             return false;
         }
-
+        if ("DOWN".equals(marketTrend) && "CALL".equalsIgnoreCase(option.getType())) {
+            log.warn("BLOCKED: CALL option on DOWN trend");
+            return false;
+        }
         boolean isPut = "PUT".equalsIgnoreCase(option.getType());
         boolean isCall = "CALL".equalsIgnoreCase(option.getType());
         boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
@@ -2422,7 +2885,9 @@ public class ZeroDTEStrategy {
             return false;
         }
 
-        if (option.getVolume() < 10 && option.getOpenInterest() < 50) {
+        Integer volume = option.getVolume();
+        Integer openInterest = option.getOpenInterest();
+        if ((volume == null || volume < 10) && (openInterest == null || openInterest < 50)) {
             return false;
         }
 
@@ -2465,7 +2930,8 @@ public class ZeroDTEStrategy {
     }
 
     private double calculateTradePerformance(Trade trade) {
-        if (trade.getExitPrice() != null && trade.getEntryPrice() != null) {
+        if (trade.getExitPrice() != null && trade.getEntryPrice() != null &&
+                trade.getEntryPrice().compareTo(BigDecimal.ZERO) > 0) {
             return trade.getExitPrice().subtract(trade.getEntryPrice())
                     .divide(trade.getEntryPrice(), 4, RoundingMode.HALF_UP)
                     .multiply(BigDecimal.valueOf(100)).doubleValue();
@@ -3053,10 +3519,9 @@ public class ZeroDTEStrategy {
         }
     }
 
-
     // ================================================================================================
-// META AI LEARNING - SIGNAL ATTRIBUTE OPTIMIZATION
-// ================================================================================================
+    // META AI LEARNING - SIGNAL ATTRIBUTE OPTIMIZATION
+    // ================================================================================================
 
     public class SignalAttributeLearning {
         private final Map<String, AttributePattern> successfulPatterns = new ConcurrentHashMap<>();
@@ -3364,6 +3829,10 @@ public class ZeroDTEStrategy {
             }
         }
     }
+
+    // ================================================================================================
+    // SUPPORTING CLASSES FOR AI LEARNING
+    // ================================================================================================
 
     private static class SignalVerification {
         Long signalId;

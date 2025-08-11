@@ -1,16 +1,16 @@
-# Application Configuration
 spring:
   application:
     name: QQQTradingBot
 
-  # Supabase Database Configuration
   datasource:
-    url: jdbc:postgresql://db.qrezdqexgzuumpyrwhho.supabase.co:5432/postgres?sslmode=require
-    username: postgres
-    password: KeshavamLLC2025
+    url: jdbc:postgresql://aws-0-us-east-2.pooler.supabase.com:6543/postgres?sslmode=require
+    username: postgres.qrezdqexgzuumpyrwhho
+    password: keshavamLLC2025   # Set in environment variable
     driver-class-name: org.postgresql.Driver
+    hikari:
+      data-source-properties:
+        prepareThreshold: 0
 
-  # JPA Configuration
   jpa:
     hibernate:
       ddl-auto: update
@@ -19,6 +19,10 @@ spring:
     properties:
       hibernate:
         format_sql: true
+        use_sql_comments: false
+        prepare_sql: false
+
+
 
   # Task Scheduling
   task:

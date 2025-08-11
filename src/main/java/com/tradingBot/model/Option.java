@@ -56,10 +56,10 @@ public class Option {
 
     // Calculate mid price
     public BigDecimal getMidPrice() {
-        if (bid != null && ask != null) {
-            return bid.add(ask).divide(BigDecimal.valueOf(2), 2, RoundingMode.HALF_UP);
+        if (bid != null && ask != null && bid.compareTo(BigDecimal.ZERO) > 0 && ask.compareTo(BigDecimal.ZERO) > 0) {
+            return bid.add(ask).divide(BigDecimal.valueOf(2), 4, RoundingMode.HALF_UP);
         }
-        return last != null ? last : BigDecimal.ZERO;
+        return last != null && last.compareTo(BigDecimal.ZERO) > 0 ? last : BigDecimal.ZERO;
     }
 
     // Get IV from any available source
@@ -78,11 +78,48 @@ public class Option {
         this.impliedVolatility = iv;
     }
 
+    // GREEKS ACCESSORS - Consistent with Signal entity (using Double)
+    public Double getDelta() {
+        if (greeks != null && greeks.getDelta() != null) {
+            return greeks.getDelta().doubleValue();
+        }
+        return null;
+    }
+
+    public Double getGamma() {
+        if (greeks != null && greeks.getGamma() != null) {
+            return greeks.getGamma().doubleValue();
+        }
+        return null;
+    }
+
+    public Double getTheta() {
+        if (greeks != null) {
+            return greeks.getTheta();
+        }
+        return null;
+    }
+
+    public Double getVega() {
+        if (greeks != null) {
+            return greeks.getVega();
+        }
+        return null;
+    }
+
+    public Double getRho() {
+        if (greeks != null) {
+            return greeks.getRho();
+        }
+        return null;
+    }
+
     // Helper method to check if option data is valid
     public boolean isValid() {
         return bid != null && ask != null && volume != null &&
                 bid.compareTo(BigDecimal.ZERO) > 0 &&
-                ask.compareTo(BigDecimal.ZERO) > 0;
+                ask.compareTo(BigDecimal.ZERO) > 0 &&
+                volume > 0;
     }
 
     // Calculate spread percentage
@@ -100,4 +137,34 @@ public class Option {
                 .doubleValue();
     }
 
+    // Check if Greeks are available
+    public boolean hasGreeks() {
+        return greeks != null &&
+                (greeks.getDelta() != null || greeks.getGamma() != null ||
+                        greeks.getTheta() != null || greeks.getVega() != null);
+    }
+
+    // Moneyness calculation
+    public String getMoneyness(BigDecimal underlyingPrice) {
+        if (strikePrice == null || underlyingPrice == null) return "UNKNOWN";
+
+        boolean isCall = "CALL".equalsIgnoreCase(getType());
+        BigDecimal diff = underlyingPrice.subtract(strikePrice);
+
+        if (isCall) {
+            if (diff.compareTo(BigDecimal.ZERO) > 0) return "ITM";
+            else if (diff.compareTo(BigDecimal.ZERO) == 0) return "ATM";
+            else return "OTM";
+        } else {
+            if (diff.compareTo(BigDecimal.ZERO) < 0) return "ITM";
+            else if (diff.compareTo(BigDecimal.ZERO) == 0) return "ATM";
+            else return "OTM";
+        }
+    }
+
+    // Distance from ATM (absolute value)
+    public BigDecimal getDistanceFromATM(BigDecimal underlyingPrice) {
+        if (strikePrice == null || underlyingPrice == null) return BigDecimal.ZERO;
+        return strikePrice.subtract(underlyingPrice).abs();
+    }
 }

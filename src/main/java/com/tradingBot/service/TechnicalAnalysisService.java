@@ -79,6 +79,7 @@ public class TechnicalAnalysisService {
             return null;
         }
 
+
         //log.info("[TA] Found {} data points for analysis", sessionData.size());
 
         // Get current quote
@@ -95,6 +96,11 @@ public class TechnicalAnalysisService {
         ta.setTimestamp(LocalDateTime.now());
         ta.setCurrentPrice(currentPrice);
         ta.setCurrentVolume(currentVolume);
+
+        if (ta.getRsi() <= 0.0 || ta.getRsi() >= 100.0 || Double.isNaN(ta.getRsi())) {
+            log.error("Invalid RSI detected: {} - aborting analysis", ta.getRsi());
+            return null;
+        }
 
         // Calculate VWAP and bands
         calculateVWAPIndicators(sessionData, ta);
