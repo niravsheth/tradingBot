@@ -93,8 +93,8 @@ public class MarketTrendMonitor {
 
             // Log current state for debugging (every 5 minutes to avoid spam)
             if (now.getMinute() % 5 == 0 && now.getSecond() < 30) {
-                log.info("[TREND-MONITOR] {} - Current: {}, Previous: {}, Changes today: {}",
-                        symbol, currentTrend, state.getPreviousTrend(), state.getChangeCount());
+//                log.info("[TREND-MONITOR] {} - Current: {}, Previous: {}, Changes today: {}",
+//                        symbol, currentTrend, state.getPreviousTrend(), state.getChangeCount());
             }
 
         } catch (Exception e) {
@@ -126,10 +126,10 @@ public class MarketTrendMonitor {
 
             //telegramService.sendMessage(message);
 
-            log.info("[TREND-MONITOR] 🚨 FIRST TREND: {} - {} at {}",
-                    symbol, currentTrend, now.format(TIME_FORMATTER));
+//            log.info("[TREND-MONITOR] 🚨 FIRST TREND: {} - {} at {}",
+//                    symbol, currentTrend, now.format(TIME_FORMATTER));
         } else {
-            log.info("[TREND-MONITOR] Market opened with NEUTRAL trend for {} - no notification sent", symbol);
+ //           log.info("[TREND-MONITOR] Market opened with NEUTRAL trend for {} - no notification sent", symbol);
         }
     }
 
@@ -174,8 +174,8 @@ public class MarketTrendMonitor {
 
         //telegramService.sendMessage(message);
 
-        log.warn("[TREND-MONITOR] 🚨 TREND CHANGE: {} - {} -> {} after {} minutes (Change #{})",
-                symbol, previousTrend, currentTrend, minutesSinceLastChange, state.getChangeCount());
+//        log.warn("[TREND-MONITOR] 🚨 TREND CHANGE: {} - {} -> {} after {} minutes (Change #{})",
+//                symbol, previousTrend, currentTrend, minutesSinceLastChange, state.getChangeCount());
 
         // Alert for rapid trend changes (potential whipsaw)
         if (minutesSinceLastChange < 15 && state.getChangeCount() > 3) {
@@ -188,8 +188,8 @@ public class MarketTrendMonitor {
                     symbol, state.getChangeCount()
             );
 
-            telegramService.sendMessage(whipsawAlert);
-            log.warn("[TREND-MONITOR] 🌪️ WHIPSAW WARNING: {} - {} rapid changes", symbol, state.getChangeCount());
+            //telegramService.sendMessage(whipsawAlert);
+//            log.warn("[TREND-MONITOR] 🌪️ WHIPSAW WARNING: {} - {} rapid changes", symbol, state.getChangeCount());
         }
     }
 
@@ -328,7 +328,7 @@ public class MarketTrendMonitor {
      */
     @Scheduled(cron = "0 25 9 * * MON-FRI", zone = "America/New_York") // 9:25 AM ET weekdays
     public void resetDailyTrendStates() {
-        log.info("[TREND-MONITOR] Resetting trend states for new trading day");
+//        log.info("[TREND-MONITOR] Resetting trend states for new trading day");
         trendStates.clear();
 
 //        telegramService.sendMessage(
@@ -352,6 +352,6 @@ public class MarketTrendMonitor {
         }
 
         //telegramService.sendMessage(summary.toString());
-        log.info("[TREND-MONITOR] End of day summary sent");
+ //       log.info("[TREND-MONITOR] End of day summary sent");
     }
 }

@@ -173,12 +173,12 @@ public class TradierService {
                 return null;
             }
 
-            //           String underlyingSymbol = extractUnderlyingSymbol(optionSymbol);
-//            if (underlyingSymbol == null || underlyingSymbol.isEmpty()) {
-//                log.error("[ORDER][{}] Could not extract underlying symbol from option symbol: {}", trackingId, optionSymbol);
-//                return null;
-//            }
-//            log.debug("[ORDER][{}] Extracted underlying symbol: {} from option symbol: {}", trackingId, underlyingSymbol, optionSymbol);
+            String underlyingSymbol = extractUnderlyingSymbol(optionSymbol);
+            if (underlyingSymbol == null || underlyingSymbol.isEmpty()) {
+                log.error("[ORDER][{}] Could not extract underlying symbol from option symbol: {}", trackingId, optionSymbol);
+                return null;
+            }
+            log.debug("[ORDER][{}] Extracted underlying symbol: {} from option symbol: {}", trackingId, underlyingSymbol, optionSymbol);
 
             String side = orderRequest.getSide();
             if (side == null || side.isEmpty()) {
@@ -210,86 +210,83 @@ public class TradierService {
                 duration = "day";
             }
 
-//            FormBody.Builder formBuilder = new FormBody.Builder()
-//                    .add("class", "option")
-//                    .add("symbol", underlyingSymbol)
-//                    .add("option_symbol", optionSymbol)
-//                    .add("side", side)
-//                    .add("quantity", String.valueOf(quantity))
-//                    .add("type", type)
-//                    .add("duration", duration);
+            FormBody.Builder formBuilder = new FormBody.Builder()
+                    .add("class", "option")
+                    .add("symbol", underlyingSymbol)
+                    .add("option_symbol", optionSymbol)
+                    .add("side", side)
+                    .add("quantity", String.valueOf(quantity))
+                    .add("type", type)
+                    .add("duration", duration);
 
-//            try {
-//                BigDecimal limitPrice = orderRequest.getPrice();
-//                if (limitPrice != null && limitPrice.compareTo(BigDecimal.ZERO) > 0) {
-//                    formBuilder.add("price", limitPrice.toString());
-//                    log.debug("[ORDER][{}] Added limit price: ${}", trackingId, limitPrice);
-//                }
-//            } catch (Exception e) {
-//                log.warn("[ORDER][{}] Failed to retrieve limit price from OrderRequest: {}", trackingId, e.getMessage());
-//            }
-//
-//            RequestBody requestBody = formBuilder.build();
-//            Request request = new Request.Builder()
-//                    .url(baseUrl + "/accounts/" + accountId + "/orders")
-//                    .addHeader("Authorization", "Bearer " + apiKey)
-//                    .addHeader("Accept", "application/json")
-//                    .addHeader("Content-Type", "application/x-www-form-urlencoded")
-//                    .post(requestBody)
-//                    .build();
-//
-//            Response response = client.newCall(request).execute();
-//            String responseBody = response.body().string();
-//
-//            if (!response.isSuccessful()) {
-//                log.error("[ORDER][{}] Failed to place order. Status: {}, Body: {}", trackingId, response.code(), responseBody);
-//                return null;
-//            }
-//
-//            OrderResponse orderResponse = objectMapper.readValue(responseBody, OrderResponse.class);
-//
-//            if (orderResponse == null) {
-//                log.error("[ORDER][{}] Null order response from Tradier", trackingId);
-//                return null;
-//            }
-//
-//            if ("error".equalsIgnoreCase(orderResponse.getStatus())) {
-//                log.error("[ORDER][{}] Order rejected by Tradier: Status = {}", trackingId, orderResponse.getStatus());
-//                return null;
-//            }
-//
-//            if (orderResponse.getOrder() == null) {
-//                log.error("[ORDER][{}] No order object in response", trackingId);
-//                return null;
-//            }
-//
-//            String orderId = orderResponse.getId();
-//            if (orderId == null || orderId.trim().isEmpty()) {
-//                log.error("[ORDER][{}] No valid order ID in response", trackingId);
-//                return null;
-//            }
-//
-//            if ("market".equalsIgnoreCase(type)) {
-//                Thread.sleep(1000);
-//                String orderStatus = getOrderStatus(orderId);
-//                if (!isOrderStatusValid(orderStatus)) {
-//                    log.error("[ORDER][{}] Market order not properly accepted. Status: {}", trackingId, orderStatus);
-//                    return null;
-//                }
-//            }
-//
-//            log.info("[ORDER][{}] ✅ Successfully placed order for {}: Side={}, Quantity={}, Order ID={}",
-//                    trackingId, optionSymbol, side, quantity, orderId);
-//            return orderResponse;
-//
-//        }
+            try {
+                BigDecimal limitPrice = orderRequest.getPrice();
+                if (limitPrice != null && limitPrice.compareTo(BigDecimal.ZERO) > 0) {
+                    formBuilder.add("price", limitPrice.toString());
+                    log.debug("[ORDER][{}] Added limit price: ${}", trackingId, limitPrice);
+                }
+            } catch (Exception e) {
+                log.warn("[ORDER][{}] Failed to retrieve limit price from OrderRequest: {}", trackingId, e.getMessage());
+            }
+
+            RequestBody requestBody = formBuilder.build();
+            Request request = new Request.Builder()
+                    .url(baseUrl + "/accounts/" + accountId + "/orders")
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Accept", "application/json")
+                    .addHeader("Content-Type", "application/x-www-form-urlencoded")
+                    .post(requestBody)
+                    .build();
+
+            Response response = client.newCall(request).execute();
+            String responseBody = response.body().string();
+
+            if (!response.isSuccessful()) {
+                log.error("[ORDER][{}] Failed to place order. Status: {}, Body: {}", trackingId, response.code(), responseBody);
+                return null;
+            }
+
+            OrderResponse orderResponse = objectMapper.readValue(responseBody, OrderResponse.class);
+
+            if (orderResponse == null) {
+                log.error("[ORDER][{}] Null order response from Tradier", trackingId);
+                return null;
+            }
+
+            if ("error".equalsIgnoreCase(orderResponse.getStatus())) {
+                log.error("[ORDER][{}] Order rejected by Tradier: Status = {}", trackingId, orderResponse.getStatus());
+                return null;
+            }
+
+            if (orderResponse.getOrder() == null) {
+                log.error("[ORDER][{}] No order object in response", trackingId);
+                return null;
+            }
+
+            String orderId = orderResponse.getId();
+            if (orderId == null || orderId.trim().isEmpty()) {
+                log.error("[ORDER][{}] No valid order ID in response", trackingId);
+                return null;
+            }
+
+            if ("market".equalsIgnoreCase(type)) {
+                Thread.sleep(1000);
+                String orderStatus = getOrderStatus(orderId);
+                if (!isOrderStatusValid(orderStatus)) {
+                    log.error("[ORDER][{}] Market order not properly accepted. Status: {}", trackingId, orderStatus);
+                    return null;
+                }
+            }
+
+            log.info("[ORDER][{}] ✅ Successfully placed order for {}: Side={}, Quantity={}, Order ID={}",
+                    trackingId, optionSymbol, side, quantity, orderId);
+            return orderResponse;
         }
         catch (Exception e) {
             log.error("[ORDER][{}] ❌ Error placing order for {}: {}", trackingId,
                     orderRequest != null ? orderRequest.getSymbol() : "unknown", e.getMessage(), e);
             return null;
         }
-         return null;
     }
 
     private String getOrderStatus(String orderId) {

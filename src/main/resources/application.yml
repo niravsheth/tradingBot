@@ -3,11 +3,16 @@ spring:
     name: QQQTradingBot
 
   datasource:
-    url: jdbc:postgresql://aws-0-us-east-2.pooler.supabase.com:6543/postgres?sslmode=require
-    username: postgres.qrezdqexgzuumpyrwhho
-    password: keshavamLLC2025   # Set in environment variable
+    url: jdbc:postgresql://34.162.24.223:5432/postgres?sslmode=require
+    username: postgres
+    password: keshavamLLC2025!  # Set in environment variables
     driver-class-name: org.postgresql.Driver
     hikari:
+      maximum-pool-size: 5        # Good for GCP small tier
+      minimum-idle: 1             # Lower idle to avoid consuming all connections
+      connection-timeout: 20000   # 20 seconds
+      idle-timeout: 60000         # 1 minute
+      max-lifetime: 180000        # 3 minutes
       data-source-properties:
         prepareThreshold: 0
 
@@ -21,8 +26,6 @@ spring:
         format_sql: true
         use_sql_comments: false
         prepare_sql: false
-
-
 
   # Task Scheduling
   task:

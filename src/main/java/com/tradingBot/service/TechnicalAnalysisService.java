@@ -97,10 +97,10 @@ public class TechnicalAnalysisService {
         ta.setCurrentPrice(currentPrice);
         ta.setCurrentVolume(currentVolume);
 
-        if (ta.getRsi() <= 0.0 || ta.getRsi() >= 100.0 || Double.isNaN(ta.getRsi())) {
-            log.error("Invalid RSI detected: {} - aborting analysis", ta.getRsi());
-            return null;
-        }
+//        if (ta.getRsi() <= 0.0 || ta.getRsi() >= 100.0 || Double.isNaN(ta.getRsi())) {
+//            log.error("Invalid RSI detected: {} - aborting analysis", ta.getRsi());
+//            return null;
+//        }
 
         // Calculate VWAP and bands
         calculateVWAPIndicators(sessionData, ta);

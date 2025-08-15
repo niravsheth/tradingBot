@@ -213,11 +213,12 @@ public class ZeroDTEStrategy {
 
             // Apply dynamic strike selection based on volatility
             List<Option> selectedStrikes = selectStrikesBasedOnVolatility(qualifiedOptions, ta, analysisId);
+            List<Option> aiStrikes = selectStrikesForAILeaderLag(qualifiedOptions, ta, analysisId);
 
-            log.info("[{}] Analyzing {} selected strikes", analysisId, selectedStrikes.size());
+            log.info("[{}] Analyzing {} selected strikes, {} AI strikes", analysisId, selectedStrikes.size(), aiStrikes.size());
 
-            // PRIORITY 1: AI-POWERED LEADER-LAG STRATEGIES (HIGHEST PRIORITY)
-            List<Signal> leaderLagSignals = analyzeAILeaderLagStrategies(selectedStrikes, ta, marketTrend, analysisId);
+// PRIORITY 1: AI-POWERED LEADER-LAG STRATEGIES (HIGHEST PRIORITY)
+            List<Signal> leaderLagSignals = analyzeAILeaderLagStrategies(aiStrikes, ta, marketTrend, analysisId);
             rawSignals.addAll(leaderLagSignals);
 
             // PRIORITY 2: ADVANCED SIGNALS (with data sufficiency checks)
@@ -299,7 +300,18 @@ public class ZeroDTEStrategy {
             return new ArrayList<>();
         }
     }
+    private List<Option> selectStrikesForAILeaderLag(List<Option> options, TechnicalAnalysis ta, String analysisId) {
+        // More permissive filtering for AI - allows slightly ITM options
+        BigDecimal currentPrice = ta.getCurrentPrice();
 
+        return options.stream()
+                .filter(option -> {
+                    BigDecimal strike = option.getStrikePrice();
+                    BigDecimal distance = strike.subtract(currentPrice).abs();
+                    return distance.compareTo(BigDecimal.valueOf(3.0)) <= 0; // Within $3 of current
+                })
+                .collect(Collectors.toList());
+    }
     public List<Signal> analyzeOptions(String symbol) {
         return analyzeOptions(symbol, "NEUTRAL");
     }
@@ -355,212 +367,212 @@ public class ZeroDTEStrategy {
     // AI-POWERED LEADER-LAG ANALYSIS - ENHANCED FOR INDIVIDUAL STOCKS
     // ================================================================================================
 
-    private List<Signal> analyzeAILeaderLagStrategies(List<Option> options, TechnicalAnalysis ta,
-                                                      String marketTrend, String analysisId) {
-        List<Signal> leaderLagSignals = new ArrayList<>();
-        LocalTime now = LocalTime.now(ET_ZONE);
-        marketTrend = ta.getTrend();
-        try {
-            // Build comprehensive market context for AI with leader stocks
-            MarketContext context = buildEnhancedMarketContext(ta, marketTrend, now, analysisId);
+//    private List<Signal> analyzeAILeaderLagStrategies(List<Option> options, TechnicalAnalysis ta,
+//                                                      String marketTrend, String analysisId) {
+//        List<Signal> leaderLagSignals = new ArrayList<>();
+//        LocalTime now = LocalTime.now(ET_ZONE);
+//        marketTrend = ta.getTrend();
+//        try {
+//            // Build comprehensive market context for AI with leader stocks
+//            MarketContext context = buildEnhancedMarketContext(ta, marketTrend, now, analysisId);
+//
+//            if (context == null) {
+//                log.warn("[AI-LEADER-LAG][{}] Could not build market context - insufficient leader data", analysisId);
+//                return leaderLagSignals;
+//            }
+//
+//            // Use AI to determine optimal strategy
+//            AIDecision aiDecision = aiLearning.decideStrategy(context, analysisId);
+//
+//            if (aiDecision.getStrategy() == LeaderLagStrategy.NONE) {
+//                log.info("[AI-LEADER-LAG][{}] AI decided to skip leader-lag: {}", analysisId, aiDecision.getReasoning());
+//                return leaderLagSignals;
+//            }
+//
+//            // Get leader correlation metrics
+//            LeaderCorrelationMetrics metrics = correlationDetector.getLeaderMetrics(analysisId);
+//
+//            if (metrics == null || metrics.getStrongestCorrelation() < 0.4) {
+//                log.warn("[AI-LEADER-LAG][{}] Insufficient leader correlation ({}%) - AI overridden",
+//                        analysisId, metrics != null ? (int)(metrics.getStrongestCorrelation() * 100) : 0);
+//                return leaderLagSignals;
+//            }
+//
+//            log.info("[AI-LEADER-LAG][{}] 🤖 AI SELECTED: {} (Confidence: {}%)",
+//                    analysisId, aiDecision.getStrategy(), (int)(aiDecision.getConfidence() * 100));
+//            log.info("[AI-LEADER-LAG][{}] 🧠 AI Reasoning: {}", analysisId, aiDecision.getReasoning());
+//            log.info("[AI-LEADER-LAG][{}] 📊 Leader Analysis: {} ({}% corr), QQQ momentum: {}",
+//                    analysisId, metrics.getStrongestLeader(),
+//                    (int)(metrics.getStrongestCorrelation() * 100),
+//                    String.format("%.2f", context.qqqMomentum));
+//
+//            // Generate signals based on AI decision
+//            for (Option option : options) {
+//                if (!quickSignalValidation(option, options, ta, marketTrend, analysisId)) {
+//                    continue;
+//                }
+//
+//                AILeaderLagSignal aiSignal = generateEnhancedAILeaderLagSignal(option, aiDecision, ta, marketTrend, metrics, context);
+//
+//                if (aiSignal != null && aiSignal.getConfidence() >= getAIThreshold(aiDecision.getStrategy(), now)) {
+//                    Signal signal = createAILeaderLagSignal(option, options, ta, aiSignal, marketTrend, analysisId);
+//                    if (signal != null) {
+//                        leaderLagSignals.add(signal);
+//
+//                        log.info("[AI-LEADER-LAG][{}] ✅ {} Signal Generated - Confidence: {}%",
+//                                analysisId, aiDecision.getStrategy(), (int)(aiSignal.getConfidence() * 100));
+//                    }
+//                }
+//            }
+//
+//            return leaderLagSignals;
+//
+//        } catch (Exception e) {
+//            log.error("[AI-LEADER-LAG][{}] Error in AI leader-lag analysis: {}", analysisId, e.getMessage());
+//            return leaderLagSignals;
+//        }
+//    }
 
-            if (context == null) {
-                log.warn("[AI-LEADER-LAG][{}] Could not build market context - insufficient leader data", analysisId);
-                return leaderLagSignals;
-            }
+//    private MarketContext buildEnhancedMarketContext(TechnicalAnalysis ta, String marketTrend, LocalTime now, String analysisId) {
+//        try {
+//            // Get leader stock analysis
+//            Map<String, TechnicalAnalysis> leaderAnalysis = new HashMap<>();
+//            Map<String, Double> leaderMomentum = new HashMap<>();
+//
+//            for (String leaderSymbol : LEADER_STOCKS) {
+//                TechnicalAnalysis leaderTA = technicalAnalysisService.analyze(leaderSymbol);
+//                if (leaderTA != null) {
+//                    leaderAnalysis.put(leaderSymbol, leaderTA);
+//                    leaderMomentum.put(leaderSymbol, leaderTA.getMomentumStrength());
+//                } else {
+//                    log.warn("[AI-CONTEXT][{}] Missing TA for leader stock: {}", analysisId, leaderSymbol);
+//                }
+//            }
+//
+//            // Ensure we have at least 2 leaders with data
+//            if (leaderMomentum.size() < 2) {
+//                log.warn("[AI-CONTEXT][{}] Insufficient leader data: {} of {} leaders",
+//                        analysisId, leaderMomentum.size(), LEADER_STOCKS.size());
+//                return null;
+//            }
+//
+//            // Find strongest leader
+//            String strongestLeader = leaderMomentum.entrySet().stream()
+//                    .max(Map.Entry.comparingByValue(Comparator.comparing(Math::abs)))
+//                    .map(Map.Entry::getKey)
+//                    .orElse("AAPL");
+//
+//            double strongestLeaderMomentum = leaderMomentum.get(strongestLeader);
+//
+//            // Calculate leader-QQQ divergence
+//            double leaderQQQDivergence = Math.abs(strongestLeaderMomentum - ta.getMomentumStrength());
+//
+//            return new MarketContext(
+//                    strongestLeaderMomentum,
+//                    ta.getMomentumStrength(),
+//                    correlationDetector.getLeaderQQQCorrelation(strongestLeader),
+//                    getVixLevel(),
+//                    marketTrend,
+//                    ta.getMarketRegime().toString(),
+//                    now.getHour() * 60 + now.getMinute(),
+//                    LocalDate.now().getDayOfWeek().getValue(),
+//                    ta.getVolumeRatio(),
+//                    leaderQQQDivergence,
+//                    ta.getRsi(),
+//                    ta.getCurrentPrice(),
+//                    strongestLeader
+//            );
+//
+//        } catch (Exception e) {
+//            log.error("[AI-CONTEXT][{}] Error building market context: {}", analysisId, e.getMessage());
+//            return null;
+//        }
+//    }
 
-            // Use AI to determine optimal strategy
-            AIDecision aiDecision = aiLearning.decideStrategy(context, analysisId);
+//    private AILeaderLagSignal generateEnhancedAILeaderLagSignal(Option option, AIDecision aiDecision,
+//                                                                TechnicalAnalysis ta, String marketTrend,
+//                                                                LeaderCorrelationMetrics metrics, MarketContext context) {
+//
+//        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+//        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+//
+//        if (aiDecision.getStrategy() == LeaderLagStrategy.STANDARD) {
+//            // STANDARD: Leader moves against QQQ, expect QQQ to follow
+//            String leader = context.strongestLeader;
+//            double leaderMomentum = context.spyMomentum; // This is actually strongest leader momentum now
+//            double qqqMomentum = context.qqqMomentum;
+//
+//            // Leader bullish, QQQ bearish/neutral -> take QQQ CALL
+//            if (isCall && leaderMomentum > 0.3 && qqqMomentum < 0.1 &&
+//                    (leaderMomentum - qqqMomentum) > 0.2) {
+//                return createStandardAISignal(option, context, metrics, "CALL", aiDecision, leader);
+//            }
+//            // Leader bearish, QQQ bullish/neutral -> take QQQ PUT
+//            else if (isPut && leaderMomentum < -0.3 && qqqMomentum > -0.1 &&
+//                    (qqqMomentum - leaderMomentum) > 0.2) {
+//                return createStandardAISignal(option, context, metrics, "PUT", aiDecision, leader);
+//            }
+//        }
+//        else if (aiDecision.getStrategy() == LeaderLagStrategy.REVERSE) {
+//            // REVERSE: Leader previously drove QQQ, now fading -> bet on QQQ's true direction
+//            double leaderMomentum = context.spyMomentum; // Actually strongest leader
+//            double qqqMomentum = context.qqqMomentum;
+//
+//            // Leader fading from strong bullish, QQQ continuing up -> QQQ CALL
+//            if (isCall && leaderMomentum > 0.1 && leaderMomentum < 0.4 && qqqMomentum > 0.3) {
+//                return createReverseAISignal(option, context, metrics, "CALL", aiDecision);
+//            }
+//            // Leader fading from strong bearish, QQQ continuing down -> QQQ PUT
+//            else if (isPut && leaderMomentum < -0.1 && leaderMomentum > -0.4 && qqqMomentum < -0.3) {
+//                return createReverseAISignal(option, context, metrics, "PUT", aiDecision);
+//            }
+//        }
+//
+//        return null;
+//    }
 
-            if (aiDecision.getStrategy() == LeaderLagStrategy.NONE) {
-                log.info("[AI-LEADER-LAG][{}] AI decided to skip leader-lag: {}", analysisId, aiDecision.getReasoning());
-                return leaderLagSignals;
-            }
+//    private AILeaderLagSignal createStandardAISignal(Option option, MarketContext context,
+//                                                     LeaderCorrelationMetrics metrics, String type,
+//                                                     AIDecision aiDecision, String leader) {
+//        double confidence = aiDecision.getConfidence();
+//
+//        // AI confidence boosts for standard strategy
+//        double leaderMomentum = context.spyMomentum; // Actually leader momentum
+//        double divergence = Math.abs(leaderMomentum - context.qqqMomentum);
+//
+//        if (divergence > 0.4) confidence = Math.min(0.95, confidence * 1.15); // Strong divergence
+//        if (Math.abs(leaderMomentum) > 0.5) confidence = Math.min(0.95, confidence * 1.10); // Strong leader move
+//        if (metrics.getStrongestCorrelation() > 0.7) confidence = Math.min(0.95, confidence * 1.08); // High correlation
+//        if (context.volumeRatio > 1.5) confidence = Math.min(0.95, confidence * 1.05); // Volume confirmation
+//
+//        String strategy = type.equals("CALL") ? "0DTE_AI_LEADER_LAG_CALL" : "0DTE_AI_LEADER_LAG_PUT";
+//        String reason = String.format("🤖 AI Standard: %s momentum %.2f vs QQQ %.2f, correlation %.0f%%, divergence %.2f",
+//                leader, leaderMomentum, context.qqqMomentum, metrics.getStrongestCorrelation() * 100, divergence);
+//
+//        return new AILeaderLagSignal(LeaderLagStrategy.STANDARD, "BUY", strategy, confidence,
+//                metrics.getStrongestCorrelation(), Math.abs(leaderMomentum), reason, aiDecision.getMarketRegime(), leader);
+//    }
 
-            // Get leader correlation metrics
-            LeaderCorrelationMetrics metrics = correlationDetector.getLeaderMetrics(analysisId);
-
-            if (metrics == null || metrics.getStrongestCorrelation() < 0.4) {
-                log.warn("[AI-LEADER-LAG][{}] Insufficient leader correlation ({}%) - AI overridden",
-                        analysisId, metrics != null ? (int)(metrics.getStrongestCorrelation() * 100) : 0);
-                return leaderLagSignals;
-            }
-
-            log.info("[AI-LEADER-LAG][{}] 🤖 AI SELECTED: {} (Confidence: {}%)",
-                    analysisId, aiDecision.getStrategy(), (int)(aiDecision.getConfidence() * 100));
-            log.info("[AI-LEADER-LAG][{}] 🧠 AI Reasoning: {}", analysisId, aiDecision.getReasoning());
-            log.info("[AI-LEADER-LAG][{}] 📊 Leader Analysis: {} ({}% corr), QQQ momentum: {}",
-                    analysisId, metrics.getStrongestLeader(),
-                    (int)(metrics.getStrongestCorrelation() * 100),
-                    String.format("%.2f", context.qqqMomentum));
-
-            // Generate signals based on AI decision
-            for (Option option : options) {
-                if (!quickSignalValidation(option, options, ta, marketTrend, analysisId)) {
-                    continue;
-                }
-
-                AILeaderLagSignal aiSignal = generateEnhancedAILeaderLagSignal(option, aiDecision, ta, marketTrend, metrics, context);
-
-                if (aiSignal != null && aiSignal.getConfidence() >= getAIThreshold(aiDecision.getStrategy(), now)) {
-                    Signal signal = createAILeaderLagSignal(option, options, ta, aiSignal, marketTrend, analysisId);
-                    if (signal != null) {
-                        leaderLagSignals.add(signal);
-
-                        log.info("[AI-LEADER-LAG][{}] ✅ {} Signal Generated - Confidence: {}%",
-                                analysisId, aiDecision.getStrategy(), (int)(aiSignal.getConfidence() * 100));
-                    }
-                }
-            }
-
-            return leaderLagSignals;
-
-        } catch (Exception e) {
-            log.error("[AI-LEADER-LAG][{}] Error in AI leader-lag analysis: {}", analysisId, e.getMessage());
-            return leaderLagSignals;
-        }
-    }
-
-    private MarketContext buildEnhancedMarketContext(TechnicalAnalysis ta, String marketTrend, LocalTime now, String analysisId) {
-        try {
-            // Get leader stock analysis
-            Map<String, TechnicalAnalysis> leaderAnalysis = new HashMap<>();
-            Map<String, Double> leaderMomentum = new HashMap<>();
-
-            for (String leaderSymbol : LEADER_STOCKS) {
-                TechnicalAnalysis leaderTA = technicalAnalysisService.analyze(leaderSymbol);
-                if (leaderTA != null) {
-                    leaderAnalysis.put(leaderSymbol, leaderTA);
-                    leaderMomentum.put(leaderSymbol, leaderTA.getMomentumStrength());
-                } else {
-                    log.warn("[AI-CONTEXT][{}] Missing TA for leader stock: {}", analysisId, leaderSymbol);
-                }
-            }
-
-            // Ensure we have at least 2 leaders with data
-            if (leaderMomentum.size() < 2) {
-                log.warn("[AI-CONTEXT][{}] Insufficient leader data: {} of {} leaders",
-                        analysisId, leaderMomentum.size(), LEADER_STOCKS.size());
-                return null;
-            }
-
-            // Find strongest leader
-            String strongestLeader = leaderMomentum.entrySet().stream()
-                    .max(Map.Entry.comparingByValue(Comparator.comparing(Math::abs)))
-                    .map(Map.Entry::getKey)
-                    .orElse("AAPL");
-
-            double strongestLeaderMomentum = leaderMomentum.get(strongestLeader);
-
-            // Calculate leader-QQQ divergence
-            double leaderQQQDivergence = Math.abs(strongestLeaderMomentum - ta.getMomentumStrength());
-
-            return new MarketContext(
-                    strongestLeaderMomentum,
-                    ta.getMomentumStrength(),
-                    correlationDetector.getLeaderQQQCorrelation(strongestLeader),
-                    getVixLevel(),
-                    marketTrend,
-                    ta.getMarketRegime().toString(),
-                    now.getHour() * 60 + now.getMinute(),
-                    LocalDate.now().getDayOfWeek().getValue(),
-                    ta.getVolumeRatio(),
-                    leaderQQQDivergence,
-                    ta.getRsi(),
-                    ta.getCurrentPrice(),
-                    strongestLeader
-            );
-
-        } catch (Exception e) {
-            log.error("[AI-CONTEXT][{}] Error building market context: {}", analysisId, e.getMessage());
-            return null;
-        }
-    }
-
-    private AILeaderLagSignal generateEnhancedAILeaderLagSignal(Option option, AIDecision aiDecision,
-                                                                TechnicalAnalysis ta, String marketTrend,
-                                                                LeaderCorrelationMetrics metrics, MarketContext context) {
-
-        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
-        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
-
-        if (aiDecision.getStrategy() == LeaderLagStrategy.STANDARD) {
-            // STANDARD: Leader moves against QQQ, expect QQQ to follow
-            String leader = context.strongestLeader;
-            double leaderMomentum = context.spyMomentum; // This is actually strongest leader momentum now
-            double qqqMomentum = context.qqqMomentum;
-
-            // Leader bullish, QQQ bearish/neutral -> take QQQ CALL
-            if (isCall && leaderMomentum > 0.3 && qqqMomentum < 0.1 &&
-                    (leaderMomentum - qqqMomentum) > 0.2) {
-                return createStandardAISignal(option, context, metrics, "CALL", aiDecision, leader);
-            }
-            // Leader bearish, QQQ bullish/neutral -> take QQQ PUT
-            else if (isPut && leaderMomentum < -0.3 && qqqMomentum > -0.1 &&
-                    (qqqMomentum - leaderMomentum) > 0.2) {
-                return createStandardAISignal(option, context, metrics, "PUT", aiDecision, leader);
-            }
-        }
-        else if (aiDecision.getStrategy() == LeaderLagStrategy.REVERSE) {
-            // REVERSE: Leader previously drove QQQ, now fading -> bet on QQQ's true direction
-            double leaderMomentum = context.spyMomentum; // Actually strongest leader
-            double qqqMomentum = context.qqqMomentum;
-
-            // Leader fading from strong bullish, QQQ continuing up -> QQQ CALL
-            if (isCall && leaderMomentum > 0.1 && leaderMomentum < 0.4 && qqqMomentum > 0.3) {
-                return createReverseAISignal(option, context, metrics, "CALL", aiDecision);
-            }
-            // Leader fading from strong bearish, QQQ continuing down -> QQQ PUT
-            else if (isPut && leaderMomentum < -0.1 && leaderMomentum > -0.4 && qqqMomentum < -0.3) {
-                return createReverseAISignal(option, context, metrics, "PUT", aiDecision);
-            }
-        }
-
-        return null;
-    }
-
-    private AILeaderLagSignal createStandardAISignal(Option option, MarketContext context,
-                                                     LeaderCorrelationMetrics metrics, String type,
-                                                     AIDecision aiDecision, String leader) {
-        double confidence = aiDecision.getConfidence();
-
-        // AI confidence boosts for standard strategy
-        double leaderMomentum = context.spyMomentum; // Actually leader momentum
-        double divergence = Math.abs(leaderMomentum - context.qqqMomentum);
-
-        if (divergence > 0.4) confidence = Math.min(0.95, confidence * 1.15); // Strong divergence
-        if (Math.abs(leaderMomentum) > 0.5) confidence = Math.min(0.95, confidence * 1.10); // Strong leader move
-        if (metrics.getStrongestCorrelation() > 0.7) confidence = Math.min(0.95, confidence * 1.08); // High correlation
-        if (context.volumeRatio > 1.5) confidence = Math.min(0.95, confidence * 1.05); // Volume confirmation
-
-        String strategy = type.equals("CALL") ? "0DTE_AI_LEADER_LAG_CALL" : "0DTE_AI_LEADER_LAG_PUT";
-        String reason = String.format("🤖 AI Standard: %s momentum %.2f vs QQQ %.2f, correlation %.0f%%, divergence %.2f",
-                leader, leaderMomentum, context.qqqMomentum, metrics.getStrongestCorrelation() * 100, divergence);
-
-        return new AILeaderLagSignal(LeaderLagStrategy.STANDARD, "BUY", strategy, confidence,
-                metrics.getStrongestCorrelation(), Math.abs(leaderMomentum), reason, aiDecision.getMarketRegime(), leader);
-    }
-
-    private AILeaderLagSignal createReverseAISignal(Option option, MarketContext context,
-                                                    LeaderCorrelationMetrics metrics, String type, AIDecision aiDecision) {
-        double confidence = aiDecision.getConfidence();
-
-        // AI confidence boosts for reverse strategy
-        double leaderFade = 0.5 - Math.abs(context.spyMomentum); // How much leader has faded
-        double qqqStrength = Math.abs(context.qqqMomentum);
-
-        if (leaderFade > 0.3) confidence = Math.min(0.95, confidence * 1.12); // Leader fading
-        if (qqqStrength > 0.4) confidence = Math.min(0.95, confidence * 1.15); // QQQ strong momentum
-        if (context.timeOfDay > 930) confidence = Math.min(0.95, confidence * 1.10); // Power hour boost
-        if (metrics.getStrongestCorrelation() > 0.6) confidence = Math.min(0.95, confidence * 1.05);
-
-        String strategy = type.equals("CALL") ? "0DTE_AI_REVERSE_LEADER_LAG_CALL" : "0DTE_AI_REVERSE_LEADER_LAG_PUT";
-        String reason = String.format("🤖 AI Reverse: %s fading %.2f, QQQ continuing %.2f, correlation %.0f%%",
-                context.strongestLeader, context.spyMomentum, context.qqqMomentum, metrics.getStrongestCorrelation() * 100);
-
-        return new AILeaderLagSignal(LeaderLagStrategy.REVERSE, "BUY", strategy, confidence,
-                metrics.getStrongestCorrelation(), qqqStrength, reason, aiDecision.getMarketRegime(), context.strongestLeader);
-    }
+//    private AILeaderLagSignal createReverseAISignal(Option option, MarketContext context,
+//                                                    LeaderCorrelationMetrics metrics, String type, AIDecision aiDecision) {
+//        double confidence = aiDecision.getConfidence();
+//
+//        // AI confidence boosts for reverse strategy
+//        double leaderFade = 0.5 - Math.abs(context.spyMomentum); // How much leader has faded
+//        double qqqStrength = Math.abs(context.qqqMomentum);
+//
+//        if (leaderFade > 0.3) confidence = Math.min(0.95, confidence * 1.12); // Leader fading
+//        if (qqqStrength > 0.4) confidence = Math.min(0.95, confidence * 1.15); // QQQ strong momentum
+//        if (context.timeOfDay > 930) confidence = Math.min(0.95, confidence * 1.10); // Power hour boost
+//        if (metrics.getStrongestCorrelation() > 0.6) confidence = Math.min(0.95, confidence * 1.05);
+//
+//        String strategy = type.equals("CALL") ? "0DTE_AI_REVERSE_LEADER_LAG_CALL" : "0DTE_AI_REVERSE_LEADER_LAG_PUT";
+//        String reason = String.format("🤖 AI Reverse: %s fading %.2f, QQQ continuing %.2f, correlation %.0f%%",
+//                context.strongestLeader, context.spyMomentum, context.qqqMomentum, metrics.getStrongestCorrelation() * 100);
+//
+//        return new AILeaderLagSignal(LeaderLagStrategy.REVERSE, "BUY", strategy, confidence,
+//                metrics.getStrongestCorrelation(), qqqStrength, reason, aiDecision.getMarketRegime(), context.strongestLeader);
+//    }
 
     private Signal createAILeaderLagSignal(Option option, List<Option> allOptions, TechnicalAnalysis ta,
                                            AILeaderLagSignal aiSignal, String marketTrend, String analysisId) {
@@ -641,18 +653,18 @@ public class ZeroDTEStrategy {
                 .setScale(2, RoundingMode.HALF_UP);
     }
 
-    private double getAIThreshold(LeaderLagStrategy strategy, LocalTime now) {
-        boolean isPowerHour = now.isAfter(POWER_HOUR_START);
-
-        switch (strategy) {
-            case STANDARD:
-                return isPowerHour ? 0.80 : 0.70; // Lower threshold - AI is smart
-            case REVERSE:
-                return isPowerHour ? 0.75 : 0.80; // Reverse easier in power hour
-            default:
-                return 0.85;
-        }
-    }
+//    private double getAIThreshold(LeaderLagStrategy strategy, LocalTime now) {
+//        boolean isPowerHour = now.isAfter(POWER_HOUR_START);
+//
+//        switch (strategy) {
+//            case STANDARD:
+//                return isPowerHour ? 0.80 : 0.70; // Lower threshold - AI is smart
+//            case REVERSE:
+//                return isPowerHour ? 0.75 : 0.80; // Reverse easier in power hour
+//            default:
+//                return 0.85;
+//        }
+//    }
 
     private List<Signal> applyLateSessionFiltering(List<Signal> signals, String analysisId) {
         List<Signal> filtered = signals.stream()
@@ -881,7 +893,7 @@ public class ZeroDTEStrategy {
 
             // 4. GREEKS VALIDATION
             GreeksValidator.GreeksValidationResult greeksValidation =
-                    greeksValidator.validateGreeks(signal, analysisId);
+                    greeksValidator.validateGreeks(signal, signal.getConfidence(), analysisId);
 
             if (!greeksValidation.isValid) {
                 log.warn("[EXECUTION][{}] ❌ Greeks validation failed: {}",
@@ -1151,7 +1163,7 @@ public class ZeroDTEStrategy {
             }
         }
 
-        public GreeksValidationResult validateGreeks(Signal signal, String analysisId) {
+        public GreeksValidationResult validateGreeks(Signal signal, double confidence, String analysisId) {
             try {
                 LocalTime now = LocalTime.now(ET_ZONE);
                 long minutesToClose = Duration.between(now, LocalTime.of(16, 0)).toMinutes();
@@ -1178,24 +1190,43 @@ public class ZeroDTEStrategy {
                         signal.getStrategy().contains("ORB");
                 boolean isReversion = signal.getStrategy().contains("REVERSION");
 
-                // DELTA VALIDATION - FIXED: Proper double handling
+                // CONFIDENCE-BASED MULTIPLIERS
+                double deltaMultiplier = 1.0;
+                double thetaMultiplier = 1.0;
+                double gammaMultiplier = 1.0;
+
+                if (confidence >= 0.90) {
+                    deltaMultiplier = 1.4;   // 40% more lenient
+                    thetaMultiplier = 1.3;   // 30% more lenient
+                    gammaMultiplier = 1.3;
+                    log.info("[GREEKS-VALIDATOR][{}] HIGH CONFIDENCE ({}%) - Relaxed Greeks thresholds",
+                            analysisId, (int)(confidence * 100));
+                } else if (confidence >= 0.80) {
+                    deltaMultiplier = 1.2;   // 20% more lenient
+                    thetaMultiplier = 1.15;  // 15% more lenient
+                    gammaMultiplier = 1.15;
+                    log.info("[GREEKS-VALIDATOR][{}] ELEVATED CONFIDENCE ({}%) - Moderately relaxed Greeks",
+                            analysisId, (int)(confidence * 100));
+                }
+
+                // DELTA VALIDATION with confidence adjustment
                 double minDelta, maxDelta;
                 if (minutesToClose < 120) { // Final 2 hours
                     minDelta = 0.30;
-                    maxDelta = 0.45;
+                    maxDelta = 0.45 * deltaMultiplier;
                 } else if (now.isBefore(LocalTime.of(11, 0))) { // Morning
                     minDelta = isBreakout ? 0.20 : 0.25;
-                    maxDelta = 0.50;
+                    maxDelta = 0.50 * deltaMultiplier;
                 } else { // Midday
                     minDelta = 0.25;
-                    maxDelta = 0.45;
+                    maxDelta = 0.45 * deltaMultiplier;
                 }
 
                 // Strategy adjustments
                 if (isBreakout) minDelta -= 0.05;
                 if (isReversion) {
                     minDelta = 0.35;
-                    maxDelta = 0.45;
+                    maxDelta = 0.45 * deltaMultiplier;
                 }
 
                 double deltaAbs = Math.abs(delta);
@@ -1211,15 +1242,15 @@ public class ZeroDTEStrategy {
                                     deltaAbs, maxDelta));
                 }
 
-                // GAMMA VALIDATION - FIXED: Proper double handling
-                double maxGamma = minutesToClose < 60 ? 0.10 : // Final hour
-                        minutesToClose < 120 ? 0.12 : // Final 2 hours
-                                0.15; // Earlier
+                // GAMMA VALIDATION with confidence adjustment
+                double maxGamma = minutesToClose < 60 ? 0.10 * gammaMultiplier : // Final hour
+                        minutesToClose < 120 ? 0.12 * gammaMultiplier : // Final 2 hours
+                                0.15 * gammaMultiplier; // Earlier
 
                 double gammaAbs = Math.abs(gamma);
                 if (gammaAbs > maxGamma) {
-                    // Extra strict for ultra-high gamma
-                    if (gammaAbs > 0.20) {
+                    // Extra strict for ultra-high gamma (even with confidence)
+                    if (gammaAbs > 0.20 * gammaMultiplier) {
                         return new GreeksValidationResult(false,
                                 String.format("Gamma too high (%.3f) - position unstable", gammaAbs));
                     }
@@ -1230,24 +1261,25 @@ public class ZeroDTEStrategy {
                     }
                 }
 
-                // GAMMA/DELTA RATIO - FIXED: Proper division with null check
+                // GAMMA/DELTA RATIO with confidence adjustment
                 if (deltaAbs > 0.001) { // Avoid division by very small numbers
                     double gammaDeltaRatio = gammaAbs / deltaAbs;
-                    if (gammaDeltaRatio > 0.5) {
+                    double maxGammaDeltaRatio = 0.5 * gammaMultiplier;
+                    if (gammaDeltaRatio > maxGammaDeltaRatio) {
                         return new GreeksValidationResult(false,
                                 String.format("Gamma/Delta ratio too high (%.2f) - unstable position", gammaDeltaRatio));
                     }
                 }
 
-                // THETA VALIDATION - FIXED: Proper calculation with null checks
+                // THETA VALIDATION with confidence adjustment
                 double thetaAbs = Math.abs(theta);
                 double optionPriceDouble = optionPrice.doubleValue();
 
                 if (optionPriceDouble > 0.001) { // Avoid division by very small numbers
                     double thetaRatio = thetaAbs / optionPriceDouble;
-                    double maxThetaRatio = minutesToClose < 60 ? 0.30 : // 30% in final hour
-                            minutesToClose < 120 ? 0.40 : // 40% in final 2 hours
-                                    0.50; // 50% earlier
+                    double maxThetaRatio = minutesToClose < 60 ? 0.30 * thetaMultiplier : // 30% in final hour
+                            minutesToClose < 120 ? 0.40 * thetaMultiplier : // 40% in final 2 hours
+                                    0.50 * thetaMultiplier; // 50% earlier
 
                     if (thetaRatio > maxThetaRatio) {
                         return new GreeksValidationResult(false,
@@ -1257,8 +1289,8 @@ public class ZeroDTEStrategy {
                 }
 
                 // All checks passed
-                log.info("[GREEKS-VALIDATOR][{}] Greeks validated - Delta: {:.3f}, Gamma: {:.3f}, Theta: {:.3f}",
-                        analysisId, deltaAbs, gammaAbs, thetaAbs);
+                log.info("[GREEKS-VALIDATOR][{}] Greeks validated - Delta: {:.3f}, Gamma: {:.3f}, Theta: {:.3f}, Confidence: {}%",
+                        analysisId, deltaAbs, gammaAbs, thetaAbs, (int)(confidence * 100));
 
                 return new GreeksValidationResult(true, "Greeks within acceptable ranges");
 
@@ -2244,6 +2276,16 @@ public class ZeroDTEStrategy {
         trade.setOptionSymbol(signal.getOptionSymbol());
         trade.setStrategy(signal.getStrategy());
         trade.setQuantity(1);
+        trade.setActualQuantity(1);
+
+        // Extract option details
+        Option option = getOptionFromSignal(signal, null); // You'll need to pass options list
+        if (option != null) {
+            trade.setStrikePrice(option.getStrikePrice());
+            trade.setSide(option.getType()); // CALL or PUT
+            trade.setType(option.getType());
+            trade.setVolume(option.getVolume());
+        }
         trade.setEntryPrice(fillPrice);
         trade.setEntryTime(LocalDateTime.now());
         trade.setCreatedAt(ZonedDateTime.now());
@@ -2252,8 +2294,6 @@ public class ZeroDTEStrategy {
         trade.setTargetPrice(signal.getTargetPrice());
         trade.setStopLoss(signal.getStopLoss());
 
-        String orderId = signal.getMetadata().get("orderId");
-        trade.setOrderId(orderId);
         trade.setSignalId(signal.getId());
         trade.setOrderStatus("FILLED");
         trade.setOrderType("MARKET");
@@ -2270,8 +2310,224 @@ public class ZeroDTEStrategy {
         trade.setTheta(signal.getTheta());
         trade.setVega(signal.getVega());
 
-        BigDecimal positionValue = fillPrice.multiply(BigDecimal.valueOf(100));
+        trade.setAction("BUY");
+
+        // =====================================
+        // PRICING INFORMATION
+        // =====================================
+        trade.setEntryPrice(fillPrice);
+        trade.setCurrentPrice(fillPrice);
+        trade.setFillPrice(fillPrice);
+        trade.setExecutionPrice(fillPrice);
+        trade.setTargetPrice(signal.getTargetPrice());
+        trade.setOriginalTarget(signal.getTargetPrice());
+        trade.setStopLoss(signal.getStopLoss());
+        trade.setOriginalStop(signal.getStopLoss());
+
+        // Get bid/ask data from fresh quote
+        try {
+            QuoteResponse quote = tradierService.getQuote(signal.getOptionSymbol());
+            if (quote != null && quote.getQuote() != null) {
+                Quote q = quote.getQuote();
+                trade.setBidAtEntry(q.getBid());
+                trade.setAskAtEntry(q.getAsk());
+                if (q.getBid() != null && q.getAsk() != null) {
+                    BigDecimal spread = q.getAsk().subtract(q.getBid());
+                    trade.setSpreadAtEntry(spread);
+                    // Calculate spread percentage
+                    if (fillPrice.compareTo(BigDecimal.ZERO) > 0) {
+                        double spreadPercent = spread.divide(fillPrice, 4, RoundingMode.HALF_UP)
+                                .multiply(BigDecimal.valueOf(100)).doubleValue();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Could not get bid/ask data for trade creation: {}", e.getMessage());
+        }
+
+        // Initialize profit tracking
+        trade.setRealizedPnl(BigDecimal.ZERO);
+        trade.setUnrealizedPnl(BigDecimal.ZERO);
+        trade.setMaxProfitReached(BigDecimal.ZERO);
+        trade.setMaxDrawdown(BigDecimal.ZERO);
+        trade.setHighestPrice(fillPrice);
+        trade.setLowestPrice(fillPrice);
+
+        // =====================================
+        // TIMESTAMPS
+        // =====================================
+        LocalDateTime now = LocalDateTime.now();
+        ZonedDateTime zonedNow = ZonedDateTime.now();
+
+        trade.setCreatedAt(zonedNow);
+        trade.setEntryTime(now);
+        trade.setSignalGeneratedAt(signal.getCreatedAt());
+        trade.setExecutionAttemptedAt(now);
+        trade.setOrderFilledAt(now);
+        trade.setLastSyncTime(now);
+
+        // =====================================
+        // EXECUTION AND ORDER TRACKING
+        // =====================================
+        String orderId = signal.getMetadata().get("orderId");
+        trade.setOrderId(orderId);
+        trade.setOrderStatus("FILLED");
+        trade.setOrderType("MARKET");
+        trade.setOrderSide("buy_to_open");
+        trade.setOrderDuration("DAY");
+        trade.setRetryCount(0);
+
+        // =====================================
+        // MARKET CONTEXT FIELDS
+        // =====================================
+        trade.setMarketTrend(signal.getMarketTrend());
+        trade.setMarketRegime(signal.getMarketRegime());
+        trade.setTimeSlot(determineTimeSlot(LocalTime.now()));
+
+        // Get underlying price (QQQ current price)
+        try {
+            TechnicalAnalysis ta = technicalAnalysisService.analyze(signal.getSymbol());
+            if (ta != null) {
+                trade.setUnderlyingPriceAtEntry(ta.getCurrentPrice());
+                trade.setMarketTrendStrength(ta.getStrength());
+            }
+        } catch (Exception e) {
+            log.debug("Could not get underlying price for trade: {}", e.getMessage());
+        }
+
+        // Market indicators
+        trade.setVixAtEntry(getVixLevel());
+        trade.setMarketBreadthAtEntry(calculateMarketBreadth());
+
+        // =====================================
+        // EXPIRATION AND TIME DECAY
+        // =====================================
+        LocalDate expirationDate = extractExpirationFromOptionSymbol(signal.getOptionSymbol());
+        trade.setExpirationDate(expirationDate.atTime(16, 0).atZone(ET_ZONE));
+
+        // Calculate time to expiry
+        LocalDateTime expiryTime = expirationDate.atTime(16, 0);
+        long minutesToExpiry = Duration.between(now, expiryTime).toMinutes();
+        trade.setMinutesToExpiry((int) minutesToExpiry);
+        trade.setDaysToExpiry(signal.getDaysToExpiry());
+
+        // Time decay factor (0DTE has high decay)
+        double timeDecayFactor = minutesToExpiry > 0 ? 1.0 / minutesToExpiry : 1.0;
+        trade.setTimeDecayFactor(timeDecayFactor);
+
+        // =====================================
+        // OPTION GREEKS
+        // =====================================
+        trade.setImpliedVolatility(signal.getImpliedVolatility());
+        trade.setDelta(signal.getDelta());
+        trade.setGamma(signal.getGamma());
+        trade.setTheta(signal.getTheta());
+        trade.setVega(signal.getVega());
+        trade.setRho(signal.getRho());
+
+        // =====================================
+        // TECHNICAL ANALYSIS DATA
+        // =====================================
+        try {
+            TechnicalAnalysis ta = technicalAnalysisService.analyze(signal.getSymbol());
+            if (ta != null) {
+                trade.setVolumeRatio(ta.getVolumeRatio());
+                trade.setMomentumStrength(ta.getMomentumStrength());
+                trade.setRsiAtEntry(ta.getRsi());
+
+                // VWAP deviation
+                if (ta.getVwap() != null && ta.getCurrentPrice() != null) {
+                    double vwapDeviation = ta.getCurrentPrice().subtract(ta.getVwap())
+                            .divide(ta.getVwap(), 4, RoundingMode.HALF_UP).doubleValue();
+                    trade.setVwapDeviation(vwapDeviation);
+                }
+
+                // ATR ratio
+                if (ta.getAverageTrueRange() != null && ta.getCurrentPrice() != null) {
+                    double atrRatio = ta.getAverageTrueRange()
+                            .divide(ta.getCurrentPrice(), 4, RoundingMode.HALF_UP).doubleValue();
+                    trade.setAtrRatio(atrRatio);
+                }
+
+                // MACD signal
+                if (ta.getMacdSignal() != null) {
+                    try {
+                        trade.setMacdAtEntry(Double.parseDouble(ta.getMacdSignal()));
+                    } catch (NumberFormatException e) {
+                        // MACD signal might be text like "BUY" or "SELL"
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("Could not populate technical analysis data: {}", e.getMessage());
+        }
+
+        // =====================================
+        // RISK MANAGEMENT
+        // =====================================
+        BigDecimal positionValue = fillPrice.multiply(BigDecimal.valueOf(100)); // Options are 100 shares
         trade.setMaxRisk(positionValue);
+        trade.setMaxProfitPotential(signal.getTargetPrice().multiply(BigDecimal.valueOf(100)));
+
+        // Calculate risk/reward ratio
+        if (signal.getStopLoss() != null && signal.getStopLoss().compareTo(BigDecimal.ZERO) > 0) {
+            BigDecimal risk = fillPrice.subtract(signal.getStopLoss());
+            BigDecimal reward = signal.getTargetPrice().subtract(fillPrice);
+            if (risk.compareTo(BigDecimal.ZERO) > 0) {
+                double riskRewardRatio = reward.divide(risk, 4, RoundingMode.HALF_UP).doubleValue();
+                trade.setRiskRewardRatio(riskRewardRatio);
+            }
+        }
+
+        // =====================================
+        // BAYESIAN AND ML DATA
+        // =====================================
+        trade.setSignalConfidence(signal.getConfidence());
+        trade.setOriginalConfidence(signal.getConfidence());
+
+        // Expected value based on confidence and risk/reward
+        if (trade.getRiskRewardRatio() != null) {
+            double expectedValue = (signal.getConfidence() * trade.getRiskRewardRatio()) -
+                    ((1 - signal.getConfidence()) * 1.0);
+            trade.setExpectedValue(expectedValue);
+        }
+
+        // =====================================
+        // TRADE STATUS AND MANAGEMENT
+        // =====================================
+        trade.setStatus("OPEN");
+        trade.setAutoClosed(false);
+        trade.setManualIntervention(false);
+        trade.setTrailingActivated(false);
+        trade.setStopAdjustmentsCount(0);
+        trade.setTargetAdjustmentsCount(0);
+
+        // =====================================
+        // LINKING AND TRACKING
+        // =====================================
+        trade.setSignalId(signal.getId());
+        trade.setStrategyInstanceId(analysisId);
+        trade.setExecutionSessionId(UUID.randomUUID().toString().substring(0, 8));
+
+        // =====================================
+        // LEARNING AND ADAPTATION
+        // =====================================
+        String learningPhase = signal.getMetadata().get("learningPhase");
+        trade.setLearningPhase(learningPhase != null ? learningPhase : "MARKET_ONLY");
+        trade.setModelVersion("1.0");
+        trade.setFeatureSetVersion("2024.1");
+
+        // =====================================
+        // POSITION MANAGEMENT
+        // =====================================
+        // Assume 1% of portfolio per trade (adjust based on your risk management)
+        trade.setPositionSizePercentage(1.0);
+        trade.setPortfolioHeat(calculateCurrentPortfolioHeat());
+
+        log.info("[TRADE-CREATE][{}] Created comprehensive trade: {} - Status: OPEN with {} populated fields",
+                analysisId, trade.getOptionSymbol(), countPopulatedFields(trade));
+
+
         trade.setMaxProfitPotential(signal.getTargetPrice().multiply(BigDecimal.valueOf(100)));
 
         trade.setSignalGeneratedAt(signal.getCreatedAt());
@@ -2282,6 +2538,42 @@ public class ZeroDTEStrategy {
                 analysisId, trade.getOptionSymbol());
 
         return trade;
+    }
+
+    // Helper method to count populated fields for logging
+    private int countPopulatedFields(Trade trade) {
+        int count = 0;
+        java.lang.reflect.Field[] fields = Trade.class.getDeclaredFields();
+
+        for (java.lang.reflect.Field field : fields) {
+            field.setAccessible(true);
+            try {
+                Object value = field.get(trade);
+                if (value != null) {
+                    if (value instanceof String && !((String) value).isEmpty()) count++;
+                    else if (!(value instanceof String)) count++;
+                }
+            } catch (IllegalAccessException e) {
+                // Ignore
+            }
+        }
+        return count;
+    }
+
+    // Helper method to calculate current portfolio heat
+    private double calculateCurrentPortfolioHeat() {
+        try {
+            // Count open trades
+            long openTrades = tradeRepository.findAll().stream()
+                    .filter(trade -> "OPEN".equals(trade.getStatus()))
+                    .count();
+
+            // Simple calculation - adjust based on your risk management
+            return Math.min(openTrades * 1.0, 10.0); // Max 10% portfolio heat
+
+        } catch (Exception e) {
+            return 1.0; // Default to 1% if calculation fails
+        }
     }
 
     private void enrichTradeWithBayesianData(Trade trade, Signal signal) {
@@ -2872,10 +3164,10 @@ public class ZeroDTEStrategy {
         if ("NEUTRAL".equals(marketTrend)) {
             return false;
         }
-        if ("DOWN".equals(marketTrend) && "CALL".equalsIgnoreCase(option.getType())) {
-            log.warn("BLOCKED: CALL option on DOWN trend");
-            return false;
-        }
+//        if ("DOWN".equals(marketTrend) && "CALL".equalsIgnoreCase(option.getType())) {
+//            log.warn("BLOCKED: CALL option on DOWN trend");
+//            return false;
+//        }
         boolean isPut = "PUT".equalsIgnoreCase(option.getType());
         boolean isCall = "CALL".equalsIgnoreCase(option.getType());
         boolean aligned = (isPut && "DOWN".equals(marketTrend)) || (isCall && "UP".equals(marketTrend));
@@ -3147,18 +3439,18 @@ public class ZeroDTEStrategy {
             }
         }
 
-        private MarketFeatures extractFeatures(MarketContext context) {
-            return new MarketFeatures(
-                    context.spyMomentum, // This is actually strongest leader momentum
-                    context.qqqMomentum,
-                    context.correlation,
-                    context.vixLevel,
-                    context.timeOfDay,
-                    context.dayOfWeek,
-                    context.volumeRatio,
-                    context.momentumDivergence
-            );
-        }
+//        private MarketFeatures extractFeatures(MarketContext context) {
+//            return new MarketFeatures(
+//                    context.spyMomentum, // This is actually strongest leader momentum
+//                    context.qqqMomentum,
+//                    context.correlation,
+//                    context.vixLevel,
+//                    context.timeOfDay,
+//                    context.dayOfWeek,
+//                    context.volumeRatio,
+//                    context.momentumDivergence
+//            );
+//        }
 
         private String classifyRegime(MarketFeatures features) {
             if (features.momentumDivergence > 0.4) return "MOMENTUM_DIVERGENCE";
@@ -3372,25 +3664,25 @@ public class ZeroDTEStrategy {
     private enum LeaderLagStrategy { STANDARD, REVERSE, NONE }
     private enum VWAPPattern { NONE, COMPRESSION, FAILED_BREAKDOWN, STAIR_STEP }
 
-    @Getter @Setter
-    private static class MarketContext {
-        final double spyMomentum, qqqMomentum, correlation, vixLevel;
-        final String marketTrend, volatilityRegime, strongestLeader;
-        final int timeOfDay, dayOfWeek;
-        final double volumeRatio, momentumDivergence, rsi;
-        final BigDecimal currentPrice;
-
-        public MarketContext(double spyMomentum, double qqqMomentum, double correlation, double vixLevel,
-                             String marketTrend, String volatilityRegime, int timeOfDay, int dayOfWeek,
-                             double volumeRatio, double momentumDivergence, double rsi, BigDecimal currentPrice,
-                             String strongestLeader) {
-            this.spyMomentum = spyMomentum; this.qqqMomentum = qqqMomentum; this.correlation = correlation;
-            this.vixLevel = vixLevel; this.marketTrend = marketTrend; this.volatilityRegime = volatilityRegime;
-            this.timeOfDay = timeOfDay; this.dayOfWeek = dayOfWeek; this.volumeRatio = volumeRatio;
-            this.momentumDivergence = momentumDivergence; this.rsi = rsi; this.currentPrice = currentPrice;
-            this.strongestLeader = strongestLeader;
-        }
-    }
+//    @Getter @Setter
+//    private static class MarketContext {
+//        final double spyMomentum, qqqMomentum, correlation, vixLevel;
+//        final String marketTrend, volatilityRegime, strongestLeader;
+//        final int timeOfDay, dayOfWeek;
+//        final double volumeRatio, momentumDivergence, rsi;
+//        final BigDecimal currentPrice;
+//
+//        public MarketContext(double spyMomentum, double qqqMomentum, double correlation, double vixLevel,
+//                             String marketTrend, String volatilityRegime, int timeOfDay, int dayOfWeek,
+//                             double volumeRatio, double momentumDivergence, double rsi, BigDecimal currentPrice,
+//                             String strongestLeader) {
+//            this.spyMomentum = spyMomentum; this.qqqMomentum = qqqMomentum; this.correlation = correlation;
+//            this.vixLevel = vixLevel; this.marketTrend = marketTrend; this.volatilityRegime = volatilityRegime;
+//            this.timeOfDay = timeOfDay; this.dayOfWeek = dayOfWeek; this.volumeRatio = volumeRatio;
+//            this.momentumDivergence = momentumDivergence; this.rsi = rsi; this.currentPrice = currentPrice;
+//            this.strongestLeader = strongestLeader;
+//        }
+//    }
 
     @Getter @Setter
     private static class AIDecision {
@@ -3870,5 +4162,436 @@ public class ZeroDTEStrategy {
         double totalPnL = 0.0;
         LocalDateTime lastSeen;
         TechnicalAttributes idealAttributes;
+    }
+
+
+    // ================================================================================================
+// FIXED AI-POWERED LEADER-LAG ANALYSIS - PROPER TREND FOLLOWING & CONFIDENCE
+// ================================================================================================
+
+    private List<Signal> analyzeAILeaderLagStrategies(List<Option> options, TechnicalAnalysis ta,
+                                                      String marketTrend, String analysisId) {
+        List<Signal> leaderLagSignals = new ArrayList<>();
+        LocalTime now = LocalTime.now(ET_ZONE);
+
+        // FIXED: Use actual market trend from TA
+        String actualMarketTrend = ta.getTrend();
+
+        try {
+            // Build comprehensive market context for AI with leader stocks
+            MarketContext context = buildEnhancedMarketContext(ta, actualMarketTrend, now, analysisId);
+
+            if (context == null) {
+                log.warn("[AI-LEADER-LAG][{}] Could not build market context - insufficient leader data", analysisId);
+                return leaderLagSignals;
+            }
+
+            // Use AI to determine optimal strategy
+            AIDecision aiDecision = aiLearning.decideStrategy(context, analysisId);
+
+            if (aiDecision.getStrategy() == LeaderLagStrategy.NONE) {
+                log.info("[AI-LEADER-LAG][{}] AI decided to skip leader-lag: {}", analysisId, aiDecision.getReasoning());
+                return leaderLagSignals;
+            }
+
+            // Get leader correlation metrics
+            LeaderCorrelationMetrics metrics = correlationDetector.getLeaderMetrics(analysisId);
+
+            if (metrics == null || metrics.getStrongestCorrelation() < 0.4) {
+                log.warn("[AI-LEADER-LAG][{}] Insufficient leader correlation ({}%) - AI overridden",
+                        analysisId, metrics != null ? (int)(metrics.getStrongestCorrelation() * 100) : 0);
+                return leaderLagSignals;
+            }
+
+            log.info("[AI-LEADER-LAG][{}] 🤖 AI SELECTED: {} (Confidence: {}%)",
+                    analysisId, aiDecision.getStrategy(), (int)(aiDecision.getConfidence() * 100));
+            log.info("[AI-LEADER-LAG][{}] 🧠 AI Reasoning: {}", analysisId, aiDecision.getReasoning());
+            log.info("[AI-LEADER-LAG][{}] 📊 Leader Analysis: {} ({}% corr), QQQ momentum: {}",
+                    analysisId, metrics.getStrongestLeader(),
+                    (int)(metrics.getStrongestCorrelation() * 100),
+                    String.format("%.2f", context.qqqMomentum));
+
+            // Generate signals based on AI decision with PROPER TREND FOLLOWING
+            for (Option option : options) {
+                if (!quickSignalValidation(option, options, ta, actualMarketTrend, analysisId)) {
+                    continue;
+                }
+
+                AILeaderLagSignal aiSignal = generateEnhancedAILeaderLagSignal(
+                        option, aiDecision, ta, actualMarketTrend, metrics, context);
+
+                if (aiSignal != null && aiSignal.getConfidence() >= getAIThreshold(aiDecision.getStrategy(), now)) {
+                    Signal signal = createAILeaderLagSignal(option, options, ta, aiSignal, actualMarketTrend, analysisId);
+                    if (signal != null) {
+                        leaderLagSignals.add(signal);
+
+                        log.info("[AI-LEADER-LAG][{}] ✅ {} Signal Generated - Confidence: {}%",
+                                analysisId, aiDecision.getStrategy(), (int)(aiSignal.getConfidence() * 100));
+                    }
+                }
+            }
+
+            return leaderLagSignals;
+
+        } catch (Exception e) {
+            log.error("[AI-LEADER-LAG][{}] Error in AI leader-lag analysis: {}", analysisId, e.getMessage());
+            return leaderLagSignals;
+        }
+    }
+
+    private MarketContext buildEnhancedMarketContext(TechnicalAnalysis ta, String marketTrend,
+                                                     LocalTime now, String analysisId) {
+        try {
+            // Get leader stock analysis
+            Map<String, TechnicalAnalysis> leaderAnalysis = new HashMap<>();
+            Map<String, Double> leaderMomentum = new HashMap<>();
+
+            for (String leaderSymbol : LEADER_STOCKS) {
+                TechnicalAnalysis leaderTA = technicalAnalysisService.analyze(leaderSymbol);
+                if (leaderTA != null) {
+                    leaderAnalysis.put(leaderSymbol, leaderTA);
+                    leaderMomentum.put(leaderSymbol, leaderTA.getMomentumStrength());
+                } else {
+                    log.warn("[AI-CONTEXT][{}] Missing TA for leader stock: {}", analysisId, leaderSymbol);
+                }
+            }
+
+            // Ensure we have at least 2 leaders with data
+            if (leaderMomentum.size() < 2) {
+                log.warn("[AI-CONTEXT][{}] Insufficient leader data: {} of {} leaders",
+                        analysisId, leaderMomentum.size(), LEADER_STOCKS.size());
+                return null;
+            }
+
+            // FIXED: Find strongest leader by CORRELATION (same as getLeaderMetrics())
+            List<PricePoint> qqqPrices = correlationDetector.getRecentPrices("QQQ", 15, analysisId);
+            if (qqqPrices.size() < 10) {
+                log.warn("[AI-CONTEXT][{}] Insufficient QQQ data for correlation", analysisId);
+                return null;
+            }
+
+            String strongestLeader = null;
+            double strongestCorrelation = 0.0;
+
+            // Find leader with highest correlation to QQQ
+            for (String leaderSymbol : LEADER_STOCKS) {
+                if (leaderMomentum.containsKey(leaderSymbol)) {
+                    List<PricePoint> leaderPrices = correlationDetector.getRecentPrices(leaderSymbol, 15, analysisId);
+                    if (leaderPrices.size() >= 10) {
+                        double correlation = correlationDetector.calculateCorrelation(leaderPrices, qqqPrices);
+                        if (correlation > strongestCorrelation) {
+                            strongestCorrelation = correlation;
+                            strongestLeader = leaderSymbol;
+                        }
+                    }
+                }
+            }
+
+            if (strongestLeader == null) {
+                log.warn("[AI-CONTEXT][{}] No valid leader correlations found", analysisId);
+                return null;
+            }
+
+            // FIXED: Use the same strongest leader's momentum consistently
+            double strongestLeaderMomentum = leaderMomentum.get(strongestLeader);
+            double qqqMomentum = ta.getMomentumStrength();
+
+            // Calculate leader-QQQ divergence
+            double leaderQQQDivergence = Math.abs(strongestLeaderMomentum - qqqMomentum);
+
+            log.info("[AI-CONTEXT][{}] Using leader: {} (corr: {}%, momentum: {})",
+                    analysisId, strongestLeader,
+                    String.format("%.1f", strongestCorrelation * 100),
+                    String.format("%.3f", strongestLeaderMomentum));
+
+            // FIXED: Create context with properly named parameters and consistent leader
+            return new MarketContext(
+                    strongestLeaderMomentum,    // Use the correlation-based strongest leader's momentum
+                    qqqMomentum,               // QQQ momentum
+                    strongestCorrelation,      // Use the actual correlation we calculated
+                    getVixLevel(),
+                    marketTrend,
+                    ta.getMarketRegime().toString(),
+                    now.getHour() * 60 + now.getMinute(),
+                    LocalDate.now().getDayOfWeek().getValue(),
+                    ta.getVolumeRatio(),
+                    leaderQQQDivergence,
+                    ta.getRsi(),
+                    ta.getCurrentPrice(),
+                    strongestLeader             // The correlation-based strongest leader
+            );
+
+        } catch (Exception e) {
+            log.error("[AI-CONTEXT][{}] Error building market context: {}", analysisId, e.getMessage());
+            return null;
+        }
+    }
+
+    // FIXED: Enhanced AI signal generation with PROPER trend following logic
+    private AILeaderLagSignal generateEnhancedAILeaderLagSignal(Option option, AIDecision aiDecision,
+                                                                TechnicalAnalysis ta, String marketTrend,
+                                                                LeaderCorrelationMetrics metrics, MarketContext context) {
+
+        boolean isCall = "CALL".equalsIgnoreCase(option.getType());
+        boolean isPut = "PUT".equalsIgnoreCase(option.getType());
+
+        // FIXED: Use proper variable names for clarity
+        String strongestLeader = context.strongestLeader;
+        double leaderMomentum = context.leaderMomentum;  // FIXED: Clear naming
+        double qqqMomentum = context.qqqMomentum;
+
+        if (aiDecision.getStrategy() == LeaderLagStrategy.STANDARD) {
+            // STANDARD STRATEGY: Leader diverges from QQQ, expect QQQ to follow leader
+
+            // BULLISH SETUP: Leader bullish + QQQ lagging + CALL option + UP/NEUTRAL trend
+            if (isCall && leaderMomentum > 0.1 && qqqMomentum < 0.15 &&
+                    (leaderMomentum - qqqMomentum) > 0.05 &&
+                    ("UP".equals(marketTrend) || "NEUTRAL".equals(marketTrend))) {
+
+                return createStandardAISignal(option, context, metrics, "CALL", aiDecision, strongestLeader,
+                        leaderMomentum, qqqMomentum, marketTrend);
+            }
+
+            // BEARISH SETUP: Leader bearish + QQQ lagging + PUT option + DOWN/NEUTRAL trend
+            else if (isPut && leaderMomentum < -0.1 && qqqMomentum > -0.15 &&
+                    (qqqMomentum - leaderMomentum) > 0.05 &&
+                    ("DOWN".equals(marketTrend) || "NEUTRAL".equals(marketTrend))) {
+
+                return createStandardAISignal(option, context, metrics, "PUT", aiDecision, strongestLeader,
+                        leaderMomentum, qqqMomentum, marketTrend);
+            }
+        }
+        else if (aiDecision.getStrategy() == LeaderLagStrategy.REVERSE) {
+            // REVERSE STRATEGY: Leader momentum fading, QQQ continuing independently
+
+            // BULLISH SETUP: Leader fading from bullish + QQQ continuing up + CALL + UP/NEUTRAL trend
+            if (isCall && leaderMomentum > -0.05 && leaderMomentum < 0.3 &&
+                    qqqMomentum > -0.05 && ("UP".equals(marketTrend) || "NEUTRAL".equals(marketTrend))) {
+
+                return createReverseAISignal(option, context, metrics, "CALL", aiDecision,
+                        leaderMomentum, qqqMomentum, marketTrend);
+            }
+
+            // BEARISH SETUP: Leader fading from bearish + QQQ continuing down + PUT + DOWN/NEUTRAL trend
+            else if (isPut && leaderMomentum < 0.05 && leaderMomentum > -0.3 &&
+                    qqqMomentum < 0.05 && ("DOWN".equals(marketTrend) || "NEUTRAL".equals(marketTrend))) {
+
+                return createReverseAISignal(option, context, metrics, "PUT", aiDecision,
+                        leaderMomentum, qqqMomentum, marketTrend);
+            }
+        }
+
+        return null;
+    }
+    // FIXED: Standard AI signal with improved confidence calculation
+    private AILeaderLagSignal createStandardAISignal(Option option, MarketContext context,
+                                                     LeaderCorrelationMetrics metrics, String type,
+                                                     AIDecision aiDecision, String leader,
+                                                     double leaderMomentum, double qqqMomentum,
+                                                     String marketTrend) {
+
+        // Start with AI base confidence
+        double confidence = aiDecision.getConfidence();
+
+        // FIXED: Enhanced confidence calculation with proper trend following
+        double divergence = Math.abs(leaderMomentum - qqqMomentum);
+        double leaderStrength = Math.abs(leaderMomentum);
+        double correlationStrength = metrics.getStrongestCorrelation();
+
+        // Divergence boost (more divergence = higher confidence)
+        if (divergence > 0.4) {
+            confidence = Math.min(0.95, confidence * 1.20); // Strong divergence
+        } else if (divergence > 0.25) {
+            confidence = Math.min(0.95, confidence * 1.15); // Moderate divergence
+        } else if (divergence > 0.15) {
+            confidence = Math.min(0.95, confidence * 1.10); // Weak divergence
+        }
+
+        // Leader strength boost
+        if (leaderStrength > 0.5) {
+            confidence = Math.min(0.95, confidence * 1.15); // Very strong leader move
+        } else if (leaderStrength > 0.3) {
+            confidence = Math.min(0.95, confidence * 1.10); // Strong leader move
+        } else if (leaderStrength > 0.2) {
+            confidence = Math.min(0.95, confidence * 1.05); // Moderate leader move
+        }
+
+        // Correlation boost (higher correlation = more reliable)
+        if (correlationStrength > 0.8) {
+            confidence = Math.min(0.95, confidence * 1.12); // Very high correlation
+        } else if (correlationStrength > 0.7) {
+            confidence = Math.min(0.95, confidence * 1.08); // High correlation
+        } else if (correlationStrength > 0.6) {
+            confidence = Math.min(0.95, confidence * 1.05); // Good correlation
+        }
+
+        // Volume confirmation boost
+        if (context.volumeRatio > 2.0) {
+            confidence = Math.min(0.95, confidence * 1.10); // Exceptional volume
+        } else if (context.volumeRatio > 1.5) {
+            confidence = Math.min(0.95, confidence * 1.05); // High volume
+        }
+
+        // Time-of-day adjustments
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isAfter(LocalTime.of(9, 45)) && now.isBefore(LocalTime.of(10, 30))) {
+            confidence = Math.min(0.95, confidence * 1.08); // Morning momentum window
+        } else if (now.isAfter(LocalTime.of(15, 0))) {
+            confidence = Math.min(0.95, confidence * 1.12); // Power hour boost
+        }
+
+        // Trend alignment boost
+        boolean isAligned = (type.equals("CALL") && "UP".equals(marketTrend)) ||
+                (type.equals("PUT") && "DOWN".equals(marketTrend));
+        if (isAligned) {
+            confidence = Math.min(0.95, confidence * 1.08); // Trend-following bonus
+        }
+
+        // Market regime adjustments
+        if ("HIGH_VOLATILITY".equals(context.volatilityRegime)) {
+            confidence = Math.min(0.95, confidence * 1.05); // Volatility helps breakouts
+        }
+
+        String strategy = type.equals("CALL") ? "0DTE_AI_LEADER_LAG_CALL" : "0DTE_AI_LEADER_LAG_PUT";
+        String reason = String.format(
+                "🤖 AI Standard: %s momentum %.2f%% vs QQQ %.2f%% (divergence %.2f%%), correlation %.0f%%, trend %s",
+                leader, leaderMomentum * 100, qqqMomentum * 100, divergence * 100,
+                correlationStrength * 100, marketTrend);
+
+        return new AILeaderLagSignal(LeaderLagStrategy.STANDARD, "BUY", strategy, confidence,
+                correlationStrength, leaderStrength, reason, aiDecision.getMarketRegime(), leader);
+    }
+
+    // FIXED: Reverse AI signal with improved confidence calculation
+    private AILeaderLagSignal createReverseAISignal(Option option, MarketContext context,
+                                                    LeaderCorrelationMetrics metrics, String type,
+                                                    AIDecision aiDecision, double leaderMomentum,
+                                                    double qqqMomentum, String marketTrend) {
+
+        // Start with AI base confidence
+        double confidence = aiDecision.getConfidence();
+
+        // FIXED: Enhanced confidence calculation for reverse strategy
+        double leaderFadeStrength = 0.5 - Math.abs(leaderMomentum); // How much leader has faded
+        double qqqStrength = Math.abs(qqqMomentum);
+        double correlationStrength = metrics.getStrongestCorrelation();
+
+        // Leader fading boost (more fading = higher confidence)
+        if (leaderFadeStrength > 0.4) {
+            confidence = Math.min(0.95, confidence * 1.18); // Strong fading
+        } else if (leaderFadeStrength > 0.3) {
+            confidence = Math.min(0.95, confidence * 1.12); // Moderate fading
+        } else if (leaderFadeStrength > 0.2) {
+            confidence = Math.min(0.95, confidence * 1.08); // Weak fading
+        }
+
+        // QQQ independence boost (QQQ continuing despite leader fade)
+        if (qqqStrength > 0.4) {
+            confidence = Math.min(0.95, confidence * 1.15); // Strong QQQ momentum
+        } else if (qqqStrength > 0.3) {
+            confidence = Math.min(0.95, confidence * 1.10); // Good QQQ momentum
+        } else if (qqqStrength > 0.2) {
+            confidence = Math.min(0.95, confidence * 1.05); // Moderate QQQ momentum
+        }
+
+        // Time-based boost (reverse strategies work better later in day)
+        LocalTime now = LocalTime.now(ET_ZONE);
+        if (now.isAfter(LocalTime.of(15, 0))) {
+            confidence = Math.min(0.95, confidence * 1.15); // Power hour independence
+        } else if (now.isAfter(LocalTime.of(13, 0))) {
+            confidence = Math.min(0.95, confidence * 1.10); // Afternoon momentum
+        }
+
+        // Correlation boost (even in reverse, correlation helps predict QQQ behavior)
+        if (correlationStrength > 0.6) {
+            confidence = Math.min(0.95, confidence * 1.08);
+        }
+
+        // Volume confirmation
+        if (context.volumeRatio > 1.5) {
+            confidence = Math.min(0.95, confidence * 1.08);
+        }
+
+        // Trend alignment boost (reverse still benefits from trend following)
+        boolean isAligned = (type.equals("CALL") && "UP".equals(marketTrend)) ||
+                (type.equals("PUT") && "DOWN".equals(marketTrend));
+        if (isAligned) {
+            confidence = Math.min(0.95, confidence * 1.10); // Higher boost for reverse trend-following
+        }
+
+        String strategy = type.equals("CALL") ? "0DTE_AI_REVERSE_LEADER_LAG_CALL" : "0DTE_AI_REVERSE_LEADER_LAG_PUT";
+        String reason = String.format(
+                "🤖 AI Reverse: %s fading %.2f%% (from strong), QQQ continuing %.2f%%, correlation %.0f%%, trend %s",
+                context.strongestLeader, leaderMomentum * 100, qqqMomentum * 100,
+                correlationStrength * 100, marketTrend);
+
+        return new AILeaderLagSignal(LeaderLagStrategy.REVERSE, "BUY", strategy, confidence,
+                correlationStrength, qqqStrength, reason, aiDecision.getMarketRegime(), context.strongestLeader);
+    }
+
+    // FIXED: Updated MarketContext class with clearer field names
+    @Getter @Setter
+    private static class MarketContext {
+        final double leaderMomentum;      // FIXED: Clear naming - strongest leader momentum
+        final double qqqMomentum;         // FIXED: Clear naming - QQQ momentum
+        final double correlation, vixLevel;
+        final String marketTrend, volatilityRegime, strongestLeader;
+        final int timeOfDay, dayOfWeek;
+        final double volumeRatio, momentumDivergence, rsi;
+        final BigDecimal currentPrice;
+
+        public MarketContext(double leaderMomentum, double qqqMomentum, double correlation, double vixLevel,
+                             String marketTrend, String volatilityRegime, int timeOfDay, int dayOfWeek,
+                             double volumeRatio, double momentumDivergence, double rsi, BigDecimal currentPrice,
+                             String strongestLeader) {
+            this.leaderMomentum = leaderMomentum;     // FIXED: Use proper field name
+            this.qqqMomentum = qqqMomentum;
+            this.correlation = correlation;
+            this.vixLevel = vixLevel;
+            this.marketTrend = marketTrend;
+            this.volatilityRegime = volatilityRegime;
+            this.timeOfDay = timeOfDay;
+            this.dayOfWeek = dayOfWeek;
+            this.volumeRatio = volumeRatio;
+            this.momentumDivergence = momentumDivergence;
+            this.rsi = rsi;
+            this.currentPrice = currentPrice;
+            this.strongestLeader = strongestLeader;
+        }
+    }
+
+    // FIXED: Updated AI threshold logic with trend consideration
+    private double getAIThreshold(LeaderLagStrategy strategy, LocalTime now) {
+        boolean isPowerHour = now.isAfter(POWER_HOUR_START);
+        boolean isMorning = now.isBefore(LocalTime.of(11, 0));
+
+        switch (strategy) {
+            case STANDARD:
+                if (isPowerHour) return 0.75;      // Lower threshold in power hour
+                if (isMorning) return 0.70;       // Lower threshold in morning
+                return 0.75;                      // Standard midday threshold
+
+            case REVERSE:
+                if (isPowerHour) return 0.70;     // Reverse easier in power hour
+                if (isMorning) return 0.80;       // Higher threshold in morning (less reliable)
+                return 0.75;                      // Standard midday threshold
+
+            default:
+                return 0.85;
+        }
+    }
+
+    // FIXED: Update the feature extraction to use proper field names
+    private MarketFeatures extractFeatures(MarketContext context) {
+        return new MarketFeatures(
+                context.leaderMomentum,    // FIXED: Use proper field name
+                context.qqqMomentum,       // FIXED: Use proper field name
+                context.correlation,
+                context.vixLevel,
+                context.timeOfDay,
+                context.dayOfWeek,
+                context.volumeRatio,
+                context.momentumDivergence
+        );
     }
 }
