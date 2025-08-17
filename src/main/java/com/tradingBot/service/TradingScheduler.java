@@ -409,7 +409,6 @@ public class TradingScheduler {
 
                 tradeRepository.save(trade);
 
-                tradingService.updateAILearning(trade);
 
                 String emoji = pnl.compareTo(BigDecimal.ZERO) > 0 ? "💰" : "💸";
                 telegramService.sendMessage(String.format(

@@ -387,7 +387,6 @@ public class TradingService {
 
                 tradeRepository.save(trade);
 
-                updateAILearning(trade);
 
                 // Refresh positions
                 positionSyncService.refreshPositions();
@@ -430,24 +429,7 @@ public class TradingService {
     }
 
     private final ZeroDTEStrategy zeroDTEStrategy;
-    public void updateAILearning(Trade trade) {
-        try {
-            if (trade.getSignalId() != null) {
-                Signal originalSignal = signalRepository.findById(trade.getSignalId()).orElse(null);
 
-                if (originalSignal != null && originalSignal.getStrategy().contains("AI_LEADER_LAG")) {
-                    // 🤖 UPDATE AI LEARNING
-                    zeroDTEStrategy.updateAIFromTradeAsync(trade, originalSignal);
-
-                    double pnlPercent = calculatePnLPercent(trade);
-                    log.info("🤖 [AI-LEARNING] Updated from trade: {} P&L: {}%",
-                            trade.getOptionSymbol(), String.format("%.2f", pnlPercent));
-                }
-            }
-        } catch (Exception e) {
-            log.error("Error updating AI learning: {}", e.getMessage());
-        }
-    }
 
     private double calculatePnLPercent(Trade trade) {
         if (trade.getExitPrice() != null && trade.getEntryPrice() != null) {
@@ -737,8 +719,6 @@ public class TradingService {
                 trade.setProfit(finalPnl);
 
                 tradeRepository.save(trade);
-
-                updateAILearning(trade);
 
                 integratedBayesianMLSystem.closeTradeWithMLFeedback(trade, reason);
                 // Refresh positions
