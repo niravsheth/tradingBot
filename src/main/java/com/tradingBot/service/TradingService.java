@@ -437,7 +437,7 @@ public class TradingService {
 
                 if (originalSignal != null && originalSignal.getStrategy().contains("AI_LEADER_LAG")) {
                     // 🤖 UPDATE AI LEARNING
-                    zeroDTEStrategy.updateAIFromTrade(trade, originalSignal);
+                    zeroDTEStrategy.updateAIFromTradeAsync(trade, originalSignal);
 
                     double pnlPercent = calculatePnLPercent(trade);
                     log.info("🤖 [AI-LEARNING] Updated from trade: {} P&L: {}%",
