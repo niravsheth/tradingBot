@@ -22,7 +22,6 @@ public class SignalConfirmationService {
 
     private final TradierService tradierService;
     private final TechnicalAnalysisService technicalAnalysisService;
-    private final EnhancedOptionsFlowAnalyzer flowAnalyzer;
     private final TelegramService telegramService;
 
     // Manual override storage

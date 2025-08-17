@@ -33,7 +33,6 @@ public class EnhancedStopLossMonitor {
     private final TradierService tradierService;
     private final TechnicalAnalysisService technicalAnalysisService;
     private final AdvancedSignalDetector advancedSignalDetector;
-    private final EnhancedOptionsFlowAnalyzer optionsFlowAnalyzer;
     private final TradeRepository tradeRepository;
     private final TelegramService telegramService;
     private final StopLossConfiguration config;
