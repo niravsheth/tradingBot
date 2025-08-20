@@ -43,8 +43,8 @@ public class SHAPExplainerService {
             shapExplanation.setTopPositiveFactors(getTopFactors(shapValues, true, 3));
             shapExplanation.setTopNegativeFactors(getTopFactors(shapValues, false, 2));
 
-            log.info("[SHAP] Explanation generated - Strength: {:.2f}, Top factor: {}",
-                    explanationStrength, getTopFactor(shapValues));
+            log.info("[SHAP] Explanation generated - Strength: {}, Top factor: {}",
+                    String.format("%.2f",explanationStrength), getTopFactor(shapValues));
 
             return shapExplanation;
 
@@ -69,8 +69,8 @@ public class SHAPExplainerService {
 
         boolean isValid = strongExplanation && !hasConflictingFactors && logicalFactors;
 
-        log.info("[SHAP-VALIDATION] Signal: {} - Strength: {:.2f}, Conflicts: {}, Logic: {}, Valid: {}",
-                signal.getOptionSymbol(), explanation.getExplanationStrength(),
+        log.info("[SHAP-VALIDATION] Signal: {} - Strength: {}, Conflicts: {}, Logic: {}, Valid: {}",
+                signal.getOptionSymbol(), String.format("%.2f",explanation.getExplanationStrength()),
                 hasConflictingFactors, logicalFactors, isValid);
 
         return isValid;

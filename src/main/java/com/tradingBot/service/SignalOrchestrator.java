@@ -417,8 +417,8 @@ public class SignalOrchestrator {
         // Even more aggressive near 0DTE expiration
         if (isNear0DTEExpiration()) {
             minConfidence -= 0.10; // 10% lower in final hour
-            log.info("[ORCHESTRATOR][{}] Near 0DTE expiration - lowering threshold to {:.2f}",
-                    analysisId, minConfidence);
+            log.info("[ORCHESTRATOR][{}] Near 0DTE expiration - lowering threshold to {}",
+                    analysisId,String.format("%.2f",minConfidence));
         }
 
         double finalMinConfidence = minConfidence;
@@ -429,10 +429,10 @@ public class SignalOrchestrator {
 
         // Log decision
         if (qualified.isEmpty() && !signals.isEmpty()) {
-            log.info("[ORCHESTRATOR][{}] No signals met minimum confidence threshold of {:.2f}",
-                    analysisId, minConfidence);
-            log.info("[ORCHESTRATOR][{}] Best signal had confidence: {:.2f}",
-                    analysisId, signals.get(0).getConfidence());
+            log.info("[ORCHESTRATOR][{}] No signals met minimum confidence threshold of {}",
+                    analysisId, String.format("%.2f",minConfidence));
+            log.info("[ORCHESTRATOR][{}] Best signal had confidence: {}",
+                    analysisId, String.format("%.2f",signals.get(0).getConfidence()));
         } else {
             for (Signal signal : qualified) {
                 log.info("[ORCHESTRATOR][{}] ✅ SELECTED: {} - Confidence: {}%, Strategy: {}",

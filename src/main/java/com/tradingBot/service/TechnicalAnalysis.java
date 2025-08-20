@@ -134,21 +134,7 @@ public class TechnicalAnalysis {
         this.previousClose = previousClose;
     }
 
-    public BigDecimal getPreMarketHigh() {
-        return preMarketHigh;
-    }
 
-    public void setPreMarketHigh(BigDecimal preMarketHigh) {
-        this.preMarketHigh = preMarketHigh;
-    }
-
-    public BigDecimal getPreMarketLow() {
-        return preMarketLow;
-    }
-
-    public void setPreMarketLow(BigDecimal preMarketLow) {
-        this.preMarketLow = preMarketLow;
-    }
     public String getTrend() {
         return trend;
     }

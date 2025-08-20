@@ -103,7 +103,7 @@ public class ZeroDTEStrategy {
 
     public List<Signal> analyzeOptions(String symbol, String marketTrend) {
         String analysisId = UUID.randomUUID().toString().substring(0, 8);
-        log.info("Trading ANALYSIS START ========== {}", analysisId);
+        //log.info("Trading ANALYSIS START ========== {}", analysisId);
         log.info("[{}] Market trend: {}", analysisId, marketTrend);
 
         List<Signal> rawSignals = new ArrayList<>();
@@ -174,7 +174,7 @@ public class ZeroDTEStrategy {
             }
 
             List<Option> options = chainResponse.getOptionsList();
-            log.info("[{}] Retrieved {} options", analysisId, options.size());
+            //log.info("[{}] Retrieved {} options", analysisId, options.size());
 
             // Apply filtering based on market regime
             List<Option> filteredOptions = filterOptionsByMarketRegime(options, ta, analysisId);
@@ -697,7 +697,6 @@ public class ZeroDTEStrategy {
                 return reason;
             }
         }
-
         public ValidationResult validateBeforeExecution(Signal signal, String analysisId) {
             try {
                 if (!"true".equals(signal.getMetadata().get("requiresPreValidation"))) {
@@ -711,6 +710,14 @@ public class ZeroDTEStrategy {
 
                 // Re-analyze momentum and correlation
                 momentumTracker.updateCurrentMomentum(analysisId);
+
+                // Check if leader monitoring is required
+                if ("true".equals(signal.getMetadata().get("requiresLeaderMonitoring"))) {
+                    ValidationResult leaderMonitorResult = monitorSpecificLeader(signal, analysisId);
+                    if (!leaderMonitorResult.isValid()) {
+                        return leaderMonitorResult; // Failed leader monitoring
+                    }
+                }
 
                 // Get current leader state
                 String leaderStock = signal.getMetadata().get("leaderStock");
@@ -736,8 +743,8 @@ public class ZeroDTEStrategy {
                 double currentMagnitude = Math.abs(currentVelocity.momentum);
 
                 if (currentMagnitude >= originalMagnitude * 1.1) {
-                    log.info("[PRE-VALIDATION][{}] ✅ EXECUTE: Momentum increased {:.3f} -> {:.3f}",
-                            analysisId, originalMagnitude, currentMagnitude);
+                    log.info("[PRE-VALIDATION][{}] ✅ EXECUTE: Momentum increased {} -> {}",
+                            analysisId, String.format("%.3f",originalMagnitude), String.format("%.3f",currentMagnitude));
                     return new ValidationResult(true, 1.15, "Momentum increased in signal direction");
                 }
 
@@ -756,8 +763,8 @@ public class ZeroDTEStrategy {
                 boolean qqqBearish = qqqVelocity.momentum < -0.01;
 
                 if ((leaderBullish && qqqBearish) || (leaderBearish && qqqBullish)) {
-                    log.warn("[PRE-VALIDATION][{}] ❌ ABORT: Leader-QQQ moving opposite: Leader={:.3f}, QQQ={:.3f}",
-                            analysisId, currentVelocity.momentum, qqqVelocity.momentum);
+                    log.warn("[PRE-VALIDATION][{}] ❌ ABORT: Leader-QQQ moving opposite: Leader={}, QQQ={}",
+                            analysisId, String.format("%.3f",currentVelocity.momentum), String.format(".3f",qqqVelocity.momentum));
                     return new ValidationResult(false, 0.0, "Leader-QQQ divergence");
                 }
 
@@ -769,6 +776,75 @@ public class ZeroDTEStrategy {
                 log.error("[PRE-VALIDATION][{}] Error in validation: {}", analysisId, e.getMessage());
                 return new ValidationResult(false, 0.0, "Validation error: " + e.getMessage());
             }
+        }
+
+        private ValidationResult monitorSpecificLeader(Signal signal, String analysisId) {
+            try {
+                String opposingLeader = signal.getMetadata().get("opposingLeader");
+                String isCallSignalStr = signal.getMetadata().get("isCallSignal");
+                String monitoringDurationStr = signal.getMetadata().get("monitoringDuration");
+
+                if (opposingLeader == null || isCallSignalStr == null || monitoringDurationStr == null) {
+                    log.warn("[LEADER-MONITORING][{}] Missing monitoring metadata - skipping", analysisId);
+                    return new ValidationResult(true, 1.0, "Monitoring metadata missing");
+                }
+
+                boolean isCallSignal = Boolean.parseBoolean(isCallSignalStr);
+                int monitoringDuration = Integer.parseInt(monitoringDurationStr);
+
+                log.info("[LEADER-MONITORING][{}] Monitoring {} for {} seconds...",
+                        analysisId, opposingLeader, monitoringDuration);
+
+                // Wait for the monitoring duration
+                Thread.sleep(monitoringDuration * 1000);
+
+                // Re-analyze the specific opposing leader
+                List<MarketData> leaderData5min = marketDataRepository.findRecentData(opposingLeader, 5);
+                double currentMomentum = calculateMomentum(leaderData5min);
+
+                // Check if leader is still opposing
+                boolean stillOpposing;
+                double threshold = LocalTime.now(ET_ZONE).isAfter(LocalTime.of(15, 30)) ? 0.0010 : 0.0015;
+
+                if (isCallSignal) {
+                    // CALL signal - negative momentum opposes
+                    stillOpposing = currentMomentum < -threshold;
+                } else {
+                    // PUT signal - positive momentum opposes
+                    stillOpposing = currentMomentum > threshold;
+                }
+
+                if (stillOpposing) {
+                    log.warn("[LEADER-MONITORING][{}] ❌ ABORT: {} still opposing after {} seconds (momentum: {})",
+                            analysisId, opposingLeader, monitoringDuration,String.format("%.3f",currentMomentum));
+                    return new ValidationResult(false, 0.0,
+                            String.format("%s still opposing after monitoring", opposingLeader));
+                }
+
+                log.info("[LEADER-MONITORING][{}] ✅ PROCEED: {} turned favorable (momentum: {})",
+                        analysisId, opposingLeader, String.format("%.3f",currentMomentum));
+                return new ValidationResult(true, 1.05, "Leader monitoring passed - turned favorable");
+
+            } catch (Exception e) {
+                log.error("[LEADER-MONITORING][{}] Error in leader monitoring: {}", analysisId, e.getMessage());
+                return new ValidationResult(false, 0.0, "Leader monitoring error: " + e.getMessage());
+            }
+        }
+
+        private double calculateMomentum(List<MarketData> data) {
+            if (data.isEmpty()) return 0.0;
+
+            MarketData firstData = data.get(data.size() - 1);
+            MarketData lastData = data.get(0);
+
+            if (firstData.getPrice() == null || lastData.getPrice() == null ||
+                    firstData.getPrice().compareTo(BigDecimal.ZERO) == 0) {
+                return 0.0;
+            }
+
+            return lastData.getPrice().subtract(firstData.getPrice())
+                    .divide(firstData.getPrice(), 6, RoundingMode.HALF_UP)
+                    .doubleValue();
         }
     }
 
@@ -1939,7 +2015,6 @@ public class ZeroDTEStrategy {
                     return new ValidationResult(true, 1.0, "Early session - skipping leader check", "");
                 }
 
-                // FIX: Add null check for confidence
                 Double confidence = signal.getConfidence();
                 if (confidence != null && confidence >= 0.85) {
                     return new ValidationResult(true, 1.0, "High confidence signal - leader check bypassed", "");
@@ -1954,7 +2029,6 @@ public class ZeroDTEStrategy {
                     return new ValidationResult(true, 1.0, "QQQ leading with high volume", "");
                 }
 
-                // Handle temporary VWAP validation signals
                 boolean isCallSignal;
                 if (signal.getStrategy().startsWith("TEMP_")) {
                     String optionType = signal.getMetadata().get("optionType");
@@ -1984,15 +2058,13 @@ public class ZeroDTEStrategy {
                                 e.getValue().isOpposing()))
                         .collect(Collectors.joining(", "));
 
-                log.info("[LEADER-VALIDATOR][{}] {} Signal Analysis: {} leaders opposing (weighted: {:.0f%%)",
-                        analysisId, isCallSignal ? "CALL" : "PUT", opposingCount, oppositionScore * 100);
-                log.info("[LEADER-VALIDATOR][{}] Leader Details: {}", analysisId, details);
+                log.info("[LEADER-VALIDATOR][{}] {} Signal Analysis: {} leaders opposing (weighted: {})",
+                        analysisId, isCallSignal ? "CALL" : "PUT", opposingCount,String.format("%.0f", oppositionScore * 100));
+                //log.info("[LEADER-VALIDATOR][{}] Leader Details: {}", analysisId, details);
 
-                // STRICTER for VWAP signals if it's a temp validation
                 boolean isVWAPValidation = signal.getStrategy().startsWith("TEMP_VWAP");
 
                 if (isVWAPValidation) {
-                    // Block ANY leader opposition for VWAP signals
                     if (opposingCount >= 1 || oppositionScore >= 0.3) {
                         return new ValidationResult(false, 0.0,
                                 String.format("VWAP BLOCKED: %d/3 leaders opposing (weighted: %.0f%%)",
@@ -2000,15 +2072,41 @@ public class ZeroDTEStrategy {
                                 details);
                     }
                 } else {
-                    // Standard validation for other signals
+                    // HARD BLOCKS first
                     if (opposingCount >= 2 || oppositionScore >= 0.7) {
                         return new ValidationResult(false, 0.0,
                                 String.format("%d/3 leaders opposing direction (weighted: %.0f%%)",
                                         opposingCount, oppositionScore * 100),
                                 details);
-                    } else if (opposingCount == 1 && oppositionScore >= 0.4) {
-                        return new ValidationResult(true, 0.8,
-                                "1 leader opposing - confidence reduced",
+                    }
+
+                    // NEW: UNIVERSAL MONITORING LOGIC - Any leader opposing
+                    if (opposingCount >= 1) {
+                        // Find the opposing leader(s)
+                        List<String> opposingLeaders = leaderAnalysis.entrySet().stream()
+                                .filter(e -> e.getValue().isOpposing())
+                                .map(Map.Entry::getKey)
+                                .collect(Collectors.toList());
+
+                        // For multiple opposing leaders, pick the one with highest weight
+                        String primaryOpposingLeader = opposingLeaders.stream()
+                                .max(Comparator.comparing(leader -> LEADER_WEIGHTS.get(leader)))
+                                .orElse(opposingLeaders.get(0));
+
+                        // Set monitoring metadata for ALL signals
+                        signal.getMetadata().put("requiresLeaderMonitoring", "true");
+                        signal.getMetadata().put("opposingLeader", primaryOpposingLeader);
+                        signal.getMetadata().put("isCallSignal", String.valueOf(isCallSignal));
+
+                        // Determine monitoring duration
+                        int monitoringSeconds = now.isAfter(LocalTime.of(15, 30)) ? 90 : 120;
+                        signal.getMetadata().put("monitoringDuration", String.valueOf(monitoringSeconds));
+
+                        log.warn("[LEADER-MONITORING][{}] {} leader(s) opposing - MONITORING {} for {} seconds",
+                                analysisId, opposingCount, primaryOpposingLeader, monitoringSeconds);
+
+                        return new ValidationResult(true, 0.9, // Slight confidence reduction
+                                String.format("%d leader(s) opposing - monitoring %s", opposingCount, primaryOpposingLeader),
                                 details);
                     }
                 }
@@ -2026,9 +2124,10 @@ public class ZeroDTEStrategy {
         private Map<String, LeaderMomentum> analyzeLeaderMomentum(boolean isCallSignal, LocalTime now) {
             Map<String, LeaderMomentum> results = new HashMap<>();
 
-            double threshold5min = now.isAfter(POWER_HOUR_START) ? 0.0010 : 0.0015;
-            double threshold10min = now.isAfter(POWER_HOUR_START) ? 0.0020 : 0.0025;
-            double threshold15min = now.isAfter(POWER_HOUR_START) ? 0.0030 : 0.0035;
+            // FIXED: Consistent lower thresholds throughout the day to catch directional misalignment
+            double threshold5min = 0.0008;   // 0.08% (was 0.10%/0.15%)
+            double threshold10min = 0.0012;  // 0.12% (was 0.20%/0.25%)
+            double threshold15min = 0.0018;  // 0.18% (was 0.30%/0.35%)
 
             for (String leader : LEADER_STOCKS) {
                 LeaderMomentum momentum = new LeaderMomentum(leader, LEADER_WEIGHTS.get(leader));
@@ -3343,8 +3442,8 @@ private void analyzeVWAPDeviationReversion(Option option, List<Option> allOption
             adjustedMinIV = adjustedMinIV * params.getMinIVMultiplier();
         }
 
-        log.info("[{}] Base filtering - Volume: {}, IV: {:.3f}",
-                analysisId, adjustedMinVolume, adjustedMinIV);
+        log.info("[{}] Base filtering - Volume: {}, IV: {}",
+                analysisId, adjustedMinVolume,String.format("%.3f",adjustedMinIV));
 
         List<Option> basicFiltered = options.stream()
                 .filter(Option::isValid)
@@ -4593,7 +4692,7 @@ private void analyzeVWAPDeviationReversion(Option option, List<Option> allOption
 
     private void logEnhancedLeaderLagDebug(List<Signal> leaderLagSignals, String analysisId) {
         if (leaderLagSignals.isEmpty()) {
-            log.warn("[ENHANCED-AI-DEBUG][{}] 🔍 NO AI LEADER LAG SIGNALS GENERATED - Debugging:", analysisId);
+            //log.warn("[ENHANCED-AI-DEBUG][{}] 🔍 NO AI LEADER LAG SIGNALS GENERATED - Debugging:", analysisId);
 
             // Debug correlation
             try {
@@ -4621,8 +4720,8 @@ private void analyzeVWAPDeviationReversion(Option option, List<Option> allOption
                 }
 
                 MomentumVelocity qqqVelocity = momentumTracker.calculateVelocity("QQQ");
-                log.info("[ENHANCED-AI-DEBUG][{}] 🎯 QQQ MOMENTUM: {:.3f}, State: {}, Acceleration: {:.4f}",
-                        analysisId, qqqVelocity.momentum, qqqVelocity.state, qqqVelocity.acceleration);
+                log.info("[ENHANCED-AI-DEBUG][{}] 🎯 QQQ MOMENTUM: {}, State: {}, Acceleration: {}",
+                        analysisId, String.format("%.3f",qqqVelocity.momentum), qqqVelocity.state, String.format("%.4f",qqqVelocity.acceleration));
 
             } catch (Exception e) {
                 log.error("[ENHANCED-AI-DEBUG][{}] ❌ Error getting momentum: {}", analysisId, e.getMessage());
@@ -4639,7 +4738,7 @@ private void analyzeVWAPDeviationReversion(Option option, List<Option> allOption
 
                     log.info("[ENHANCED-AI-DEBUG][{}] 🧠 AI DECISION DEBUG:", analysisId);
                     log.info("[ENHANCED-AI-DEBUG][{}] - Strongest Leader: {}", analysisId, context.strongestLeader);
-                    log.info("[ENHANCED-AI-DEBUG][{}] - Correlation: {:.1f}%", analysisId, context.correlation * 100);
+                    log.info("[ENHANCED-AI-DEBUG][{}] - Correlation: {}%", analysisId, String.format("%.1f",context.correlation * 100));
 
                     leaderPatterns.forEach((leader, pattern) ->
                             log.info("[ENHANCED-AI-DEBUG][{}] - {} Pattern: {}", analysisId, leader, pattern));

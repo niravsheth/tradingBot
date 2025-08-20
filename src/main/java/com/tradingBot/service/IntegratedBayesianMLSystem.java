@@ -130,8 +130,8 @@ public class IntegratedBayesianMLSystem {
                     .dataQuality(calculateDataQuality(historicalData))
                     .build();
 
-            log.debug("[BAYESIAN] Analysis complete - Prior: {:.3f}, Likelihood: {:.3f}, Posterior: {:.3f}, Adjusted: {:.3f}",
-                    priorProbability, likelihood, posteriorProbability, adjustedConfidence);
+            log.debug("[BAYESIAN] Analysis complete - Prior: {}, Likelihood: {}, Posterior: {}, Adjusted: {}",
+                    String.format("%.3f",priorProbability),String.format("%.3f",likelihood), String.format("%.3f",posteriorProbability), String.format("%.3f",adjustedConfidence));
 
             return analysis;
 
@@ -317,8 +317,8 @@ public class IntegratedBayesianMLSystem {
             // Cache the result
             learningStateCache.put(strategy, state);
 
-            log.debug("[LEARNING] State for {}: Phase={}, Trades={}, Performance={:.3f}",
-                    strategy, learningPhase, historicalData.size(), performanceScore);
+            log.debug("[LEARNING] State for {}: Phase={}, Trades={}, Performance={}",
+                    strategy, learningPhase, historicalData.size(), String.format("%.3f",performanceScore));
 
             return state;
 
@@ -364,8 +364,8 @@ public class IntegratedBayesianMLSystem {
             // Cache the result
             thresholdCache.put(cacheKey, new ThresholdCache(threshold, LocalDateTime.now()));
 
-            log.debug("[THRESHOLD] Dynamic threshold for {}: {:.3f} (base: {:.3f}, method: {})",
-                    strategy, finalThreshold, baseThreshold, threshold.getOptimizationMethod());
+            log.debug("[THRESHOLD] Dynamic threshold for {}: {} (base: {}, method: {})",
+                    strategy, String.format("%.3f",finalThreshold),String.format("%.3f",baseThreshold), threshold.getOptimizationMethod());
 
             return threshold;
 
@@ -417,8 +417,8 @@ public class IntegratedBayesianMLSystem {
             // Calculate optimal threshold using ROC analysis
             double optimalThreshold = calculateOptimalThresholdROC(sortedByConfidence);
 
-            log.info("[LEARNING] Calculated learned threshold: {:.3f} from {} valid data points (filtered from {})",
-                    optimalThreshold, validData.size(), historicalData.size());
+            log.info("[LEARNING] Calculated learned threshold: {} from {} valid data points (filtered from {})",
+                    String.format("%.3f",optimalThreshold), validData.size(), historicalData.size());
 
             return optimalThreshold;
 
@@ -449,7 +449,7 @@ public class IntegratedBayesianMLSystem {
             }
         }
 
-        log.debug("[LEARNING] Best threshold: {:.3f} with F1-score: {:.3f}", bestThreshold, bestF1Score);
+        log.debug("[LEARNING] Best threshold: {} with F1-score: {}", String.format("%.3f",bestThreshold), String.format("%.3f",bestF1Score));
         return bestThreshold;
     }
 
@@ -1245,14 +1245,14 @@ public class IntegratedBayesianMLSystem {
      */
     private void logLearningInsights(Trade trade, TradeOutcomeAnalysis outcome, LearningMetricsUpdate metricsUpdate) {
         try {
-            log.info("[ML_INSIGHTS] Trade {} completed - Strategy: {}, Profitability: {:.3f}, " +
-                            "Original Confidence: {:.3f}, Met Expectations: {}, Performance Delta: {:.3f}",
+            log.info("[ML_INSIGHTS] Trade {} completed - Strategy: {}, Profitability: {}, " +
+                            "Original Confidence: {}, Met Expectations: {}, Performance Delta: {}",
                     trade.getId(),
                     trade.getStrategy(),
-                    outcome.getProfitability(),
-                    outcome.getOriginalConfidence(),
+                    String.format("%.3f",outcome.getProfitability()),
+                    String.format("%.3f",outcome.getOriginalConfidence()),
                     outcome.isMetExpectations(),
-                    metricsUpdate.getPerformanceDelta());
+                    String.format("%.3f",metricsUpdate.getPerformanceDelta()));
 
             // Log key learnings
             if (!outcome.getKeyLearnings().isEmpty()) {

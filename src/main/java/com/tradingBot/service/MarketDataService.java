@@ -39,7 +39,7 @@ public class MarketDataService {
         return momentumCache.computeIfAbsent(symbol, k -> {
             // Simulate realistic momentum values between -1.0 and 1.0
             double momentum = random.nextGaussian() * 0.4; // Normal distribution
-            log.debug("Generated momentum for {}: {:.3f}", symbol, momentum);
+            log.debug("Generated momentum for {}: {}", symbol, String.format("%.3f",momentum));
             return momentum;
         });
     }
@@ -100,7 +100,7 @@ public class MarketDataService {
         );
 
         double weight = qqqWeights.getOrDefault(symbol, 0.01); // Default 1% for others
-        log.debug("Constituent weight for {}: {:.3f}%", symbol, weight * 100);
+        log.debug("Constituent weight for {}: {}%", symbol, String.format("%.3f",weight * 100));
         return weight;
     }
 
@@ -111,7 +111,7 @@ public class MarketDataService {
     public double getImpliedVolatilityRank(String symbol) {
         // Simulate IV rank between 0-100
         double ivRank = 20 + random.nextDouble() * 60; // 20-80 range is typical
-        log.debug("IV Rank for {}: {:.1f}", symbol, ivRank);
+        log.debug("IV Rank for {}: {}", symbol, String.format("%.1f",ivRank));
         return ivRank;
     }
 
