@@ -1073,6 +1073,9 @@ public class EnhancedStopLossMonitor {
                     state.setCurrentStop(newTrailingStop);
                     state.setTrailingActivated(true);
                     state.setAdjustmentReason(trailingReason);
+                    // MISSING: Update database
+                    trade.setStopLoss(newTrailingStop);
+                    tradeRepository.save(trade);
                     trailingUpdated = true;
 
                     log.info("Trailing stop updated",
