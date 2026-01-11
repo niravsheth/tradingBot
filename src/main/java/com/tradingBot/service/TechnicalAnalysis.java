@@ -48,7 +48,7 @@ public class TechnicalAnalysis {
 
     // Volume fields (replaced VolumeAnalysis)
     private long currentVolume;
-    private long averageVolume;
+    private BigDecimal averageVolume;
     private double volumeRatio; // current/average
     private boolean highVolume;
     private String volumeTrend; // INCREASING, DECREASING, STABLE

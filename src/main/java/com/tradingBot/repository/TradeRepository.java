@@ -72,4 +72,13 @@ public interface TradeRepository extends JpaRepository<Trade, Long> {
     // In TradeRepository interface, add:
     Optional<Trade> findBySignalId(Long signalId);
 
+    // ============================================
+    // NEW METHOD FOR MOCK TRADING SUPPORT
+    // ============================================
+    /**
+     * Find trades by status and failure reason - used to detect ORDER_FAILED trades
+     * that need to be converted to MOCK trades
+     */
+    List<Trade> findByStatusAndFailureReason(String status, String failureReason);
+
 }

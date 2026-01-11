@@ -84,11 +84,11 @@ public class MLTrendPredictor {
             }
 
             // Microstructure features
-            if (md.getBid() != null && md.getAsk() != null) {
-                features[i][4] = md.getAsk().subtract(md.getBid()).doubleValue(); // Spread
-                features[i][5] = (md.getBidSize() - md.getAskSize()) /
-                        (double)(md.getBidSize() + md.getAskSize()); // Order imbalance
-            }
+//            if (md.getBid() != null && md.getAsk() != null) {
+//                features[i][4] = md.getAsk().subtract(md.getBid()).doubleValue(); // Spread
+//                features[i][5] = (md.getBidSize() - md.getAskSize()) /
+//                        (double)(md.getBidSize() + md.getAskSize()); // Order imbalance
+//            }
 
             // Technical indicators
             if (i >= 14) {

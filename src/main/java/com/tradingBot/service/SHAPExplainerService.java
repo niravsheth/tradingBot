@@ -19,7 +19,10 @@ public class SHAPExplainerService {
     // MAIN PUBLIC METHOD - Explain signal generation
     public SHAPExplanation explainSignal(Signal signal, TechnicalAnalysis ta, String marketTrend) {
         try {
-            log.info("[SHAP] Generating explanation for signal: {}", signal.getOptionSymbol());
+            if (signal == null || ta == null) {
+                log.warn("[SHAP] Signal or TA is null, returning default explanation");
+                return createDefaultExplanation(signal);
+            }
 
             // Extract features from technical analysis
             Map<String, Double> features = extractFeatures(signal, ta, marketTrend);
@@ -44,7 +47,7 @@ public class SHAPExplainerService {
             shapExplanation.setTopNegativeFactors(getTopFactors(shapValues, false, 2));
 
             log.info("[SHAP] Explanation generated - Strength: {}, Top factor: {}",
-                    String.format("%.2f",explanationStrength), getTopFactor(shapValues));
+                    String.format("%.2f", explanationStrength), getTopFactor(shapValues));
 
             return shapExplanation;
 
@@ -58,19 +61,28 @@ public class SHAPExplainerService {
     public boolean validateSignalWithExplanation(Signal signal, TechnicalAnalysis ta, String marketTrend) {
         SHAPExplanation explanation = explainSignal(signal, ta, marketTrend);
 
+        // Null safety check
+        if (explanation == null) {
+            log.warn("[SHAP-VALIDATION] Explanation is null, returning false");
+            return false;
+        }
+
         // Require strong explanation for signal validation
         boolean strongExplanation = explanation.getExplanationStrength() >= 0.7;
 
-        // Check for conflicting factors
-        boolean hasConflictingFactors = hasStrongConflictingFactors(explanation.getShapValues());
+        // Check for conflicting factors - with null safety
+        Map<String, Double> shapValues = explanation.getShapValues();
+        boolean hasConflictingFactors = shapValues != null && hasStrongConflictingFactors(shapValues);
 
-        // Validate top factors make sense for signal type
-        boolean logicalFactors = validateSignalLogic(signal, explanation.getTopPositiveFactors());
+        // Validate top factors make sense for signal type - with null safety
+        List<String> topFactors = explanation.getTopPositiveFactors();
+        boolean logicalFactors = topFactors != null && validateSignalLogic(signal, topFactors);
 
         boolean isValid = strongExplanation && !hasConflictingFactors && logicalFactors;
 
         log.info("[SHAP-VALIDATION] Signal: {} - Strength: {}, Conflicts: {}, Logic: {}, Valid: {}",
-                signal.getOptionSymbol(), String.format("%.2f",explanation.getExplanationStrength()),
+                signal != null ? signal.getOptionSymbol() : "null",
+                String.format("%.2f", explanation.getExplanationStrength()),
                 hasConflictingFactors, logicalFactors, isValid);
 
         return isValid;
@@ -80,13 +92,13 @@ public class SHAPExplainerService {
     private Map<String, Double> extractFeatures(Signal signal, TechnicalAnalysis ta, String marketTrend) {
         Map<String, Double> features = new HashMap<>();
 
-        // Price-based features
+        // Price-based features - with null safety
         features.put("price_momentum", calculatePriceMomentum(ta));
-        features.put("price_to_vwap_ratio", ta.getPriceToVwapRatio());
+        features.put("price_to_vwap_ratio", ta.getPriceToVwapRatio() != 0 ? ta.getPriceToVwapRatio() : 0.0);
         features.put("vwap_deviation", calculateVWAPDeviation(ta));
 
         // Volume features
-        features.put("volume_ratio", ta.getVolumeRatio());
+        features.put("volume_ratio", ta.getVolumeRatio() != 0 ? ta.getVolumeRatio() : 1.0);
         features.put("volume_strength", ta.isHighVolume() ? 1.0 : 0.0);
 
         // Technical indicators
@@ -111,7 +123,8 @@ public class SHAPExplainerService {
         // Time-based features
         features.put("time_window_strength", calculateTimeWindowStrength());
 
-        log.debug("[SHAP-FEATURES] Extracted {} features for {}", features.size(), signal.getOptionSymbol());
+        log.debug("[SHAP-FEATURES] Extracted {} features for {}",
+                features.size(), signal != null ? signal.getOptionSymbol() : "null");
 
         return features;
     }
@@ -120,13 +133,23 @@ public class SHAPExplainerService {
     private Map<String, Double> calculateSHAPValues(Map<String, Double> features, Signal signal) {
         Map<String, Double> shapValues = new HashMap<>();
 
+        if (features == null || features.isEmpty()) {
+            return shapValues;
+        }
+
         // Base weights for different feature categories (learned from historical performance)
         Map<String, Double> baseWeights = getBaseFeatureWeights();
 
         // Calculate SHAP values based on feature values and learned weights
         for (Map.Entry<String, Double> feature : features.entrySet()) {
             String featureName = feature.getKey();
-            double featureValue = feature.getValue();
+            Double featureValue = feature.getValue();
+
+            // Null safety
+            if (featureValue == null) {
+                featureValue = 0.0;
+            }
+
             double baseWeight = baseWeights.getOrDefault(featureName, 0.1);
 
             // SHAP value = feature_value * base_weight * interaction_effects
@@ -137,7 +160,8 @@ public class SHAPExplainerService {
         }
 
         // Normalize SHAP values so they sum to the prediction (signal confidence)
-        normalizeShapValues(shapValues, signal.getConfidence());
+        double confidence = signal != null ? signal.getConfidence() : 0.5;
+        normalizeShapValues(shapValues, confidence);
 
         return shapValues;
     }
@@ -154,11 +178,11 @@ public class SHAPExplainerService {
 
         // Medium-impact features
         weights.put("price_momentum", 0.12);         // Price momentum matters
-        weights.put("rsi", 0.10);                   // RSI useful but not dominant
-        weights.put("macd_signal", 0.08);           // MACD helpful for confirmation
+        weights.put("rsi", 0.10);                    // RSI useful but not dominant
+        weights.put("macd_signal", 0.08);            // MACD helpful for confirmation
 
         // Lower-impact but useful features
-        weights.put("price_to_vwap_ratio", 0.06);   // VWAP ratio provides context
+        weights.put("price_to_vwap_ratio", 0.06);    // VWAP ratio provides context
         weights.put("time_window_strength", 0.05);   // Time windows matter for 0DTE
         weights.put("market_regime_strength", 0.04); // Market regime provides context
 
@@ -170,8 +194,8 @@ public class SHAPExplainerService {
         weights.put("vwap_as_resistance", 0.02);
 
         // Negative features (reduce confidence when present)
-        weights.put("rsi_divergence", -0.15);       // Divergences are warning signs
-        weights.put("macd_divergence", -0.10);      // Divergences reduce confidence
+        weights.put("rsi_divergence", -0.15);        // Divergences are warning signs
+        weights.put("macd_divergence", -0.10);       // Divergences reduce confidence
 
         return weights;
     }
@@ -180,94 +204,87 @@ public class SHAPExplainerService {
     private double calculateInteractionEffect(String featureName, Map<String, Double> features) {
         double baseEffect = 1.0;
 
+        // Null safety
+        if (features == null) {
+            return baseEffect;
+        }
+
         switch (featureName) {
             case "volume_ratio":
                 // Volume is more important when momentum is strong
-                double momentum = features.getOrDefault("momentum_strength", 0.0);
-                baseEffect += Math.abs(momentum) * 0.3;
-                break;
-
-            case "vwap_breakout":
-                // VWAP breakouts are more reliable with high volume
-                double volume = features.getOrDefault("volume_ratio", 1.0);
-                baseEffect += Math.max(0, (volume - 1.0) * 0.2);
-                break;
-
-            case "rsi":
-                // RSI is more meaningful at extremes
-                double rsiValue = features.getOrDefault("rsi", 0.5);
-                if (rsiValue > 0.7 || rsiValue < 0.3) {
-                    baseEffect += 0.2; // Boost at overbought/oversold levels
+                Double momentum = features.get("momentum_strength");
+                if (momentum != null && momentum > 0.5) {
+                    baseEffect *= 1.3;
                 }
                 break;
-
+            case "vwap_breakout":
+                // VWAP breakout more significant with high volume
+                Double volume = features.get("volume_ratio");
+                if (volume != null && volume > 1.5) {
+                    baseEffect *= 1.4;
+                }
+                break;
             case "trend_alignment":
-                // Trend alignment is more critical in volatile markets
-                double regimeStrength = features.getOrDefault("market_regime_strength", 0.5);
-                baseEffect += regimeStrength * 0.3;
+                // Trend alignment matters more in strong regimes
+                Double regime = features.get("market_regime_strength");
+                if (regime != null && regime > 0.7) {
+                    baseEffect *= 1.2;
+                }
+                break;
+            case "rsi":
+                // RSI extremes are more predictive
+                Double rsi = features.get("rsi");
+                if (rsi != null && (rsi < 0.3 || rsi > 0.7)) {
+                    baseEffect *= 1.3;
+                }
                 break;
         }
 
-        return Math.max(0.1, Math.min(2.0, baseEffect)); // Bound between 0.1 and 2.0
+        return baseEffect;
     }
 
-    // NORMALIZE SHAP VALUES to sum to prediction confidence
+    // NORMALIZATION - Make SHAP values sum to confidence
     private void normalizeShapValues(Map<String, Double> shapValues, double targetSum) {
-        double currentSum = shapValues.values().stream().mapToDouble(Double::doubleValue).sum();
+        if (shapValues == null || shapValues.isEmpty()) {
+            return;
+        }
 
-        if (Math.abs(currentSum) > 0.001) { // Avoid division by zero
-            double normalizationFactor = targetSum / currentSum;
-            shapValues.replaceAll((k, v) -> v * normalizationFactor);
+        double currentSum = shapValues.values().stream()
+                .filter(Objects::nonNull)
+                .mapToDouble(Double::doubleValue)
+                .sum();
+
+        if (Math.abs(currentSum) > 0.001) {
+            double scaleFactor = targetSum / currentSum;
+            shapValues.replaceAll((k, v) -> v != null ? v * scaleFactor : 0.0);
         }
     }
 
-    // EXPLANATION GENERATION - Convert SHAP values to human-readable text
+    // EXPLANATION GENERATION
     private String generateExplanation(Map<String, Double> shapValues, Signal signal) {
+        if (shapValues == null || shapValues.isEmpty()) {
+            return "Unable to generate explanation - no SHAP values";
+        }
+
         StringBuilder explanation = new StringBuilder();
+        String signalType = signal != null && signal.getOptionSymbol() != null && signal.getOptionSymbol().contains("P")
+                ? "PUT" : "CALL";
 
-        // Get top contributing factors
-        List<Map.Entry<String, Double>> sortedFactors = shapValues.entrySet().stream()
+        explanation.append(String.format("Signal generated for %s based on: ", signalType));
+
+        // Get top 3 positive factors
+        List<Map.Entry<String, Double>> topPositive = shapValues.entrySet().stream()
+                .filter(e -> e.getValue() != null && e.getValue() > 0)
                 .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-                .collect(Collectors.toList());
-
-        // Positive factors (supporting the signal)
-        List<Map.Entry<String, Double>> positiveFactors = sortedFactors.stream()
-                .filter(e -> e.getValue() > 0.05) // Only significant positive contributions
                 .limit(3)
                 .collect(Collectors.toList());
 
-        // Negative factors (opposing the signal)
-        List<Map.Entry<String, Double>> negativeFactors = sortedFactors.stream()
-                .filter(e -> e.getValue() < -0.03) // Only significant negative contributions
-                .limit(2)
-                .collect(Collectors.toList());
-
-        explanation.append("Signal Explanation:\n");
-
-        // Positive factors
-        if (!positiveFactors.isEmpty()) {
-            explanation.append("✅ Supporting Factors:\n");
-            for (Map.Entry<String, Double> factor : positiveFactors) {
-                String humanName = getHumanReadableFeatureName(factor.getKey());
-                double contribution = factor.getValue() * 100;
-                explanation.append(String.format("  • %s: +%.1f%%\n", humanName, contribution));
-            }
+        for (int i = 0; i < topPositive.size(); i++) {
+            Map.Entry<String, Double> factor = topPositive.get(i);
+            String humanName = getHumanReadableFeatureName(factor.getKey());
+            if (i > 0) explanation.append(", ");
+            explanation.append(humanName);
         }
-
-        // Negative factors
-        if (!negativeFactors.isEmpty()) {
-            explanation.append("❌ Opposing Factors:\n");
-            for (Map.Entry<String, Double> factor : negativeFactors) {
-                String humanName = getHumanReadableFeatureName(factor.getKey());
-                double contribution = Math.abs(factor.getValue()) * 100;
-                explanation.append(String.format("  • %s: -%.1f%%\n", humanName, contribution));
-            }
-        }
-
-        // Overall assessment
-        double netContribution = shapValues.values().stream().mapToDouble(Double::doubleValue).sum();
-        explanation.append(String.format("\nNet Prediction: %.1f%% confidence in %s signal",
-                netContribution * 100, signal.getStrategy()));
 
         return explanation.toString();
     }
@@ -290,36 +307,59 @@ public class SHAPExplainerService {
         nameMapping.put("vwap_as_support", "VWAP Support");
         nameMapping.put("vwap_as_resistance", "VWAP Resistance");
 
-        return nameMapping.getOrDefault(featureName, featureName.replace("_", " "));
+        return nameMapping.getOrDefault(featureName,
+                featureName != null ? featureName.replace("_", " ") : "Unknown");
     }
 
     // HELPER CALCULATION METHODS
     private double calculatePriceMomentum(TechnicalAnalysis ta) {
-        if (ta.getCurrentPrice() == null || ta.getPreviousClose() == null) return 0.0;
+        if (ta == null || ta.getCurrentPrice() == null || ta.getPreviousClose() == null) {
+            return 0.0;
+        }
 
-        return ta.getCurrentPrice().subtract(ta.getPreviousClose())
-                .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP)
-                .doubleValue();
+        try {
+            return ta.getCurrentPrice().subtract(ta.getPreviousClose())
+                    .divide(ta.getPreviousClose(), 4, RoundingMode.HALF_UP)
+                    .doubleValue();
+        } catch (Exception e) {
+            return 0.0;
+        }
     }
 
     private double calculateVWAPDeviation(TechnicalAnalysis ta) {
-        if (ta.getVwap() == null || ta.getCurrentPrice() == null) return 0.0;
+        if (ta == null || ta.getVwap() == null || ta.getCurrentPrice() == null) {
+            return 0.0;
+        }
 
-        return ta.getCurrentPrice().subtract(ta.getVwap())
-                .divide(ta.getVwap(), 4, RoundingMode.HALF_UP)
-                .doubleValue();
+        try {
+            if (ta.getVwap().compareTo(BigDecimal.ZERO) == 0) {
+                return 0.0;
+            }
+            return ta.getCurrentPrice().subtract(ta.getVwap())
+                    .divide(ta.getVwap(), 4, RoundingMode.HALF_UP)
+                    .doubleValue();
+        } catch (Exception e) {
+            return 0.0;
+        }
     }
 
     private double getMACDSignalValue(String macdSignal) {
         if (macdSignal == null) return 0.0;
         switch (macdSignal.toUpperCase()) {
-            case "BULLISH": return 0.8;
-            case "BEARISH": return -0.8;
-            default: return 0.0;
+            case "BULLISH":
+                return 0.8;
+            case "BEARISH":
+                return -0.8;
+            default:
+                return 0.0;
         }
     }
 
     private double calculateTrendAlignment(Signal signal, String marketTrend) {
+        if (signal == null || signal.getOptionSymbol() == null || marketTrend == null) {
+            return 0.0;
+        }
+
         boolean isPut = signal.getOptionSymbol().contains("P");
         boolean isCall = !isPut;
 
@@ -350,7 +390,6 @@ public class SHAPExplainerService {
     }
 
     private double calculateTimeWindowStrength() {
-        // Simple implementation - could be enhanced based on current time
         java.time.LocalTime now = java.time.LocalTime.now();
 
         // Prime trading hours (10:00-12:00, 13:30-15:30)
@@ -366,14 +405,17 @@ public class SHAPExplainerService {
 
     // VALIDATION HELPERS
     private double calculateExplanationStrength(Map<String, Double> shapValues) {
-        // Calculate how strong/confident the explanation is
+        if (shapValues == null || shapValues.isEmpty()) {
+            return 0.0;
+        }
+
         double totalPositive = shapValues.values().stream()
-                .filter(v -> v > 0)
+                .filter(v -> v != null && v > 0)
                 .mapToDouble(Double::doubleValue)
                 .sum();
 
         double totalNegative = Math.abs(shapValues.values().stream()
-                .filter(v -> v < 0)
+                .filter(v -> v != null && v < 0)
                 .mapToDouble(Double::doubleValue)
                 .sum());
 
@@ -383,26 +425,32 @@ public class SHAPExplainerService {
     }
 
     private boolean hasStrongConflictingFactors(Map<String, Double> shapValues) {
+        if (shapValues == null || shapValues.isEmpty()) {
+            return false;
+        }
+
         double totalPositive = shapValues.values().stream()
-                .filter(v -> v > 0)
+                .filter(v -> v != null && v > 0)
                 .mapToDouble(Double::doubleValue)
                 .sum();
 
         double totalNegative = Math.abs(shapValues.values().stream()
-                .filter(v -> v < 0)
+                .filter(v -> v != null && v < 0)
                 .mapToDouble(Double::doubleValue)
                 .sum());
 
         // If negative factors are more than 40% of positive, it's conflicting
-        return totalNegative > (totalPositive * 0.4);
+        return totalPositive > 0 && totalNegative > (totalPositive * 0.4);
     }
 
     private boolean validateSignalLogic(Signal signal, List<String> topFactors) {
-        boolean isPut = signal.getOptionSymbol().contains("P");
+        if (topFactors == null || topFactors.isEmpty()) {
+            return false;
+        }
 
         // Check if top factors make sense for signal type
         for (String factor : topFactors) {
-            if (factor.equals("trend_alignment")) {
+            if ("Trend Alignment".equals(factor)) {
                 // Trend alignment should always be positive for valid signals
                 return true;
             }
@@ -412,8 +460,12 @@ public class SHAPExplainerService {
     }
 
     private List<String> getTopFactors(Map<String, Double> shapValues, boolean positive, int count) {
+        if (shapValues == null || shapValues.isEmpty()) {
+            return new ArrayList<>();
+        }
+
         return shapValues.entrySet().stream()
-                .filter(e -> positive ? e.getValue() > 0 : e.getValue() < 0)
+                .filter(e -> e.getValue() != null && (positive ? e.getValue() > 0 : e.getValue() < 0))
                 .sorted(positive ?
                         Map.Entry.<String, Double>comparingByValue().reversed() :
                         Map.Entry.<String, Double>comparingByValue())
@@ -423,7 +475,12 @@ public class SHAPExplainerService {
     }
 
     private String getTopFactor(Map<String, Double> shapValues) {
+        if (shapValues == null || shapValues.isEmpty()) {
+            return "Unknown";
+        }
+
         return shapValues.entrySet().stream()
+                .filter(e -> e.getValue() != null)
                 .max(Map.Entry.comparingByValue())
                 .map(e -> getHumanReadableFeatureName(e.getKey()))
                 .orElse("Unknown");
@@ -431,8 +488,8 @@ public class SHAPExplainerService {
 
     private SHAPExplanation createDefaultExplanation(Signal signal) {
         SHAPExplanation explanation = new SHAPExplanation();
-        explanation.setSignal(signal.getOptionSymbol());
-        explanation.setStrategy(signal.getStrategy());
+        explanation.setSignal(signal != null ? signal.getOptionSymbol() : "Unknown");
+        explanation.setStrategy(signal != null ? signal.getStrategy() : "Unknown");
         explanation.setExplanation("Unable to generate detailed explanation");
         explanation.setExplanationStrength(0.5);
         explanation.setFeatures(new HashMap<>());

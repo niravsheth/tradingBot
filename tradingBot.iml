@@ -67,8 +67,6 @@
     <orderEntry type="library" name="Maven: org.springframework:spring-webmvc:6.1.1" level="project" />
     <orderEntry type="library" name="Maven: org.springframework:spring-expression:6.1.1" level="project" />
     <orderEntry type="library" scope="RUNTIME" name="Maven: com.h2database:h2:2.2.224" level="project" />
-    <orderEntry type="library" scope="RUNTIME" name="Maven: org.postgresql:postgresql:42.6.0" level="project" />
-    <orderEntry type="library" name="Maven: org.checkerframework:checker-qual:3.31.0" level="project" />
     <orderEntry type="library" name="Maven: com.squareup.okhttp3:okhttp:4.12.0" level="project" />
     <orderEntry type="library" name="Maven: com.squareup.okio:okio:3.6.0" level="project" />
     <orderEntry type="library" name="Maven: com.squareup.okio:okio-jvm:3.6.0" level="project" />
@@ -92,6 +90,7 @@
     <orderEntry type="library" name="Maven: org.springframework.boot:spring-boot-starter-cache:3.2.0" level="project" />
     <orderEntry type="library" name="Maven: org.springframework:spring-context-support:6.1.1" level="project" />
     <orderEntry type="library" name="Maven: com.github.ben-manes.caffeine:caffeine:3.1.8" level="project" />
+    <orderEntry type="library" name="Maven: org.checkerframework:checker-qual:3.37.0" level="project" />
     <orderEntry type="library" name="Maven: com.google.errorprone:error_prone_annotations:2.21.1" level="project" />
     <orderEntry type="library" name="Maven: org.springframework.boot:spring-boot-starter-validation:3.2.0" level="project" />
     <orderEntry type="library" name="Maven: org.apache.tomcat.embed:tomcat-embed-el:10.1.16" level="project" />
@@ -107,5 +106,6 @@
     <orderEntry type="library" name="Maven: io.prometheus:simpleclient_tracer_otel:0.16.0" level="project" />
     <orderEntry type="library" name="Maven: io.prometheus:simpleclient_tracer_common:0.16.0" level="project" />
     <orderEntry type="library" name="Maven: io.prometheus:simpleclient_tracer_otel_agent:0.16.0" level="project" />
+    <orderEntry type="library" scope="RUNTIME" name="Maven: com.mysql:mysql-connector-j:8.0.33" level="project" />
   </component>
 </module>

@@ -543,6 +543,7 @@ public class Trade {
     @Column(name = "luck_factor")
     private Double luckFactor;
 
+
     // =====================================
     // METADATA STORAGE
     // =====================================

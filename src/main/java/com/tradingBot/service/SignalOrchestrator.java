@@ -351,7 +351,7 @@ public class SignalOrchestrator {
     private List<Signal> adjustForConfluence(List<Signal> signals, TechnicalAnalysis ta,
                                              String analysisId) {
         // Check for confluence factors
-        boolean hasVolumeConfirmation = ta.getVolumeRatio() > 1.5;
+        boolean hasVolumeConfirmation = ta.getVolumeRatio() > 0.5;
         boolean hasMomentumAlignment = Math.abs(ta.getMomentumStrength()) > 0.5;
         boolean hasCleanTrend = !ta.isHasRsiDivergence() && !ta.isHasMacdDivergence();
 

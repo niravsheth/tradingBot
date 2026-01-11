@@ -79,9 +79,9 @@ public class QQQConstituentService {
 
         double finalAlignment = totalWeight > 0 ? alignmentScore / totalWeight : 0.5;
 
-        log.debug("QQQ Constituent Alignment: {} (Total Weight: {})",
-                String.format("%.3f", finalAlignment),
-                String.format("%.3f", totalWeight));
+//        log.debug("QQQ Constituent Alignment: {} (Total Weight: {})",
+//                String.format("%.3f", finalAlignment),
+//                String.format("%.3f", totalWeight));
 
         return finalAlignment;
     }

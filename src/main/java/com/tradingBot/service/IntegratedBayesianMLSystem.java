@@ -31,7 +31,7 @@ public class IntegratedBayesianMLSystem {
 
     // Configuration constants - ADJUSTED FOR BETTER PERFORMANCE
     private static final int MIN_HISTORICAL_TRADES = 10;
-    private static final double DEFAULT_THRESHOLD = 0.70; // REDUCED from 0.75
+    private static final double DEFAULT_THRESHOLD = 0.60; // REDUCED from 0.75
     private static final double MIN_CONFIDENCE = 0.0;
     private static final double MAX_CONFIDENCE = 1.0;
     private static final int CACHE_EXPIRY_MINUTES = 30;
@@ -350,7 +350,7 @@ public class IntegratedBayesianMLSystem {
             double finalThreshold = adjustThresholdByPerformance(adjustedThreshold, learningState.getPerformanceScore());
 
             // Ensure threshold is within valid range
-            finalThreshold = Math.max(0.5, Math.min(0.95, finalThreshold));
+            finalThreshold = Math.max(0.5, Math.min(0.80, finalThreshold));
 
             DynamicThreshold threshold = DynamicThreshold.builder()
                     .baseThreshold(baseThreshold)
@@ -782,10 +782,10 @@ public class IntegratedBayesianMLSystem {
         switch (learningState.getLearningPhase()) {
             case "BOOTSTRAPPING":
                 // REDUCED: More lenient for new strategies - was +0.1, now +0.05
-                return Math.min(baseThreshold + 0.05, 0.80); // Cap at 80% instead of 90%
+                return Math.min(baseThreshold + 0.00, 0.70); // Cap at 80% instead of 90%
             case "LEARNING":
                 // REDUCED: Slightly more lenient - was +0.05, now +0.02
-                return Math.min(baseThreshold + 0.02, 0.82); // Cap at 82% instead of 85%
+                return Math.min(baseThreshold + 0.02, 0.75); // Cap at 82% instead of 85%
             case "OPTIMIZING":
                 return baseThreshold; // Use as-is
             case "MATURE":
@@ -799,7 +799,7 @@ public class IntegratedBayesianMLSystem {
         if (performanceScore > 0.1) { // Good performance
             return Math.max(threshold - 0.05, 0.5);
         } else if (performanceScore < -0.1) { // Poor performance
-            return Math.min(threshold + 0.1, 0.95);
+            return Math.min(threshold + 0.1, 0.74);
         }
         return threshold;
     }
@@ -1262,8 +1262,8 @@ public class IntegratedBayesianMLSystem {
 
             // Log significant performance changes
             if (Math.abs(metricsUpdate.getPerformanceDelta()) > 0.05) {
-                log.warn("[ML_INSIGHTS] Significant performance change detected for {}: {:.3f}",
-                        trade.getStrategy(), metricsUpdate.getPerformanceDelta());
+                log.warn("[ML_INSIGHTS] Significant performance change detected for {}: {}",
+                        trade.getStrategy(), String.format("%.3f",metricsUpdate.getPerformanceDelta()));
             }
 
         } catch (Exception e) {

@@ -174,17 +174,19 @@ public class TradingService {
     @Transactional
     public void checkOpenPositions() {
         String checkId = UUID.randomUUID().toString().substring(0, 8);
-        log.debug("[ENHANCED][{}] Checking open positions with order validation", checkId);
+        log.debug("[ENHANCED][{}] Checking open positions with coordination", checkId);
 
         positionSyncService.refreshPositions();
 
         Map<String, BrokerPosition> brokerPositions = positionSyncService.getCurrentPositions(false);
 
+        // CRITICAL: Only get OPEN trades, exclude CLOSING trades
         List<Trade> dbTrades = tradeRepository.findByStatusAndSymbol("OPEN", "QQQ").stream()
                 .filter(this::hasValidOrderExecution)
+                .filter(trade -> !"CLOSING".equals(trade.getStatus())) // Extra safety check
                 .collect(Collectors.toList());
 
-        log.info("[{}] Found {} broker positions, {} valid DB trades for monitoring",
+        log.info("[{}] Found {} broker positions, {} OPEN DB trades for monitoring",
                 checkId, brokerPositions.size(), dbTrades.size());
 
         for (Map.Entry<String, BrokerPosition> entry : brokerPositions.entrySet()) {
@@ -202,7 +204,10 @@ public class TradingService {
                     .orElse(null);
 
             if (dbTrade != null) {
-                checkPositionWithEnhancedStopLoss(brokerPos, dbTrade, checkId);
+                // Verify trade is still available for processing
+                if (canProcessTrade(dbTrade, checkId)) {
+                    checkPositionWithEnhancedStopLoss(brokerPos, dbTrade, checkId);
+                }
             } else {
                 checkBrokerOnlyPosition(brokerPos, checkId);
             }
@@ -298,21 +303,21 @@ public class TradingService {
             }
 
             // STEP 5: Log enhanced stop-loss status
-            EnhancedStopLossMonitor.StopLossState stopState =
-                    enhancedStopLossMonitor.getStopLossState(dbTrade.getId().toString());
-
-            if (stopState != null) {
-                log.info("[ENHANCED][{}] Stop Status - Original: ${}, Current: ${}, Reason: {}",
-                        checkId, stopState.getOriginalStop(), stopState.getCurrentStop(),
-                        stopState.getAdjustmentReason());
-
-                // Update trade record with enhanced stop
-                if (stopState.getCurrentStop() != null &&
-                        !stopState.getCurrentStop().equals(dbTrade.getStopLoss())) {
-                    dbTrade.setStopLoss(stopState.getCurrentStop());
-                    log.info("[ENHANCED][{}] Updated DB stop-loss to ${}", checkId, stopState.getCurrentStop());
-                }
-            }
+//            EnhancedStopLossMonitor.StopLossState stopState =
+//                    enhancedStopLossMonitor.getStopLossState(dbTrade.getId().toString());
+//
+//            if (stopState != null) {
+//                log.info("[ENHANCED][{}] Stop Status - Original: ${}, Current: ${}, Reason: {}",
+//                        checkId, stopState.getOriginalStop(), stopState.getCurrentStop(),
+//                        stopState.getAdjustmentReason());
+//
+//                // Update trade record with enhanced stop
+//                if (stopState.getCurrentStop() != null &&
+//                        !stopState.getCurrentStop().equals(dbTrade.getStopLoss())) {
+//                    dbTrade.setStopLoss(stopState.getCurrentStop());
+//                    log.info("[ENHANCED][{}] Updated DB stop-loss to ${}", checkId, stopState.getCurrentStop());
+//                }
+//            }
 
             // STEP 6: Check for traditional exits (targets, time-based)
             boolean shouldClose = false;
@@ -430,6 +435,38 @@ public class TradingService {
 
     private final ZeroDTEStrategy zeroDTEStrategy;
 
+    private boolean canProcessTrade(Trade trade, String checkId) {
+        try {
+            // Get fresh trade status from database
+            Trade freshTrade = tradeRepository.findById(trade.getId()).orElse(null);
+
+            if (freshTrade == null) {
+                log.warn("[{}] Trade {} not found in database", checkId, trade.getId());
+                return false;
+            }
+
+            if (!"OPEN".equals(freshTrade.getStatus())) {
+                log.debug("[{}] Trade {} status is {} - skipping processing",
+                        checkId, trade.getId(), freshTrade.getStatus());
+                return false;
+            }
+
+            // Check if enhanced monitor is already processing
+            if (freshTrade.getLastAdjustmentTime() != null &&
+                    freshTrade.getLastAdjustmentTime().isAfter(LocalDateTime.now().minusSeconds(30))) {
+                log.debug("[{}] Trade {} recently processed by another system - skipping",
+                        checkId, trade.getId());
+                return false;
+            }
+
+            return true;
+
+        } catch (Exception e) {
+            log.error("[{}] Error checking if trade {} can be processed: {}",
+                    checkId, trade.getId(), e.getMessage());
+            return false;
+        }
+    }
 
     private double calculatePnLPercent(Trade trade) {
         if (trade.getExitPrice() != null && trade.getEntryPrice() != null) {
@@ -456,7 +493,7 @@ public class TradingService {
             tradeRepository.save(trade);
 
             // Update enhanced monitoring
-            enhancedStopLossMonitor.adjustStopLoss(tradeId.toString(), newStop, reason);
+            //enhancedStopLossMonitor.adjustStopLoss(tradeId.toString(), newStop, reason);
 
             log.info("[MANUAL STOP] Trade {} - Stop adjusted to ${} (Reason: {})",
                     tradeId, newStop, reason);
@@ -686,11 +723,37 @@ public class TradingService {
 
     private void executePositionClose(Trade trade, BrokerPosition brokerPos,
                                       BigDecimal exitPrice, String reason, String checkId) {
+        String tradeId = trade.getId().toString();
+
         try {
-            log.info("[{}] EXECUTING CLOSE for {} - Reason: {}",
+            log.info("[{}] ATTEMPTING POSITION CLOSE for {} - Reason: {}",
                     checkId, trade.getOptionSymbol(), reason);
 
-            // Create market order to close
+            // STEP 1: ATOMIC STATUS LOCKING - Try to acquire trade for closing
+            Trade freshTrade = tradeRepository.findById(trade.getId())
+                    .orElseThrow(() -> new RuntimeException("Trade not found: " + trade.getId()));
+
+            if (!"OPEN".equals(freshTrade.getStatus())) {
+                log.warn("[{}] Cannot close trade {} - Status is {} (another system processing)",
+                        checkId, trade.getId(), freshTrade.getStatus());
+                return;
+            }
+
+            // Atomic status change: OPEN -> CLOSING
+            freshTrade.setStatus("CLOSING");
+            freshTrade.setLastAdjustmentTime(LocalDateTime.now());
+            Trade savedTrade = tradeRepository.saveAndFlush(freshTrade);
+
+            // Verify status change
+            Trade verifyTrade = tradeRepository.findById(trade.getId()).orElse(null);
+            if (verifyTrade == null || !"CLOSING".equals(verifyTrade.getStatus())) {
+                log.error("[{}] Failed to acquire trade {} for closing", checkId, trade.getId());
+                return;
+            }
+
+            log.info("[{}] Successfully acquired trade {} for position close", checkId, trade.getId());
+
+            // STEP 2: CREATE AND PLACE SELL ORDER
             OrderRequest closeOrder = new OrderRequest();
             closeOrder.setupForOption(brokerPos.getSymbol());
             closeOrder.setSymbol(brokerPos.getSymbol());
@@ -699,56 +762,78 @@ public class TradingService {
             closeOrder.setType("market");
             closeOrder.setDuration("day");
 
-            log.info("[{}] Placing MARKET close order for {} contracts",
-                    checkId, closeOrder.getQuantity());
+            log.info("[{}] Placing MARKET close order for {} contracts", checkId, closeOrder.getQuantity());
 
             OrderResponse response = tradierService.placeOrder(closeOrder);
 
             if (response != null && response.getOrder() != null) {
-                // Update trade record
-                trade.setExitPrice(exitPrice);
-                trade.setExitTime(LocalDateTime.now());
-                trade.setStatus("CLOSED");
-                trade.setCloseReason(reason);
-                trade.setExitReason(reason);
+                // STEP 3: UPDATE TRADE TO FINAL CLOSED STATUS
+                freshTrade.setStatus("CLOSED");
+                freshTrade.setExitPrice(exitPrice);
+                freshTrade.setExitTime(LocalDateTime.now());
+                freshTrade.setCloseReason(reason);
+                freshTrade.setExitReason(reason);
 
                 // Calculate final P&L
                 BigDecimal finalPnl = exitPrice.subtract(brokerPos.getAvgCost())
                         .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100));
-                trade.setRealizedPnl(finalPnl);
-                trade.setProfit(finalPnl);
+                freshTrade.setRealizedPnl(finalPnl);
+                freshTrade.setProfit(finalPnl);
 
-                tradeRepository.save(trade);
+                tradeRepository.saveAndFlush(freshTrade);
 
-                integratedBayesianMLSystem.closeTradeWithMLFeedback(trade, reason);
+                // Feed ML system
+                integratedBayesianMLSystem.closeTradeWithMLFeedback(freshTrade, reason);
+
                 // Refresh positions
                 positionSyncService.refreshPositions();
 
+                log.info("[{}] Successfully closed position {} - P&L: ${}",
+                        checkId, trade.getOptionSymbol(), finalPnl);
+
                 // Send alert
                 String emoji = finalPnl.compareTo(BigDecimal.ZERO) >= 0 ? "✅" : "❌";
-//                telegramService.sendMessage(String.format(
-//                        "%s Position Closed: %s\n" +
-//                                "Reason: %s\n" +
-//                                "Entry: $%.2f → Exit: $%.2f\n" +
-//                                "P&L: $%.2f (%.1f%%)\n" +
-//                                "Order ID: %s",
-//                        emoji, trade.getOptionSymbol(),
-//                        reason,
-//                        brokerPos.getAvgCost(), exitPrice,
-//                        finalPnl,
-//                        finalPnl.divide(brokerPos.getAvgCost()
-//                                        .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100)),
-//                                2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100)),
-//                        response.getOrder().getId()
-//                ));
+                telegramService.sendMessage(String.format(
+                        "%s Position Closed: %s\n" +
+                                "Reason: %s\n" +
+                                "Entry: $%.2f → Exit: $%.2f\n" +
+                                "P&L: $%.2f (%.1f%%)\n" +
+                                "Order ID: %s",
+                        emoji, trade.getOptionSymbol(),
+                        reason,
+                        brokerPos.getAvgCost(), exitPrice,
+                        finalPnl,
+                        finalPnl.divide(brokerPos.getAvgCost()
+                                        .multiply(BigDecimal.valueOf(Math.abs(brokerPos.getQuantity()) * 100)),
+                                2, RoundingMode.HALF_UP).multiply(BigDecimal.valueOf(100)),
+                        response.getOrder()
+                ));
 
             } else {
-                log.error("[{}] Failed to place close order", checkId);
+                log.error("[{}] Failed to place close order for trade {}", checkId, trade.getId());
+
+                // Release lock on failure
+                freshTrade.setStatus("OPEN");
+                freshTrade.setLastAdjustmentTime(LocalDateTime.now());
+                tradeRepository.saveAndFlush(freshTrade);
+
                 telegramService.sendMessage("❌ Failed to close position: " + trade.getOptionSymbol());
             }
 
         } catch (Exception e) {
-            log.error("[{}] Error executing close: {}", checkId, e.getMessage());
+            log.error("[{}] Error executing close for trade {}: {}", checkId, trade.getId(), e.getMessage());
+
+            // Release lock on error
+            try {
+                Trade errorTrade = tradeRepository.findById(trade.getId()).orElse(null);
+                if (errorTrade != null && "CLOSING".equals(errorTrade.getStatus())) {
+                    errorTrade.setStatus("OPEN");
+                    tradeRepository.saveAndFlush(errorTrade);
+                }
+            } catch (Exception releaseError) {
+                log.error("Error releasing trade lock: {}", releaseError.getMessage());
+            }
+
             telegramService.sendMessage("❌ Error closing position: " + e.getMessage());
         }
     }

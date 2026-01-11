@@ -26,7 +26,7 @@ public class PreTradeRiskEngine {
     @Value("${trading.pre-trade.max-vix:35}")
     private double maxVix;
 
-    @Value("${trading.pre-trade.min-market-breadth:0.3}")
+    @Value("${trading.pre-trade.min-market-breadth:0.1}")
     private double minMarketBreadth;
 
     @Value("${trading.pre-trade.max-daily-trades:20}")
@@ -37,37 +37,42 @@ public class PreTradeRiskEngine {
 
     public boolean isMarketSuitable() {
         String checkId = "MKT-" + System.currentTimeMillis();
-        log.info("[PRE-TRADE][{}] Running market suitability checks", checkId);
+        //log.info("[PRE-TRADE][{}] Running market suitability checks", checkId);
 
         // 1. Check VIX level
         try {
             QuoteResponse vixQuote = tradierService.getQuote("VIX");
-            if (vixQuote != null && vixQuote.getQuote() != null) {
+            if (vixQuote != null && vixQuote.getQuote() != null && vixQuote.getQuote().getLast() != null) {
                 double vixLevel = vixQuote.getQuote().getLast().doubleValue();
                 if (vixLevel > maxVix) {
                     log.warn("[PRE-TRADE][{}] VIX too high: {} > {}", checkId, vixLevel, maxVix);
                     return false;
                 }
-                //log.info("[PRE-TRADE][{}] VIX check passed: {}", checkId, vixLevel);
+                log.info("[PRE-TRADE][{}] VIX check passed: {}", checkId, vixLevel);
+            } else {
+                log.warn("[PRE-TRADE][{}] VIX data unavailable, skipping VIX check", checkId);
             }
         } catch (Exception e) {
             log.error("[PRE-TRADE][{}] VIX check failed: {}", checkId, e.getMessage());
         }
 
-        // 2. Check market breadth (using QQQ volume as proxy)
+        // 2. Check market breadth (using QQQ bid/ask ratio as proxy)
         try {
             QuoteResponse qqqQuote = tradierService.getQuote("QQQ");
             if (qqqQuote != null && qqqQuote.getQuote() != null) {
                 Quote quote = qqqQuote.getQuote();
-                if (quote.getBidSize() != null && quote.getAskSize() != null) {
+                if (quote.getBidSize() != null && quote.getAskSize() != null &&
+                        (quote.getBidSize() + quote.getAskSize()) > 0) {
                     double breadth = (double) quote.getBidSize() /
                             (quote.getBidSize() + quote.getAskSize());
                     if (breadth < minMarketBreadth) {
-                        log.warn("[PRE-TRADE][{}] Market breadth too low: {} < {}",
-                                checkId, breadth, minMarketBreadth);
+                        log.warn("[PRE-TRADE][{}] Market breadth too low: {:.4f} < {} (Bid: {}, Ask: {})",
+                                checkId, breadth, minMarketBreadth, quote.getBidSize(), quote.getAskSize());
                         return false;
                     }
-                    //log.info("[PRE-TRADE][{}] Market breadth check passed: {}", checkId, breadth);
+                    log.info("[PRE-TRADE][{}] Market breadth check passed: {:.4f}", checkId, breadth);
+                } else {
+                    log.warn("[PRE-TRADE][{}] Bid/Ask size unavailable, skipping breadth check", checkId);
                 }
             }
         } catch (Exception e) {
@@ -104,7 +109,7 @@ public class PreTradeRiskEngine {
         if (option == null) return false;
 
         String checkId = option.getSymbol() + "-" + System.currentTimeMillis();
-        log.debug("[PRE-TRADE][{}] Checking strike suitability", checkId);
+        //log.debug("[PRE-TRADE][{}] Checking strike suitability", checkId);
 
         // 1. Volume check
         if (option.getVolume() < 50) {
@@ -113,8 +118,8 @@ public class PreTradeRiskEngine {
         }
 
         // 2. Open Interest check
-        if (option.getOpenInterest() < 1000) {
-            log.debug("[PRE-TRADE][{}] OI too low: {} < 1000", checkId, option.getOpenInterest());
+        if (option.getOpenInterest() < 500) {
+            log.debug("[PRE-TRADE][{}] OI too low: {} < 500", checkId, option.getOpenInterest());
             return false;
         }
 

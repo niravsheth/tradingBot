@@ -1,25 +1,18 @@
 package com.tradingBot.service;
 
 import com.tradingBot.entity.MarketData;
-import com.tradingBot.model.*;
-import com.tradingBot.service.*;
+import com.tradingBot.service.TechnicalAnalysis;
+import com.tradingBot.model.QuoteResponse;
+import com.tradingBot.model.Quote;
 import com.tradingBot.repository.MarketDataRepository;
-import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.ZoneId;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
@@ -27,913 +20,852 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class TechnicalAnalysisService {
 
-    private final TradierService tradierService;
     private final MarketDataRepository marketDataRepository;
+    private final TradierService tradierService;
+    private final BarAggregationService barAggregationService;
 
-    // Constants for technical analysis calculations
-    private static final int VWAP_PERIOD = 20;
-    private static final int RSI_PERIOD = 14;
-    private static final int VOLATILITY_PERIOD = 20;
-    private static final int VOLUME_AVG_PERIOD = 20;
-    private static final double STD_DEV_MULTIPLIER = 2.0;
-    private static final int LOOKBACK_CANDLES = 5;
-    private static final int SUPPORT_RESISTANCE_LOOKBACK = 50;
+    private static final int DEFAULT_PERIOD = 14; // For RSI, ATR
+    private static final int BOLLINGER_PERIOD = 20;
+    private static final double BOLLINGER_STD_DEV = 2.0;
+    private static final int MIN_BARS_REQUIRED = 20;
 
-    // Add these fields for VWAP optimization
-    private final Map<String, VWAPState> vwapStateCache = new ConcurrentHashMap<>();
-    private static final long VWAP_CACHE_TTL = 60000; // 1 minute
-
-    private static final ZoneId ET_ZONE = ZoneId.of("America/New_York");
-
-    @Data
-    private static class VWAPState {
-        private BigDecimal cumulativePriceVolume = BigDecimal.ZERO;
-        private BigDecimal cumulativeVolume = BigDecimal.ZERO;
-        private BigDecimal vwap = BigDecimal.ZERO;
-        private BigDecimal sumSquaredDeviations = BigDecimal.ZERO;
-        private int dataPointCount = 0;
-        private LocalDateTime lastUpdate;
-        private LocalDateTime sessionStart;
-
-        public boolean isStale() {
-            return lastUpdate == null ||
-                    LocalDateTime.now().isAfter(lastUpdate.plusSeconds(60));
-        }
-
-        public boolean isNewSession(LocalDateTime marketOpen) {
-            return sessionStart == null ||
-                    !sessionStart.toLocalDate().equals(marketOpen.toLocalDate());
-        }
-    }
-
+    /**
+     * Main analysis method with comprehensive NULL handling
+     */
     public TechnicalAnalysis analyze(String symbol) {
-        log.info("[TA] Starting technical analysis for {}", symbol);
+        String analysisId = UUID.randomUUID().toString().substring(0, 8);
+        log.info("[TA][{}] Starting technical analysis for {}", analysisId, symbol);
 
-        // Fetch market data since market open
-        LocalDateTime marketOpen = LocalDateTime.now().withHour(9).withMinute(30).withSecond(0).withNano(0);
-        List<MarketData> sessionData = marketDataRepository
-                .findBySymbolAndTimestampAfterOrderByTimestampAsc(symbol, marketOpen);
+        try {
+            // Get market data with fallback mechanisms
+            List<MarketData> marketData = getValidMarketData(symbol, analysisId);
 
-        if (sessionData == null || sessionData.isEmpty()) {
-            log.error("[TA] No market data available for {}", symbol);
-            return null;
+            if (marketData == null || marketData.isEmpty()) {
+                log.error("[TA][{}] No valid market data available for {}", analysisId, symbol);
+                return createFallbackAnalysis(symbol, analysisId);
+            }
+
+            // Create technical analysis object
+            TechnicalAnalysis ta = new TechnicalAnalysis();
+            ta.setSymbol(symbol);
+            ta.setTimestamp(LocalDateTime.now());
+
+            // Get current price from most recent bar or quote
+            BigDecimal currentPrice = getCurrentPrice(marketData, symbol);
+            if (currentPrice == null) {
+                log.error("[TA][{}] Cannot determine current price for {}", analysisId, symbol);
+                return createFallbackAnalysis(symbol, analysisId);
+            }
+            ta.setCurrentPrice(currentPrice);
+
+            // Calculate indicators with NULL safety
+            calculateVWAP(ta, marketData, analysisId);
+            calculateRSI(ta, marketData, analysisId);
+            calculateMovingAverages(ta, marketData, analysisId);
+            calculateBollingerBands(ta, marketData, analysisId);
+            calculateATR(ta, marketData, analysisId);
+            calculateVolatility(ta, marketData, analysisId);
+            calculateVolumeMetrics(ta, marketData, analysisId);
+            calculateMomentum(ta, marketData, analysisId);
+            determineTrend(ta, marketData, analysisId);
+
+            // Validate the analysis
+            if (!validateAnalysis(ta, analysisId)) {
+                log.warn("[TA][{}] Analysis validation failed, using fallback", analysisId);
+                return enhanceWithFallbackData(ta, symbol, analysisId);
+            }
+
+            log.info("[TA][{}] Analysis complete - Price: ${}, VWAP: ${}, RSI: {}",
+                    analysisId, ta.getCurrentPrice(), ta.getVwap(), ta.getRsi());
+
+            return ta;
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error analyzing {}: {}", analysisId, symbol, e.getMessage(), e);
+            return createFallbackAnalysis(symbol, analysisId);
         }
-
-
-        //log.info("[TA] Found {} data points for analysis", sessionData.size());
-
-        // Get current quote
-        QuoteResponse quote = tradierService.getQuote(symbol);
-        if (quote == null || quote.getQuote() == null) {
-            log.error("[TA] Failed to fetch current quote for {}", symbol);
-            return null;
-        }
-        BigDecimal currentPrice = quote.getQuote().getLast();
-        long currentVolume = quote.getQuote().getVolume() != null ? quote.getQuote().getVolume() : 0L;
-
-        TechnicalAnalysis ta = new TechnicalAnalysis();
-        ta.setSymbol(symbol);
-        ta.setTimestamp(LocalDateTime.now());
-        ta.setCurrentPrice(currentPrice);
-        ta.setCurrentVolume(currentVolume);
-
-//        if (ta.getRsi() <= 0.0 || ta.getRsi() >= 100.0 || Double.isNaN(ta.getRsi())) {
-//            log.error("Invalid RSI detected: {} - aborting analysis", ta.getRsi());
-//            return null;
-//        }
-
-        // Calculate VWAP and bands
-        calculateVWAPIndicators(sessionData, ta);
-
-        // Calculate volume metrics
-        calculateVolumeMetrics(sessionData, currentVolume, ta);
-
-        // Calculate volatility metrics
-        calculateVolatilityMetrics(sessionData, ta);
-
-        // Calculate momentum indicators
-        calculateMomentumIndicators(sessionData, ta);
-
-        // Calculate support and resistance levels
-        calculateSupportResistance(sessionData, ta);
-
-        // Analyze trends - UPDATED METHOD
-        analyzeTrends(sessionData, ta);
-
-        // Check for reversals
-        checkReversals(ta);
-
-        // Set dynamic parameters based on market conditions
-        setDynamicParameters(ta);
-
-        // Detect market regime
-        detectMarketRegime(ta);
-
-        // Calculate opening range if within first hour
-        calculateOpeningRange(sessionData, ta);
-
-        // Check for divergences
-        checkDivergences(sessionData, ta);
-
-        // Calculate VWAP extensions
-        calculateVwapExtensions(ta);
-
-        log.info("[TA] Analysis complete - VWAP: ${}, Price: ${}, RSI: {}, Volume Ratio: {}, Regime: {}",
-                ta.getVwap(), ta.getCurrentPrice(),
-                String.format("%.1f", ta.getRsi()),
-                String.format("%.2f", ta.getVolumeRatio()),
-                ta.getMarketRegime());
-
-        // Get previous close from market data
-        BigDecimal previousClose = getPreviousCloseFromTradier(symbol);
-        ta.setPreviousClose(previousClose);
-
-        // DISABLE DIVERGENCE - it's broken and blocking all signals
-        ta.setHasRsiDivergence(false);
-
-        return ta;
     }
 
-    // Helper method to get previous close from Tradier
-    private BigDecimal getPreviousCloseFromTradier(String symbol) {
+    /**
+     * Get valid market data with filtering and fallback
+     */
+    private List<MarketData> getValidMarketData(String symbol, String analysisId) {
         try {
-            QuoteResponse quote = tradierService.getQuote(symbol);
-            if (quote != null && quote.getQuote().getPreviousClose() != null) {
-                return quote.getQuote().getPreviousClose();
+            // Try to get data from BarAggregationService first
+            List<MarketData> bars = barAggregationService.getRecentBars(symbol, 50);
+
+            // Filter out invalid bars
+            List<MarketData> validBars = bars.stream()
+                    .filter(this::isValidBar)
+                    .sorted(Comparator.comparing(MarketData::getTimestamp))
+                    .collect(Collectors.toList());
+
+            int invalidCount = bars.size() - validBars.size();
+            if (invalidCount > 0) {
+                log.warn("[TA][{}] Filtered out {} bars with NULL fields for {}",
+                        analysisId, invalidCount, symbol);
+            }
+
+            if (validBars.size() < MIN_BARS_REQUIRED) {
+                log.warn("[TA][{}] Only {} valid bars found (need {}), fetching from repository",
+                        analysisId, validBars.size(), MIN_BARS_REQUIRED);
+
+                // Try to get more data from repository
+                List<MarketData> repoData = marketDataRepository.findRecentData(symbol, 100);
+                validBars = repoData.stream()
+                        .filter(this::isValidBar)
+                        .sorted(Comparator.comparing(MarketData::getTimestamp))
+                        .limit(50)
+                        .collect(Collectors.toList());
+            }
+
+            return validBars;
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error getting market data: {}", analysisId, e.getMessage());
+            return new ArrayList<>();
+        }
+    }
+
+    /**
+     * Validate that a bar has all required fields
+     */
+    private boolean isValidBar(MarketData bar) {
+        return bar != null &&
+                bar.getOpen() != null &&
+                bar.getHigh() != null &&
+                bar.getLow() != null &&
+                bar.getClose() != null &&
+                bar.getVolume() != null &&
+                bar.getTimestamp() != null &&
+                bar.getClose().compareTo(BigDecimal.ZERO) > 0;
+    }
+
+    /**
+     * Get current price from bars or quote service
+     */
+    private BigDecimal getCurrentPrice(List<MarketData> marketData, String symbol) {
+        // Try to get from most recent bar
+        if (!marketData.isEmpty()) {
+            MarketData lastBar = marketData.get(marketData.size() - 1);
+            if (lastBar.getClose() != null && lastBar.getClose().compareTo(BigDecimal.ZERO) > 0) {
+                return lastBar.getClose();
+            }
+        }
+
+        // Fallback to quote service
+        try {
+            QuoteResponse quoteResponse = tradierService.getQuote(symbol);
+            if (quoteResponse != null && quoteResponse.getQuote() != null) {
+                Quote quote = quoteResponse.getQuote();
+                if (quote.getLast() != null) {
+                    return quote.getLast();
+                }
             }
         } catch (Exception e) {
-            log.error("Failed to get previous close for {}: {}", symbol, e.getMessage());
+            log.error("Error getting quote for {}: {}", symbol, e.getMessage());
         }
+
         return null;
     }
 
-    private void calculateVWAPIndicators(List<MarketData> data, TechnicalAnalysis ta) {
-        if (data.isEmpty()) {
-            ta.setVwap(BigDecimal.ZERO);
-            ta.setVwapUpperBand(BigDecimal.ZERO);
-            ta.setVwapLowerBand(BigDecimal.ZERO);
-            return;
-        }
+    /**
+     * Calculate VWAP with NULL safety
+     */
+    private void calculateVWAP(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            BigDecimal totalPriceVolume = BigDecimal.ZERO;
+            BigDecimal totalVolume = BigDecimal.ZERO;
 
-        String symbol = ta.getSymbol();
-        LocalDateTime marketOpen = LocalDateTime.now().withHour(9).withMinute(30).withSecond(0).withNano(0);
+            for (MarketData bar : marketData) {
+                if (bar.getClose() != null && bar.getVolume() != null && bar.getVolume() > 0) {
 
-        // Get or create VWAP state
-        VWAPState state = vwapStateCache.computeIfAbsent(symbol, k -> new VWAPState());
-
-        // Check if we need to reset (new session)
-        if (state.isNewSession(marketOpen)) {
-            state = new VWAPState();
-            state.setSessionStart(marketOpen);
-            vwapStateCache.put(symbol, state);
-        }
-
-        // Incremental VWAP calculation
-        if (!state.isStale() && state.getDataPointCount() > 0) {
-            // Incremental update - only process new data points
-            int startIndex = Math.max(0, state.getDataPointCount());
-
-            for (int i = startIndex; i < data.size(); i++) {
-                MarketData md = data.get(i);
-                updateVWAPIncremental(state, md);
-            }
-        } else {
-            // Full recalculation (only on startup or after gap)
-            state = new VWAPState();
-            state.setSessionStart(marketOpen);
-
-            for (MarketData md : data) {
-                updateVWAPIncremental(state, md);
-            }
-
-            vwapStateCache.put(symbol, state);
-        }
-
-        // Set calculated values
-        ta.setVwap(state.getVwap());
-
-        // Calculate bands using Welford's algorithm for variance
-        BigDecimal variance = calculateIncrementalVariance(state);
-        BigDecimal stdDev = BigDecimal.valueOf(Math.sqrt(variance.doubleValue()));
-
-        ta.setVwapUpperBand(state.getVwap().add(stdDev.multiply(BigDecimal.valueOf(STD_DEV_MULTIPLIER))));
-        ta.setVwapLowerBand(state.getVwap().subtract(stdDev.multiply(BigDecimal.valueOf(STD_DEV_MULTIPLIER))));
-        ta.setVwapStandardDeviation(stdDev);
-
-        // Check for breakout
-        BigDecimal currentPrice = ta.getCurrentPrice();
-        ta.setVwapBreakout(currentPrice.compareTo(ta.getVwapUpperBand()) > 0 ||
-                currentPrice.compareTo(ta.getVwapLowerBand()) < 0);
-
-        // VWAP trend using exponential smoothing
-        ta.setVwapTrend(calculateVWAPTrend(state, ta.getCurrentPrice()));
-
-        // Support/Resistance with proper statistical methods
-        checkVWAPSupportResistanceOptimized(data.subList(Math.max(0, data.size() - 20), data.size()),
-                state.getVwap(), ta);
-    }
-
-    private void updateVWAPIncremental(VWAPState state, MarketData md) {
-        BigDecimal high = md.getHigh() != null ? md.getHigh() : md.getPrice();
-        BigDecimal low = md.getLow() != null ? md.getLow() : md.getPrice();
-        BigDecimal close = md.getPrice();
-        BigDecimal typicalPrice = high.add(low).add(close).divide(BigDecimal.valueOf(3), 6, RoundingMode.HALF_UP);
-        long volume = md.getVolume() != null ? md.getVolume() : 0;
-
-        if (volume > 0) {
-            // Update cumulative values
-            state.setCumulativePriceVolume(
-                    state.getCumulativePriceVolume().add(typicalPrice.multiply(BigDecimal.valueOf(volume)))
-            );
-            state.setCumulativeVolume(
-                    state.getCumulativeVolume().add(BigDecimal.valueOf(volume))
-            );
-
-            // Update VWAP
-            if (state.getCumulativeVolume().compareTo(BigDecimal.ZERO) > 0) {
-                state.setVwap(
-                        state.getCumulativePriceVolume().divide(state.getCumulativeVolume(), 6, RoundingMode.HALF_UP)
-                );
-            }
-
-            // Update variance using Welford's online algorithm
-            BigDecimal deviation = typicalPrice.subtract(state.getVwap());
-            state.setSumSquaredDeviations(
-                    state.getSumSquaredDeviations().add(
-                            deviation.multiply(deviation).multiply(BigDecimal.valueOf(volume))
-                    )
-            );
-
-            state.setDataPointCount(state.getDataPointCount() + 1);
-            state.setLastUpdate(LocalDateTime.now());
-        }
-    }
-
-    private BigDecimal calculateIncrementalVariance(VWAPState state) {
-        if (state.getCumulativeVolume().compareTo(BigDecimal.ZERO) <= 0) {
-            return BigDecimal.ZERO;
-        }
-
-        return state.getSumSquaredDeviations().divide(state.getCumulativeVolume(), 10, RoundingMode.HALF_UP);
-    }
-
-    private String calculateVWAPTrend(VWAPState state, BigDecimal currentPrice) {
-        // Use EMA of VWAP to determine trend
-        String key = state.getVwap().toString() + "_trend";
-        BigDecimal emaVwap = getEMAValue(key, state.getVwap(), 0.1);
-
-        if (state.getVwap().compareTo(emaVwap) > 0 && currentPrice.compareTo(state.getVwap()) > 0) {
-            return "BULLISH";
-        } else if (state.getVwap().compareTo(emaVwap) < 0 && currentPrice.compareTo(state.getVwap()) < 0) {
-            return "BEARISH";
-        }
-        return "NEUTRAL";
-    }
-
-    private final Map<String, BigDecimal> emaCache = new ConcurrentHashMap<>();
-
-    private BigDecimal getEMAValue(String key, BigDecimal newValue, double alpha) {
-        BigDecimal previousEMA = emaCache.get(key);
-        if (previousEMA == null) {
-            emaCache.put(key, newValue);
-            return newValue;
-        }
-
-        BigDecimal ema = newValue.multiply(BigDecimal.valueOf(alpha))
-                .add(previousEMA.multiply(BigDecimal.valueOf(1 - alpha)));
-        emaCache.put(key, ema);
-        return ema;
-    }
-
-    private void checkVWAPSupportResistanceOptimized(List<MarketData> recentData,
-                                                     BigDecimal vwap, TechnicalAnalysis ta) {
-        if (recentData.size() < 3) {
-            ta.setVwapAsSupport(false);
-            ta.setVwapAsResistance(false);
-            return;
-        }
-
-        int supportTouches = 0;
-        int resistanceTouches = 0;
-        int successfulBounces = 0;
-
-        // More sensitive threshold - 0.1% instead of 0.15%
-        BigDecimal vwapThreshold = vwap.multiply(BigDecimal.valueOf(0.001));
-
-        for (int i = 1; i < recentData.size() - 1; i++) {
-            MarketData current = recentData.get(i);
-            MarketData previous = recentData.get(i - 1);
-            MarketData next = recentData.get(i + 1);
-
-            BigDecimal currentLow = current.getLow() != null ? current.getLow() : current.getPrice();
-            BigDecimal currentHigh = current.getHigh() != null ? current.getHigh() : current.getPrice();
-            BigDecimal currentPrice = current.getPrice();
-
-            // Check for support touch (price dipped to VWAP and bounced)
-            if (currentLow.subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
-                // Price touched VWAP from above
-                if (previous.getPrice().compareTo(vwap) > 0) {
-                    // Check if it bounced (next price is higher)
-                    if (next.getPrice().compareTo(currentPrice) > 0 &&
-                            next.getPrice().compareTo(vwap) > 0) {
-                        supportTouches++;
-                        successfulBounces++;
-                        log.debug("Support bounce detected at index {} - Low: {}, VWAP: {}, Next: {}",
-                                i, currentLow, vwap, next.getPrice());
+                    // Use typical price (H+L+C)/3 or just close if OHLC incomplete
+                    BigDecimal typicalPrice;
+                    if (bar.getHigh() != null && bar.getLow() != null) {
+                        typicalPrice = bar.getHigh().add(bar.getLow()).add(bar.getClose())
+                                .divide(BigDecimal.valueOf(3), 4, RoundingMode.HALF_UP);
+                    } else {
+                        typicalPrice = bar.getClose();
                     }
+
+                    // Convert Long volume to BigDecimal for calculation
+                    BigDecimal volumeBD = BigDecimal.valueOf(bar.getVolume());
+                    totalPriceVolume = totalPriceVolume.add(typicalPrice.multiply(volumeBD));
+                    totalVolume = totalVolume.add(volumeBD);
                 }
             }
 
-            // Check for resistance touch (price rose to VWAP and rejected)
-            if (vwap.subtract(currentHigh).abs().compareTo(vwapThreshold) <= 0) {
-                // Price touched VWAP from below
-                if (previous.getPrice().compareTo(vwap) < 0) {
-                    // Check if it was rejected (next price is lower)
-                    if (next.getPrice().compareTo(currentPrice) < 0 &&
-                            next.getPrice().compareTo(vwap) < 0) {
-                        resistanceTouches++;
-                        log.debug("Resistance rejection detected at index {} - High: {}, VWAP: {}, Next: {}",
-                                i, currentHigh, vwap, next.getPrice());
-                    }
-                }
-            }
-        }
-
-        // Also check the most recent candle for real-time detection
-        if (recentData.size() >= 2) {
-            MarketData latest = recentData.get(recentData.size() - 1);
-            MarketData previousCandle = recentData.get(recentData.size() - 2);
-
-            // Real-time support check
-            if (latest.getPrice().compareTo(vwap) > 0 &&
-                    previousCandle.getLow() != null &&
-                    previousCandle.getLow().subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
-                // Just bounced off VWAP
-                supportTouches++;
-                log.info("REAL-TIME: Potential support bounce - Current: {}, VWAP: {}",
-                        latest.getPrice(), vwap);
-            }
-
-            // Real-time resistance check
-            if (latest.getPrice().compareTo(vwap) < 0 &&
-                    previousCandle.getHigh() != null &&
-                    vwap.subtract(previousCandle.getHigh()).abs().compareTo(vwapThreshold) <= 0) {
-                // Just rejected from VWAP
-                resistanceTouches++;
-                log.info("REAL-TIME: Potential resistance rejection - Current: {}, VWAP: {}",
-                        latest.getPrice(), vwap);
-            }
-        }
-
-        // Lower threshold for 0DTE - only need 1 clean touch/bounce
-        ta.setVwapAsSupport(supportTouches >= 1 && successfulBounces >= 1);
-        ta.setVwapAsResistance(resistanceTouches >= 1);
-
-        if (ta.isVwapAsSupport()) {
-            log.info("VWAP acting as SUPPORT - {} touches, {} bounces", supportTouches, successfulBounces);
-        }
-        if (ta.isVwapAsResistance()) {
-            log.info("VWAP acting as RESISTANCE - {} touches", resistanceTouches);
-        }
-    }
-
-    private BigDecimal calculateVWAPAtIndex(List<MarketData> data, int endIndex) {
-        BigDecimal cumulativePriceVolume = BigDecimal.ZERO;
-        BigDecimal cumulativeVolume = BigDecimal.ZERO;
-
-        for (int i = 0; i <= endIndex && i < data.size(); i++) {
-            MarketData md = data.get(i);
-            BigDecimal high = md.getHigh() != null ? md.getHigh() : md.getPrice();
-            BigDecimal low = md.getLow() != null ? md.getLow() : md.getPrice();
-            BigDecimal close = md.getPrice();
-            BigDecimal typicalPrice = high.add(low).add(close).divide(BigDecimal.valueOf(3), 4, RoundingMode.HALF_UP);
-            long volume = md.getVolume() != null ? md.getVolume() : 0;
-
-            cumulativePriceVolume = cumulativePriceVolume.add(typicalPrice.multiply(BigDecimal.valueOf(volume)));
-            cumulativeVolume = cumulativeVolume.add(BigDecimal.valueOf(volume));
-        }
-
-        return cumulativeVolume.compareTo(BigDecimal.ZERO) > 0 ?
-                cumulativePriceVolume.divide(cumulativeVolume, 2, RoundingMode.HALF_UP) : BigDecimal.ZERO;
-    }
-
-    private void checkVWAPSupportResistance(List<MarketData> data, BigDecimal vwap, TechnicalAnalysis ta) {
-        if (data.size() < LOOKBACK_CANDLES) {
-            ta.setVwapAsSupport(false);
-            ta.setVwapAsResistance(false);
-            return;
-        }
-
-        int bounces = 0;
-        boolean aboveVwap = false;
-        boolean belowVwap = false;
-
-        for (int i = data.size() - LOOKBACK_CANDLES; i < data.size(); i++) {
-            MarketData md = data.get(i);
-            BigDecimal low = md.getLow() != null ? md.getLow() : md.getPrice();
-            BigDecimal high = md.getHigh() != null ? md.getHigh() : md.getPrice();
-
-            // Check if price touched VWAP and bounced
-            BigDecimal vwapThreshold = vwap.multiply(BigDecimal.valueOf(0.002)); // 0.2% threshold
-
-            if (low.subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
-                bounces++;
-                if (md.getPrice().compareTo(vwap) > 0) {
-                    aboveVwap = true;
-                }
-            }
-
-            if (high.subtract(vwap).abs().compareTo(vwapThreshold) <= 0) {
-                bounces++;
-                if (md.getPrice().compareTo(vwap) < 0) {
-                    belowVwap = true;
-                }
-            }
-        }
-
-        ta.setVwapAsSupport(bounces >= 2 && aboveVwap);
-        ta.setVwapAsResistance(bounces >= 2 && belowVwap);
-    }
-
-    private void calculateVolumeMetrics(List<MarketData> data, long currentVolume, TechnicalAnalysis ta) {
-        if (data.size() < VOLUME_AVG_PERIOD) {
-            ta.setAverageVolume(currentVolume);
-            ta.setVolumeRatio(1.0);
-            ta.setHighVolume(false);
-            ta.setVolumeTrend("STABLE");
-            return;
-        }
-
-        // Calculate average volume
-        List<MarketData> recentData = data.subList(Math.max(0, data.size() - VOLUME_AVG_PERIOD), data.size());
-        long totalVolume = recentData.stream()
-                .mapToLong(md -> md.getVolume() != null ? md.getVolume() : 0)
-                .sum();
-        long avgVolume = totalVolume / recentData.size();
-
-        ta.setAverageVolume(avgVolume);
-        ta.setVolumeRatio(avgVolume > 0 ? (double) currentVolume / avgVolume : 1.0);
-        ta.setHighVolume(ta.getVolumeRatio() > 1.5);
-
-        // Determine volume trend
-        if (data.size() >= 10) {
-            long oldAvgVolume = data.subList(Math.max(0, data.size() - 10), data.size() - 5)
-                    .stream()
-                    .mapToLong(md -> md.getVolume() != null ? md.getVolume() : 0)
-                    .sum() / 5;
-
-            long recentAvgVolume = data.subList(data.size() - 5, data.size())
-                    .stream()
-                    .mapToLong(md -> md.getVolume() != null ? md.getVolume() : 0)
-                    .sum() / 5;
-
-            if (recentAvgVolume > oldAvgVolume * 1.2) {
-                ta.setVolumeTrend("INCREASING");
-            } else if (recentAvgVolume < oldAvgVolume * 0.8) {
-                ta.setVolumeTrend("DECREASING");
+            if (totalVolume.compareTo(BigDecimal.ZERO) > 0) {
+                ta.setVwap(totalPriceVolume.divide(totalVolume, 2, RoundingMode.HALF_UP));
+                log.debug("[TA][{}] VWAP calculated: {}", analysisId, ta.getVwap());
             } else {
-                ta.setVolumeTrend("STABLE");
+                // Use current price as VWAP fallback
+                ta.setVwap(ta.getCurrentPrice());
+                log.warn("[TA][{}] No volume data for VWAP, using current price", analysisId);
             }
-        } else {
-            ta.setVolumeTrend("STABLE");
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating VWAP: {}", analysisId, e.getMessage());
+            ta.setVwap(ta.getCurrentPrice());
         }
     }
 
-    private void calculateVolatilityMetrics(List<MarketData> data, TechnicalAnalysis ta) {
-        if (data.size() < 2) {
-            ta.setCurrentVolatility(BigDecimal.ZERO);
-            ta.setAverageVolatility(BigDecimal.ZERO);
-            ta.setAverageTrueRange(BigDecimal.ONE);
-            ta.setVolatilityPercentile(50.0);
-            ta.setVolatilitySpike(false);
-            return;
-        }
-
-        // Calculate returns for volatility
-        List<BigDecimal> returns = new ArrayList<>();
-        for (int i = 1; i < data.size(); i++) {
-            BigDecimal prevPrice = data.get(i - 1).getPrice();
-            BigDecimal currPrice = data.get(i).getPrice();
-            if (prevPrice.compareTo(BigDecimal.ZERO) > 0) {
-                BigDecimal ret = currPrice.subtract(prevPrice).divide(prevPrice, 6, RoundingMode.HALF_UP);
-                returns.add(ret);
+    /**
+     * Calculate RSI with NULL safety - sets primitive double
+     */
+    private void calculateRSI(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            if (marketData.size() < DEFAULT_PERIOD + 1) {
+                ta.setRsi(50.0); // Neutral RSI as fallback
+                log.warn("[TA][{}] Insufficient data for RSI, using neutral value", analysisId);
+                return;
             }
+
+            List<BigDecimal> gains = new ArrayList<>();
+            List<BigDecimal> losses = new ArrayList<>();
+
+            for (int i = 1; i < marketData.size(); i++) {
+                BigDecimal prevClose = marketData.get(i - 1).getClose();
+                BigDecimal currClose = marketData.get(i).getClose();
+
+                if (prevClose != null && currClose != null) {
+                    BigDecimal change = currClose.subtract(prevClose);
+                    if (change.compareTo(BigDecimal.ZERO) > 0) {
+                        gains.add(change);
+                        losses.add(BigDecimal.ZERO);
+                    } else {
+                        gains.add(BigDecimal.ZERO);
+                        losses.add(change.abs());
+                    }
+                }
+            }
+
+            if (gains.size() >= DEFAULT_PERIOD) {
+                // Calculate average gain and loss
+                BigDecimal avgGain = gains.subList(gains.size() - DEFAULT_PERIOD, gains.size())
+                        .stream()
+                        .reduce(BigDecimal.ZERO, BigDecimal::add)
+                        .divide(BigDecimal.valueOf(DEFAULT_PERIOD), 4, RoundingMode.HALF_UP);
+
+                BigDecimal avgLoss = losses.subList(losses.size() - DEFAULT_PERIOD, losses.size())
+                        .stream()
+                        .reduce(BigDecimal.ZERO, BigDecimal::add)
+                        .divide(BigDecimal.valueOf(DEFAULT_PERIOD), 4, RoundingMode.HALF_UP);
+
+                double rsi;
+                if (avgLoss.compareTo(BigDecimal.ZERO) == 0) {
+                    rsi = 100.0;
+                } else {
+                    BigDecimal rs = avgGain.divide(avgLoss, 4, RoundingMode.HALF_UP);
+                    rsi = 100.0 - (100.0 / (1.0 + rs.doubleValue()));
+                }
+
+                ta.setRsi(Math.round(rsi * 100.0) / 100.0);
+                log.debug("[TA][{}] RSI calculated: {}", analysisId, ta.getRsi());
+            } else {
+                ta.setRsi(50.0);
+                log.warn("[TA][{}] Insufficient valid data for RSI", analysisId);
+            }
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating RSI: {}", analysisId, e.getMessage());
+            ta.setRsi(50.0);
         }
+    }
 
-        // Calculate current volatility (standard deviation of returns)
-        if (!returns.isEmpty()) {
-            BigDecimal mean = returns.stream()
-                    .reduce(BigDecimal.ZERO, BigDecimal::add)
-                    .divide(BigDecimal.valueOf(returns.size()), 6, RoundingMode.HALF_UP);
+    /**
+     * Calculate volume metrics with NULL safety
+     */
+    private void calculateVolumeMetrics(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            if (marketData.isEmpty()) {
+                log.error("[TA][{}] No data for volume metrics", analysisId);
+                ta.setVolumeRatio(1.0);
+                ta.setAverageVolume(BigDecimal.valueOf(100000));
+                ta.setCurrentVolume(100000L);
+                return;
+            }
 
-            BigDecimal sumSquaredDiff = returns.stream()
-                    .map(r -> r.subtract(mean).pow(2))
-                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            String symbol = ta.getSymbol();
+            Long currentIncrementalVolume = null;
+            boolean usingStaleData = false;
 
-            BigDecimal variance = sumSquaredDiff.divide(BigDecimal.valueOf(returns.size()), 10, RoundingMode.HALF_UP);
-            BigDecimal volatility = BigDecimal.valueOf(Math.sqrt(variance.doubleValue()));
-            ta.setCurrentVolatility(volatility);
+            // STEP 1: Try to get real-time volume from active accumulator
+            if (barAggregationService.hasActiveAccumulator(symbol)) {
+                currentIncrementalVolume = barAggregationService.getCurrentIncrementalVolume(symbol);
+                if (currentIncrementalVolume != null && currentIncrementalVolume > 0) {
+                    log.debug("[TA][{}] Using real-time incremental volume from accumulator: {}",
+                            analysisId, currentIncrementalVolume);
+                }
+            }
 
-            // Calculate average volatility over longer period
-            if (data.size() >= VOLATILITY_PERIOD) {
-                List<BigDecimal> longReturns = new ArrayList<>();
-                for (int i = data.size() - VOLATILITY_PERIOD; i < data.size(); i++) {
-                    if (i > 0) {
-                        BigDecimal prevPrice = data.get(i - 1).getPrice();
-                        BigDecimal currPrice = data.get(i).getPrice();
-                        if (prevPrice.compareTo(BigDecimal.ZERO) > 0) {
-                            BigDecimal ret = currPrice.subtract(prevPrice).divide(prevPrice, 6, RoundingMode.HALF_UP);
-                            longReturns.add(ret.abs());
+            // STEP 2: Fallback to last finalized bar if accumulator unavailable
+            if (currentIncrementalVolume == null || currentIncrementalVolume <= 0) {
+                MarketData currentBar = marketData.get(marketData.size() - 1);
+                currentIncrementalVolume = currentBar.getIncrementalVolume();
+
+                if (currentIncrementalVolume == null || currentIncrementalVolume <= 0) {
+                    // Try to calculate from cumulative volumes
+                    if (marketData.size() >= 2 && currentBar.getVolume() != null) {
+                        MarketData previousBar = marketData.get(marketData.size() - 2);
+                        if (previousBar.getVolume() != null) {
+                            currentIncrementalVolume = Math.max(0L, currentBar.getVolume() - previousBar.getVolume());
+                            log.debug("[TA][{}] Calculated incremental volume from cumulative: {}",
+                                    analysisId, currentIncrementalVolume);
                         }
                     }
                 }
 
-                BigDecimal avgVolatility = longReturns.stream()
-                        .reduce(BigDecimal.ZERO, BigDecimal::add)
-                        .divide(BigDecimal.valueOf(longReturns.size()), 6, RoundingMode.HALF_UP);
-                ta.setAverageVolatility(avgVolatility);
+                if (currentIncrementalVolume == null || currentIncrementalVolume <= 0) {
+                    log.error("[TA][{}] Cannot determine current incremental volume for {}", analysisId, symbol);
+                    ta.setVolumeRatio(0.1); // Set very low to fail volume checks
+                    ta.setAverageVolume(BigDecimal.valueOf(100000));
+                    ta.setCurrentVolume(0L);
+                    return;
+                }
 
-                // Volatility spike detection
-                ta.setVolatilitySpike(volatility.compareTo(avgVolatility.multiply(BigDecimal.valueOf(1.5))) > 0);
-            } else {
-                ta.setAverageVolatility(volatility);
-                ta.setVolatilitySpike(false);
+                usingStaleData = true;
             }
-        } else {
-            ta.setCurrentVolatility(BigDecimal.ZERO);
-            ta.setAverageVolatility(BigDecimal.ZERO);
-            ta.setVolatilitySpike(false);
+
+            // STEP 3: Calculate average from last 3 finalized bars
+            int barsForAverage = Math.min(3, marketData.size() - 1);
+            if (barsForAverage < 1) {
+                log.warn("[TA][{}] Insufficient bars for average calculation", analysisId);
+                ta.setVolumeRatio(1.0);
+                ta.setCurrentVolume(currentIncrementalVolume);
+                ta.setAverageVolume(BigDecimal.valueOf(currentIncrementalVolume));
+                return;
+            }
+
+            List<Long> validIncrementalVolumes = new ArrayList<>();
+            for (int i = marketData.size() - 1 - barsForAverage; i < marketData.size() - 1; i++) {
+                if (i < 0) continue;
+                MarketData bar = marketData.get(i);
+                Long incVol = bar.getIncrementalVolume();
+
+                if (incVol != null && incVol > 0) {
+                    validIncrementalVolumes.add(incVol);
+                } else if (i < marketData.size() - 2) {
+                    // Try to calculate from cumulative
+                    MarketData nextBar = marketData.get(i + 1);
+                    if (bar.getVolume() != null && nextBar.getVolume() != null) {
+                        Long calculated = Math.max(0L, nextBar.getVolume() - bar.getVolume());
+                        if (calculated > 0) {
+                            validIncrementalVolumes.add(calculated);
+                        }
+                    }
+                }
+            }
+
+            if (validIncrementalVolumes.isEmpty()) {
+                log.error("[TA][{}] No valid historical volume data for average calculation", analysisId);
+                ta.setVolumeRatio(0.1); // Set very low to fail volume checks
+                ta.setAverageVolume(BigDecimal.valueOf(100000));
+                ta.setCurrentVolume(currentIncrementalVolume);
+                return;
+            }
+
+            // Calculate simple average of last 3 bars
+            double averageIncrementalVolume = validIncrementalVolumes.stream()
+                    .mapToLong(Long::longValue)
+                    .average()
+                    .orElse(currentIncrementalVolume.doubleValue());
+
+            if (averageIncrementalVolume <= 0) {
+                log.error("[TA][{}] Invalid average volume: {}", analysisId, averageIncrementalVolume);
+                ta.setVolumeRatio(0.1);
+                ta.setCurrentVolume(currentIncrementalVolume);
+                ta.setAverageVolume(BigDecimal.valueOf(100000));
+                return;
+            }
+
+            // STEP 4: Calculate ratio
+            double volumeRatio = currentIncrementalVolume / averageIncrementalVolume;
+
+            // Validate ratio is reasonable (cap at 10x for safety)
+            if (volumeRatio > 10.0) {
+                log.warn("[TA][{}] Volume ratio capped at 10x: {} (current: {}, average: {})",
+                        analysisId, volumeRatio, currentIncrementalVolume, averageIncrementalVolume);
+                volumeRatio = 10.0;
+            }
+
+            ta.setVolumeRatio(volumeRatio);
+            ta.setCurrentVolume(currentIncrementalVolume);
+            ta.setAverageVolume(BigDecimal.valueOf((long) averageIncrementalVolume));
+
+            // Log warning if using stale data
+            if (usingStaleData) {
+                log.warn("[TA][{}] Using stale volume data from finalized bar - accumulator unavailable. Current: {}, Average: {}, Ratio: {}x",
+                        analysisId, currentIncrementalVolume, (long) averageIncrementalVolume,
+                        String.format("%.2f", volumeRatio));
+            } else {
+                log.debug("[TA][{}] Volume metrics - Current: {}, Average: {}, Ratio: {}x",
+                        analysisId, currentIncrementalVolume, (long) averageIncrementalVolume,
+                        String.format("%.2f", volumeRatio));
+            }
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating volume metrics: {}", analysisId, e.getMessage(), e);
+            ta.setVolumeRatio(0.1); // Set very low to fail volume checks
+            ta.setAverageVolume(BigDecimal.valueOf(100000));
+            ta.setCurrentVolume(0L);
         }
+    }    /**
+     * Calculate moving averages with NULL safety
+     */
+    private void calculateMovingAverages(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            // Calculate 20-period SMA
+            if (marketData.size() >= 20) {
+                BigDecimal sum = marketData.subList(marketData.size() - 20, marketData.size())
+                        .stream()
+                        .map(MarketData::getClose)
+                        .filter(Objects::nonNull)
+                        .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        // Calculate ATR for dynamic stops/targets
-        calculateATR(data, ta);
+                long validCount = marketData.subList(marketData.size() - 20, marketData.size())
+                        .stream()
+                        .map(MarketData::getClose)
+                        .filter(Objects::nonNull)
+                        .count();
 
-        // Set volatility percentile (simplified - would need historical data for accurate percentile)
-        ta.setVolatilityPercentile(ta.isVolatilitySpike() ? 80.0 : 50.0);
+                if (validCount > 0) {
+                    ta.setSma20(sum.divide(BigDecimal.valueOf(validCount), 2, RoundingMode.HALF_UP));
+                }
+            }
+
+            // Calculate 50-period SMA
+            if (marketData.size() >= 50) {
+                BigDecimal sum = marketData.stream()
+                        .map(MarketData::getClose)
+                        .filter(Objects::nonNull)
+                        .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+                long validCount = marketData.stream()
+                        .map(MarketData::getClose)
+                        .filter(Objects::nonNull)
+                        .count();
+
+                if (validCount > 0) {
+                    ta.setSma50(sum.divide(BigDecimal.valueOf(validCount), 2, RoundingMode.HALF_UP));
+                }
+            }
+
+            // Use current price as fallback for missing SMAs
+            if (ta.getSma20() == null) {
+                ta.setSma20(ta.getCurrentPrice());
+            }
+            if (ta.getSma50() == null) {
+                ta.setSma50(ta.getCurrentPrice());
+            }
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating moving averages: {}", analysisId, e.getMessage());
+            ta.setSma20(ta.getCurrentPrice());
+            ta.setSma50(ta.getCurrentPrice());
+        }
     }
 
-    private void calculateATR(List<MarketData> data, TechnicalAnalysis ta) {
-        if (data.size() < 2) {
-            ta.setAverageTrueRange(ta.getCurrentPrice().multiply(BigDecimal.valueOf(0.01))); // 1% default
-            return;
-        }
+    /**
+     * Calculate Bollinger Bands with NULL safety
+     */
+    private void calculateBollingerBands(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            if (marketData.size() < BOLLINGER_PERIOD) {
+                // Use current price +/- 0.5% as fallback
+                BigDecimal offset = ta.getCurrentPrice().multiply(new BigDecimal("0.005"));
+                ta.setBollingerUpper(ta.getCurrentPrice().add(offset));
+                ta.setBollingerMiddle(ta.getCurrentPrice());
+                ta.setBollingerLower(ta.getCurrentPrice().subtract(offset));
+                return;
+            }
 
-        List<BigDecimal> trueRanges = new ArrayList<>();
-        for (int i = 1; i < Math.min(data.size(), 14); i++) {
-            MarketData current = data.get(data.size() - i);
-            MarketData previous = data.get(data.size() - i - 1);
+            List<BigDecimal> recentPrices = marketData
+                    .subList(marketData.size() - BOLLINGER_PERIOD, marketData.size())
+                    .stream()
+                    .map(MarketData::getClose)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
 
-            BigDecimal high = current.getHigh() != null ? current.getHigh() : current.getPrice();
-            BigDecimal low = current.getLow() != null ? current.getLow() : current.getPrice();
-            BigDecimal prevClose = previous.getPrice();
+            if (recentPrices.size() < BOLLINGER_PERIOD / 2) {
+                // Not enough valid data
+                BigDecimal offset = ta.getCurrentPrice().multiply(new BigDecimal("0.005"));
+                ta.setBollingerUpper(ta.getCurrentPrice().add(offset));
+                ta.setBollingerMiddle(ta.getCurrentPrice());
+                ta.setBollingerLower(ta.getCurrentPrice().subtract(offset));
+                return;
+            }
 
-            BigDecimal tr1 = high.subtract(low);
-            BigDecimal tr2 = high.subtract(prevClose).abs();
-            BigDecimal tr3 = low.subtract(prevClose).abs();
-
-            BigDecimal trueRange = tr1.max(tr2).max(tr3);
-            trueRanges.add(trueRange);
-        }
-
-        if (!trueRanges.isEmpty()) {
-            BigDecimal atr = trueRanges.stream()
+            // Calculate SMA for middle band
+            BigDecimal sma = recentPrices.stream()
                     .reduce(BigDecimal.ZERO, BigDecimal::add)
-                    .divide(BigDecimal.valueOf(trueRanges.size()), 4, RoundingMode.HALF_UP);
-            ta.setAverageTrueRange(atr);
-        } else {
-            ta.setAverageTrueRange(ta.getCurrentPrice().multiply(BigDecimal.valueOf(0.01)));
+                    .divide(BigDecimal.valueOf(recentPrices.size()), 4, RoundingMode.HALF_UP);
+
+            // Calculate standard deviation
+            double variance = recentPrices.stream()
+                    .mapToDouble(price -> Math.pow(price.subtract(sma).doubleValue(), 2))
+                    .average()
+                    .orElse(0.0);
+
+            BigDecimal stdDev = BigDecimal.valueOf(Math.sqrt(variance));
+            BigDecimal bandWidth = stdDev.multiply(BigDecimal.valueOf(BOLLINGER_STD_DEV));
+
+            ta.setBollingerMiddle(sma);
+            ta.setBollingerUpper(sma.add(bandWidth));
+            ta.setBollingerLower(sma.subtract(bandWidth));
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating Bollinger Bands: {}", analysisId, e.getMessage());
+            BigDecimal offset = ta.getCurrentPrice().multiply(new BigDecimal("0.005"));
+            ta.setBollingerUpper(ta.getCurrentPrice().add(offset));
+            ta.setBollingerMiddle(ta.getCurrentPrice());
+            ta.setBollingerLower(ta.getCurrentPrice().subtract(offset));
         }
     }
 
-    private void calculateMomentumIndicators(List<MarketData> data, TechnicalAnalysis ta) {
-        // Calculate RSI
-        double rsi = calculateRSI(data, RSI_PERIOD);
-        ta.setRsi(rsi);
+    /**
+     * Calculate ATR with NULL safety - NOTE: Sets averageTrueRange, not atr
+     */
+    private void calculateATR(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            if (marketData.size() < DEFAULT_PERIOD + 1) {
+                ta.setAverageTrueRange(ta.getCurrentPrice().multiply(new BigDecimal("0.01"))); // 1% as fallback
+                return;
+            }
 
-        // Simple MACD signal (would need more sophisticated calculation in production)
-        if (data.size() >= 26) {
-            BigDecimal ema12 = calculateEMA(data, 12);
-            BigDecimal ema26 = calculateEMA(data, 26);
-            BigDecimal macd = ema12.subtract(ema26);
+            List<BigDecimal> trueRanges = new ArrayList<>();
 
-            if (macd.compareTo(BigDecimal.ZERO) > 0) {
-                ta.setMacdSignal("BULLISH");
-                ta.setMomentumStrength(Math.min(macd.doubleValue() / ta.getCurrentPrice().doubleValue() * 100, 1.0));
-            } else if (macd.compareTo(BigDecimal.ZERO) < 0) {
-                ta.setMacdSignal("BEARISH");
-                ta.setMomentumStrength(Math.max(macd.doubleValue() / ta.getCurrentPrice().doubleValue() * 100, -1.0));
+            for (int i = 1; i < marketData.size(); i++) {
+                MarketData current = marketData.get(i);
+                MarketData previous = marketData.get(i - 1);
+
+                if (current.getHigh() != null && current.getLow() != null &&
+                        current.getClose() != null && previous.getClose() != null) {
+
+                    BigDecimal highLow = current.getHigh().subtract(current.getLow());
+                    BigDecimal highPrevClose = current.getHigh().subtract(previous.getClose()).abs();
+                    BigDecimal lowPrevClose = current.getLow().subtract(previous.getClose()).abs();
+
+                    BigDecimal trueRange = highLow.max(highPrevClose).max(lowPrevClose);
+                    trueRanges.add(trueRange);
+                }
+            }
+
+            if (trueRanges.size() >= DEFAULT_PERIOD) {
+                BigDecimal atr = trueRanges.subList(trueRanges.size() - DEFAULT_PERIOD, trueRanges.size())
+                        .stream()
+                        .reduce(BigDecimal.ZERO, BigDecimal::add)
+                        .divide(BigDecimal.valueOf(DEFAULT_PERIOD), 4, RoundingMode.HALF_UP);
+
+                ta.setAverageTrueRange(atr); // Use correct method name
             } else {
-                ta.setMacdSignal("NEUTRAL");
-                ta.setMomentumStrength(0.0);
+                ta.setAverageTrueRange(ta.getCurrentPrice().multiply(new BigDecimal("0.01")));
             }
-        } else {
-            ta.setMacdSignal("NEUTRAL");
-            ta.setMomentumStrength(0.0);
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating ATR: {}", analysisId, e.getMessage());
+            ta.setAverageTrueRange(ta.getCurrentPrice().multiply(new BigDecimal("0.01")));
         }
     }
 
-    private double calculateRSI(List<MarketData> data, int period) {
-        if (data.size() < period + 1) {
-            return 50.0; // Neutral RSI
+    /**
+     * Calculate volatility with NULL safety - Sets both currentVolatility and volatilityPercentile
+     */
+    private void calculateVolatility(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            if (marketData.size() < 20) {
+                BigDecimal defaultVol = ta.getCurrentPrice().multiply(new BigDecimal("0.02"));
+                ta.setCurrentVolatility(defaultVol);
+                ta.setAverageVolatility(defaultVol);
+                ta.setVolatilityPercentile(50.0); // Mid-range percentile
+                return;
+            }
+
+            List<Double> returns = new ArrayList<>();
+            for (int i = 1; i < marketData.size(); i++) {
+                BigDecimal prevClose = marketData.get(i - 1).getClose();
+                BigDecimal currClose = marketData.get(i).getClose();
+
+                if (prevClose != null && currClose != null && prevClose.compareTo(BigDecimal.ZERO) > 0) {
+                    double dailyReturn = currClose.subtract(prevClose)
+                            .divide(prevClose, 6, RoundingMode.HALF_UP)
+                            .doubleValue();
+                    returns.add(dailyReturn);
+                }
+            }
+
+            if (returns.size() >= 10) {
+                double avgReturn = returns.stream().mapToDouble(Double::doubleValue).average().orElse(0.0);
+                double variance = returns.stream()
+                        .mapToDouble(r -> Math.pow(r - avgReturn, 2))
+                        .average()
+                        .orElse(0.0);
+
+                double stdDev = Math.sqrt(variance);
+
+                // Set current volatility as price * standard deviation
+                BigDecimal currentVol = ta.getCurrentPrice().multiply(BigDecimal.valueOf(stdDev));
+                ta.setCurrentVolatility(currentVol);
+
+                // Calculate average volatility (use same as current for now)
+                ta.setAverageVolatility(currentVol);
+
+                // Calculate volatility percentile (simplified - assumes normal distribution)
+                // Map stdDev to percentile (0.01 = 20th percentile, 0.02 = 50th, 0.03 = 80th)
+                double percentile = Math.min(100, Math.max(0, stdDev * 2500));
+                ta.setVolatilityPercentile(percentile);
+
+            } else {
+                BigDecimal defaultVol = ta.getCurrentPrice().multiply(new BigDecimal("0.02"));
+                ta.setCurrentVolatility(defaultVol);
+                ta.setAverageVolatility(defaultVol);
+                ta.setVolatilityPercentile(50.0);
+            }
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating volatility: {}", analysisId, e.getMessage());
+            BigDecimal defaultVol = ta.getCurrentPrice().multiply(new BigDecimal("0.02"));
+            ta.setCurrentVolatility(defaultVol);
+            ta.setAverageVolatility(defaultVol);
+            ta.setVolatilityPercentile(50.0);
         }
+    }
 
-        List<BigDecimal> gains = new ArrayList<>();
-        List<BigDecimal> losses = new ArrayList<>();
+    /**
+     * Calculate momentum with NULL safety - sets primitive double
+     */
+    private void calculateMomentum(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            if (marketData.size() < 10) {
+                ta.setMomentumStrength(0.5); // Neutral momentum
+                return;
+            }
 
-        for (int i = data.size() - period; i < data.size(); i++) {
-            if (i > 0) {
-                BigDecimal change = data.get(i).getPrice().subtract(data.get(i - 1).getPrice());
-                if (change.compareTo(BigDecimal.ZERO) > 0) {
-                    gains.add(change);
-                    losses.add(BigDecimal.ZERO);
+            // Calculate rate of change over last 10 periods
+            BigDecimal oldPrice = marketData.get(marketData.size() - 10).getClose();
+            BigDecimal currentPrice = marketData.get(marketData.size() - 1).getClose();
+
+            if (oldPrice != null && currentPrice != null && oldPrice.compareTo(BigDecimal.ZERO) > 0) {
+                double roc = currentPrice.subtract(oldPrice)
+                        .divide(oldPrice, 4, RoundingMode.HALF_UP)
+                        .doubleValue();
+
+                // Normalize to 0-1 range (assuming +/-5% is extreme)
+                double momentum = Math.max(0, Math.min(1, (roc + 0.05) / 0.10));
+                ta.setMomentumStrength(momentum);
+            } else {
+                ta.setMomentumStrength(0.5);
+            }
+
+        } catch (Exception e) {
+            log.error("[TA][{}] Error calculating momentum: {}", analysisId, e.getMessage());
+            ta.setMomentumStrength(0.5);
+        }
+    }
+
+    /**
+     * Determine trend with NULL safety
+     */
+    private void determineTrend(TechnicalAnalysis ta, List<MarketData> marketData, String analysisId) {
+        try {
+            // Default trend
+            ta.setTrend("NEUTRAL");
+            ta.setStrength(0.5);
+
+            if (marketData.size() < 20) {
+                return;
+            }
+
+            BigDecimal currentPrice = ta.getCurrentPrice();
+            int upCount = 0;
+            int downCount = 0;
+
+            // Count higher highs and higher lows
+            for (int i = marketData.size() - 10; i < marketData.size() - 1; i++) {
+                MarketData current = marketData.get(i);
+                MarketData next = marketData.get(i + 1);
+
+                if (current.getHigh() != null && next.getHigh() != null &&
+                        current.getLow() != null && next.getLow() != null) {
+
+                    if (next.getHigh().compareTo(current.getHigh()) > 0 &&
+                            next.getLow().compareTo(current.getLow()) > 0) {
+                        upCount++;
+                    } else if (next.getHigh().compareTo(current.getHigh()) < 0 &&
+                            next.getLow().compareTo(current.getLow()) < 0) {
+                        downCount++;
+                    }
+                }
+            }
+
+            // Determine trend based on price action and moving averages
+            if (ta.getSma20() != null && ta.getSma50() != null) {
+                boolean aboveSMA20 = currentPrice.compareTo(ta.getSma20()) > 0;
+                boolean aboveSMA50 = currentPrice.compareTo(ta.getSma50()) > 0;
+                boolean sma20AboveSMA50 = ta.getSma20().compareTo(ta.getSma50()) > 0;
+
+                if (aboveSMA20 && aboveSMA50 && sma20AboveSMA50 && upCount > downCount) {
+                    ta.setTrend("UP");
+                    ta.setStrength(Math.min(1.0, 0.5 + (upCount - downCount) * 0.1));
+                } else if (!aboveSMA20 && !aboveSMA50 && !sma20AboveSMA50 && downCount > upCount) {
+                    ta.setTrend("DOWN");
+                    ta.setStrength(Math.min(1.0, 0.5 + (downCount - upCount) * 0.1));
                 } else {
-                    gains.add(BigDecimal.ZERO);
-                    losses.add(change.abs());
+                    ta.setTrend("NEUTRAL");
+                    ta.setStrength(0.5);
                 }
             }
-        }
 
-        BigDecimal avgGain = gains.stream().reduce(BigDecimal.ZERO, BigDecimal::add)
-                .divide(BigDecimal.valueOf(period), 6, RoundingMode.HALF_UP);
-        BigDecimal avgLoss = losses.stream().reduce(BigDecimal.ZERO, BigDecimal::add)
-                .divide(BigDecimal.valueOf(period), 6, RoundingMode.HALF_UP);
-
-        if (avgLoss.compareTo(BigDecimal.ZERO) == 0) {
-            return 100.0;
-        }
-
-        BigDecimal rs = avgGain.divide(avgLoss, 6, RoundingMode.HALF_UP);
-        double rsi = 100.0 - (100.0 / (1.0 + rs.doubleValue()));
-
-        return rsi;
-    }
-
-    private BigDecimal calculateEMA(List<MarketData> data, int period) {
-        if (data.size() < period) {
-            return data.get(data.size() - 1).getPrice();
-        }
-
-        BigDecimal multiplier = BigDecimal.valueOf(2.0 / (period + 1));
-        BigDecimal ema = data.get(data.size() - period).getPrice();
-
-        for (int i = data.size() - period + 1; i < data.size(); i++) {
-            BigDecimal price = data.get(i).getPrice();
-            ema = price.subtract(ema).multiply(multiplier).add(ema);
-        }
-
-        return ema;
-    }
-
-    private void calculateSupportResistance(List<MarketData> data, TechnicalAnalysis ta) {
-        if (data.size() < SUPPORT_RESISTANCE_LOOKBACK) {
-            ta.setSupportLevels(new ArrayList<>());
-            ta.setResistanceLevels(new ArrayList<>());
-            return;
-        }
-
-        List<BigDecimal> highs = new ArrayList<>();
-        List<BigDecimal> lows = new ArrayList<>();
-
-        // Look for local highs and lows
-        for (int i = 2; i < data.size() - 2; i++) {
-            MarketData current = data.get(i);
-            MarketData prev1 = data.get(i - 1);
-            MarketData prev2 = data.get(i - 2);
-            MarketData next1 = data.get(i + 1);
-            MarketData next2 = data.get(i + 2);
-
-            BigDecimal currentHigh = current.getHigh() != null ? current.getHigh() : current.getPrice();
-            BigDecimal currentLow = current.getLow() != null ? current.getLow() : current.getPrice();
-
-            // Check for local high
-            if (isLocalHigh(currentHigh, prev1, prev2, next1, next2)) {
-                highs.add(currentHigh);
-            }
-
-            // Check for local low
-            if (isLocalLow(currentLow, prev1, prev2, next1, next2)) {
-                lows.add(currentLow);
-            }
-        }
-
-        // Sort and take significant levels
-        List<BigDecimal> resistanceLevels = highs.stream()
-                .sorted(Comparator.reverseOrder())
-                .distinct()
-                .limit(3)
-                .collect(Collectors.toList());
-
-        List<BigDecimal> supportLevels = lows.stream()
-                .sorted()
-                .distinct()
-                .limit(3)
-                .collect(Collectors.toList());
-
-        ta.setResistanceLevels(resistanceLevels);
-        ta.setSupportLevels(supportLevels);
-    }
-
-    private boolean isLocalHigh(BigDecimal current, MarketData prev1, MarketData prev2,
-                                MarketData next1, MarketData next2) {
-        BigDecimal p1High = prev1.getHigh() != null ? prev1.getHigh() : prev1.getPrice();
-        BigDecimal p2High = prev2.getHigh() != null ? prev2.getHigh() : prev2.getPrice();
-        BigDecimal n1High = next1.getHigh() != null ? next1.getHigh() : next1.getPrice();
-        BigDecimal n2High = next2.getHigh() != null ? next2.getHigh() : next2.getPrice();
-
-        return current.compareTo(p1High) > 0 && current.compareTo(p2High) > 0 &&
-                current.compareTo(n1High) > 0 && current.compareTo(n2High) > 0;
-    }
-
-    private boolean isLocalLow(BigDecimal current, MarketData prev1, MarketData prev2,
-                               MarketData next1, MarketData next2) {
-        BigDecimal p1Low = prev1.getLow() != null ? prev1.getLow() : prev1.getPrice();
-        BigDecimal p2Low = prev2.getLow() != null ? prev2.getLow() : prev2.getPrice();
-        BigDecimal n1Low = next1.getLow() != null ? next1.getLow() : next1.getPrice();
-        BigDecimal n2Low = next2.getLow() != null ? next2.getLow() : next2.getPrice();
-
-        return current.compareTo(p1Low) < 0 && current.compareTo(p2Low) < 0 &&
-                current.compareTo(n1Low) < 0 && current.compareTo(n2Low) < 0;
-    }
-    @Autowired
-    private UnifiedTrendDetector unifiedTrendDetector;
-    private void analyzeTrends(List<MarketData> data, TechnicalAnalysis ta) {
-        String trend = unifiedTrendDetector.detectTrend("QQQ");
-        ta.setTrend(trend);
-        log.info("[TA] Trend: {}", ta.getTrend());
-    }
-
-    private void checkReversals(TechnicalAnalysis ta) {
-        // Check for potential bearish reversal
-        boolean bearishReversal = false;
-        if (ta.getRsi() > 70 && "BEARISH".equals(ta.getMacdSignal())) {
-            bearishReversal = true;
-        } else if (ta.getCurrentPrice().compareTo(ta.getVwapUpperBand()) > 0 &&
-                ta.isHighVolume() && ta.getRsi() > 65) {
-            bearishReversal = true;
-        }
-        ta.setPotentialBearishReversal(bearishReversal);
-
-        // Check for potential bullish reversal
-        boolean bullishReversal = false;
-        if (ta.getRsi() < 30 && "BULLISH".equals(ta.getMacdSignal())) {
-            bullishReversal = true;
-        } else if (ta.getCurrentPrice().compareTo(ta.getVwapLowerBand()) < 0 &&
-                ta.isHighVolume() && ta.getRsi() < 35) {
-            bullishReversal = true;
-        }
-        ta.setPotentialBullishReversal(bullishReversal);
-    }
-
-    private void setDynamicParameters(TechnicalAnalysis ta) {
-        DynamicParameters params = new DynamicParameters();
-
-        // Adjust based on volatility
-        if (ta.isVolatilitySpike()) {
-            params.setMinVolumeMultiplier(0.7); // Lower volume requirement during volatility
-            params.setMinIVMultiplier(1.2);     // Higher IV requirement
-            params.setTargetMultiplier(1.5);    // Wider targets
-            params.setStopMultiplier(1.3);      // Wider stops
-        } else if (ta.getVolatilityPercentile() < 30) {
-            params.setMinVolumeMultiplier(1.3); // Higher volume requirement in low volatility
-            params.setMinIVMultiplier(0.8);     // Lower IV requirement
-            params.setTargetMultiplier(0.8);    // Tighter targets
-            params.setStopMultiplier(0.9);      // Tighter stops
-        }
-
-        // Adjust based on volume
-        if (ta.isHighVolume()) {
-            params.setMinVolumeMultiplier(params.getMinVolumeMultiplier() * 0.8);
-        }
-
-        ta.setDynamicParameters(params);
-    }
-
-    private void detectMarketRegime(TechnicalAnalysis ta) {
-        LocalTime now = LocalTime.now(ET_ZONE);
-
-        // Time-based regimes
-        if (now.isBefore(LocalTime.of(10, 0))) {
-            ta.setMarketRegime(MarketRegime.OPENING_RANGE);
-            return;
-        }
-        if (now.isAfter(LocalTime.of(15, 30))) {
-            ta.setMarketRegime(MarketRegime.CLOSING_RANGE);
-            return;
-        }
-
-        // Volatility-based regimes
-        if (ta.isVolatilitySpike()) {
-            ta.setMarketRegime(MarketRegime.HIGH_VOLATILITY);
-            return;
-        }
-
-        if (ta.getVolatilityPercentile() < 30) {
-            ta.setMarketRegime(MarketRegime.LOW_VOLATILITY);
-            return;
-        }
-
-        // Trend-based regimes - UPDATED TO USE NEW NAMING
-        double trendStrength = ta.getStrength();
-        String trend = ta.getTrend();
-
-        if (trendStrength > 0.7) {
-            if ("UP".equals(trend)) {
-                ta.setMarketRegime(MarketRegime.TRENDING_UP);
-            } else if ("DOWN".equals(trend)) {
-                ta.setMarketRegime(MarketRegime.TRENDING_DOWN);
-            }
-        } else {
-            ta.setMarketRegime(MarketRegime.CHOPPY);
+        } catch (Exception e) {
+            log.error("[TA][{}] Error determining trend: {}", analysisId, e.getMessage());
+            ta.setTrend("NEUTRAL");
+            ta.setStrength(0.5);
         }
     }
 
-    private void calculateOpeningRange(List<MarketData> data, TechnicalAnalysis ta) {
-        LocalTime marketOpen = LocalTime.of(9, 30);
-        LocalTime rangeEnd = LocalTime.of(9, 45); // 15-minute opening range
-        LocalTime now = LocalTime.now(ET_ZONE);
+    /**
+     * Validate the technical analysis has minimum required fields
+     * Note: Since RSI and volumeRatio are primitives, they always have values (can't be null)
+     */
+    private boolean validateAnalysis(TechnicalAnalysis ta, String analysisId) {
+        boolean valid = ta.getCurrentPrice() != null &&
+                ta.getVwap() != null;
 
-        if (data.isEmpty()) {
-            ta.setOpeningRangeHigh(null);
-            ta.setOpeningRangeLow(null);
-            return;
+        // RSI and volumeRatio are primitives, so check for default/invalid values
+        if (ta.getRsi() <= 0 || ta.getRsi() > 100) {
+            log.warn("[TA][{}] Invalid RSI value: {}", analysisId, ta.getRsi());
+            valid = false;
         }
 
-        BigDecimal orHigh = null;
-        BigDecimal orLow = null;
+        if (ta.getVolumeRatio() <= 0) {
+            log.warn("[TA][{}] Invalid volume ratio: {}", analysisId, ta.getVolumeRatio());
+            valid = false;
+        }
 
-        if (now.isBefore(rangeEnd)) {
-            // Still in opening range, use data so far
-            for (MarketData md : data) {
-                LocalDateTime timestamp = md.getTimestamp();
-                if (timestamp.toLocalTime().isAfter(marketOpen)) {
-                    BigDecimal high = md.getHigh() != null ? md.getHigh() : md.getPrice();
-                    BigDecimal low = md.getLow() != null ? md.getLow() : md.getPrice();
+        if (!valid) {
+            log.warn("[TA][{}] Analysis validation failed", analysisId);
+        }
 
-                    if (orHigh == null || high.compareTo(orHigh) > 0) {
-                        orHigh = high;
-                    }
-                    if (orLow == null || low.compareTo(orLow) < 0) {
-                        orLow = low;
-                    }
+        return valid;
+    }
+
+    /**
+     * Create a basic fallback analysis when data is unavailable
+     */
+    private TechnicalAnalysis createFallbackAnalysis(String symbol, String analysisId) {
+        log.warn("[TA][{}] Creating fallback analysis for {}", analysisId, symbol);
+
+        TechnicalAnalysis ta = new TechnicalAnalysis();
+        ta.setSymbol(symbol);
+        ta.setTimestamp(LocalDateTime.now());
+
+        try {
+            // Try to get current price from quote
+            QuoteResponse quoteResponse = tradierService.getQuote(symbol);
+            if (quoteResponse != null && quoteResponse.getQuote() != null) {
+                Quote quote = quoteResponse.getQuote();
+                BigDecimal price = quote.getLast();
+
+                if (price != null && price.compareTo(BigDecimal.ZERO) > 0) {
+                    ta.setCurrentPrice(price);
+                    ta.setVwap(price);
+                    ta.setSma20(price);
+                    ta.setSma50(price);
+                    ta.setBollingerMiddle(price);
+                    ta.setBollingerUpper(price.multiply(new BigDecimal("1.005")));
+                    ta.setBollingerLower(price.multiply(new BigDecimal("0.995")));
+                    ta.setAverageTrueRange(price.multiply(new BigDecimal("0.01")));
+                    ta.setAverageVolume(BigDecimal.valueOf(100000));
+                    ta.setCurrentVolatility(price.multiply(new BigDecimal("0.02")));
+                    ta.setAverageVolatility(price.multiply(new BigDecimal("0.02")));
                 }
             }
-        } else {
-            // After opening range, calculate from first 15 minutes
-            for (MarketData md : data) {
-                LocalDateTime timestamp = md.getTimestamp();
-                LocalTime time = timestamp.toLocalTime();
-
-                if (time.isAfter(marketOpen) && time.isBefore(rangeEnd)) {
-                    BigDecimal high = md.getHigh() != null ? md.getHigh() : md.getPrice();
-                    BigDecimal low = md.getLow() != null ? md.getLow() : md.getPrice();
-
-                    if (orHigh == null || high.compareTo(orHigh) > 0) {
-                        orHigh = high;
-                    }
-                    if (orLow == null || low.compareTo(orLow) < 0) {
-                        orLow = low;
-                    }
-                }
-            }
+        } catch (Exception e) {
+            log.error("[TA][{}] Error creating fallback analysis: {}", analysisId, e.getMessage());
         }
 
-        ta.setOpeningRangeHigh(orHigh);
-        ta.setOpeningRangeLow(orLow);
+        // Set neutral/default values for primitives
+        ta.setRsi(50.0);
+        ta.setVolatilityPercentile(50.0);
+        ta.setVolumeRatio(1.0);
+        ta.setMomentumStrength(0.5);
+        ta.setTrend("NEUTRAL");
+        ta.setStrength(0.5);
+        ta.setCurrentVolume(10000L);
+
+        return ta;
     }
 
-    private void checkDivergences(List<MarketData> data, TechnicalAnalysis ta) {
-        // DISABLED - always set to false
-        ta.setHasRsiDivergence(false);
-        ta.setHasMacdDivergence(false);
-    }
-
-    private void calculateVwapExtensions(TechnicalAnalysis ta) {
-        if (ta.getVwap() == null || ta.getVwap().compareTo(BigDecimal.ZERO) == 0) {
-            ta.setPriceToVwapRatio(1.0);
-            ta.setExtendedFromVwap(false);
-            return;
+    /**
+     * Enhance partial analysis with fallback data
+     */
+    private TechnicalAnalysis enhanceWithFallbackData(TechnicalAnalysis ta, String symbol, String analysisId) {
+        // Fill in any missing fields with reasonable defaults
+        if (ta.getVwap() == null) {
+            ta.setVwap(ta.getCurrentPrice());
         }
 
-        BigDecimal currentPrice = ta.getCurrentPrice();
-        BigDecimal vwap = ta.getVwap();
-
-        // Calculate price to VWAP ratio
-        double ratio = currentPrice.divide(vwap, 6, RoundingMode.HALF_UP).doubleValue();
-        ta.setPriceToVwapRatio(ratio);
-
-        // Calculate standard deviation if not already set
-        if (ta.getVwapUpperBand() != null && ta.getVwapLowerBand() != null) {
-            BigDecimal upperDiff = ta.getVwapUpperBand().subtract(vwap);
-            BigDecimal stdDev = upperDiff.divide(BigDecimal.valueOf(STD_DEV_MULTIPLIER), 4, RoundingMode.HALF_UP);
-            ta.setVwapStandardDeviation(stdDev);
-
-            // Check if price is extended (beyond 2.5 standard deviations)
-            BigDecimal extension = currentPrice.subtract(vwap).abs();
-            BigDecimal maxExtension = stdDev.multiply(BigDecimal.valueOf(2.5));
-            ta.setExtendedFromVwap(extension.compareTo(maxExtension) > 0);
-        } else {
-            ta.setVwapStandardDeviation(BigDecimal.ZERO);
-            ta.setExtendedFromVwap(false);
+        // For primitive doubles, check if they have invalid/default values
+        if (ta.getRsi() <= 0 || ta.getRsi() > 100) {
+            ta.setRsi(50.0);
         }
+
+        if (ta.getVolumeRatio() <= 0) {
+            ta.setVolumeRatio(1.0);
+        }
+
+        if (ta.getVolatilityPercentile() <= 0) {
+            ta.setVolatilityPercentile(50.0);
+        }
+
+        if (ta.getMomentumStrength() < 0 || ta.getMomentumStrength() > 1) {
+            ta.setMomentumStrength(0.5);
+        }
+
+        if (ta.getTrend() == null) {
+            ta.setTrend("NEUTRAL");
+        }
+
+        if (ta.getStrength() < 0 || ta.getStrength() > 1) {
+            ta.setStrength(0.5);
+        }
+
+        if (ta.getSma20() == null) {
+            ta.setSma20(ta.getCurrentPrice());
+        }
+
+        if (ta.getSma50() == null) {
+            ta.setSma50(ta.getCurrentPrice());
+        }
+
+        if (ta.getBollingerMiddle() == null) {
+            ta.setBollingerMiddle(ta.getCurrentPrice());
+            ta.setBollingerUpper(ta.getCurrentPrice().multiply(new BigDecimal("1.005")));
+            ta.setBollingerLower(ta.getCurrentPrice().multiply(new BigDecimal("0.995")));
+        }
+
+        if (ta.getAverageTrueRange() == null) {
+            ta.setAverageTrueRange(ta.getCurrentPrice().multiply(new BigDecimal("0.01")));
+        }
+
+        if (ta.getAverageVolume() == null) {
+            ta.setAverageVolume(BigDecimal.valueOf(100000));
+        }
+
+        if (ta.getCurrentVolatility() == null) {
+            ta.setCurrentVolatility(ta.getCurrentPrice().multiply(new BigDecimal("0.02")));
+        }
+
+        if (ta.getAverageVolatility() == null) {
+            ta.setAverageVolatility(ta.getCurrentPrice().multiply(new BigDecimal("0.02")));
+        }
+
+        if (ta.getCurrentVolume() <= 0) {
+            ta.setCurrentVolume(10000L);
+        }
+
+        log.info("[TA][{}] Enhanced analysis with fallback data", analysisId);
+        return ta;
     }
 }

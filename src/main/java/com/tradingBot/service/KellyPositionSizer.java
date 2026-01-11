@@ -106,8 +106,8 @@ public class KellyPositionSizer {
             contracts = availableCapital.divide(contractValue, 0, RoundingMode.DOWN).intValue();
         }
 
-        log.info("[{}] Kelly sizing - Available: ${}, Kelly%: {:.2f}%, Adjusted%: {:.2f}%, Contracts: {}",
-                sizeId, availableCapital, kellyPercentage * 100, adjustedPercentage * 100, contracts);
+        log.info("[{}] Kelly sizing - Available: ${}, Kelly%: {}%, Adjusted%: {}%, Contracts: {}",
+                sizeId, availableCapital, String.format("%.2f",kellyPercentage * 100), String.format("%.2f",adjustedPercentage * 100), contracts);
 
         return contracts;
     }

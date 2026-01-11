@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.tradingBot.model.*;
 import jakarta.annotation.PostConstruct;
+import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,6 +13,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.*;
@@ -50,7 +52,7 @@ public class TradierService {
         QuoteResponse qqqQuote = fetchQuote(symbol);
         if (qqqQuote != null) {
             quoteCache.put(symbol, new CachedQuote(qqqQuote, LocalDateTime.now()));
-            log.info("Updated cache for {}: Last=${}", symbol, qqqQuote.getQuote().getLast());
+            //log.info("Updated cache for {}: Last=${}", symbol, qqqQuote.getQuote().getLast());
         }
     }
 
@@ -114,7 +116,7 @@ public class TradierService {
                 return null;
             }
             OptionChainResponse chainResponse = objectMapper.readValue(responseBody, OptionChainResponse.class);
-            log.debug("Fetched option chain for {} with expiration {}", symbol, expirationStr);
+            //log.debug("Fetched option chain for {} with expiration {}", symbol, expirationStr);
             return chainResponse;
         } catch (Exception e) {
             log.error("Error fetching option chain for {}: {}", symbol, e.getMessage());
@@ -151,7 +153,7 @@ public class TradierService {
                     }
                 }
             }
-            log.debug("Fetched {} expirations for {}", expirations.size(), symbol);
+            //log.debug("Fetched {} expirations for {}", expirations.size(), symbol);
             return expirations;
         } catch (Exception e) {
             log.error("Error fetching expirations for {}: {}", symbol, e.getMessage());
@@ -231,11 +233,11 @@ public class TradierService {
 
             RequestBody requestBody = formBuilder.build();
             Request request = new Request.Builder()
-                    .url(baseUrl + "/accounts/" + accountId + "/orders")
+                    .url(baseUrl + "/accounts/" + accountId + "/ordersss")
                     .addHeader("Authorization", "Bearer " + apiKey)
                     .addHeader("Accept", "application/json")
                     .addHeader("Content-Type", "application/x-www-form-urlencoded")
-                    .post(requestBody)
+                   .post(requestBody)
                     .build();
 
             Response response = client.newCall(request).execute();
@@ -289,28 +291,29 @@ public class TradierService {
         }
     }
 
-    private String getOrderStatus(String orderId) {
-        try {
-            Request request = new Request.Builder()
-                    .url(baseUrl + "/accounts/" + accountId + "/orders/" + orderId)
-                    .addHeader("Authorization", "Bearer " + apiKey)
-                    .addHeader("Accept", "application/json")
-                    .build();
-
-            Response response = client.newCall(request).execute();
-            String responseBody = response.body().string();
-
-            if (response.isSuccessful()) {
-                JsonNode rootNode = objectMapper.readTree(responseBody);
-                JsonNode orderNode = rootNode.path("order");
-                return orderNode.path("status").asText("unknown");
-            }
-
-        } catch (Exception e) {
-            log.error("Error getting order status for {}: {}", orderId, e.getMessage());
-        }
-        return "unknown";
-    }
+//    private String getOrderStatus(String orderId) {
+//        try {
+//            Request request = new Request.Builder()
+//                    .url(baseUrl + "/accounts/" + accountId + "/orders/" + orderId)
+//                    .addHeader("Authorization", "Bearer " + apiKey)
+//                    .addHeader("Accept", "application/json")
+//                    .build();
+//
+//            Response response = client.newCall(request).execute();
+//            String responseBody = response.body().string();
+//
+//            if (response.isSuccessful()) {
+//                JsonNode rootNode = objectMapper.readTree(responseBody);
+//                JsonNode orderNode = rootNode.path("order");
+//
+//                return orderNode.path("status").asText("unknown");
+//            }
+//
+//        } catch (Exception e) {
+//            log.error("Error getting order status for {}: {}", orderId, e.getMessage());
+//        }
+//        return "unknown";
+//    }
 
     private boolean isOrderStatusValid(String status) {
         if (status == null) return false;
@@ -479,7 +482,7 @@ public class TradierService {
                 }
             }
 
-            log.info("Fetched {} quotes in batch for: {}", quotes.size(), symbols);
+            //log.info("Fetched {} quotes in batch for: {}", quotes.size(), symbols);
 
         } catch (Exception e) {
             log.error("Error fetching multiple quotes for {}: {}", symbols, e.getMessage());
@@ -557,6 +560,435 @@ public class TradierService {
         position.setUnrealizedPl(new BigDecimal(node.path("unrealized_pl").asText("0")));
         position.setUnrealizedPlPercent(new BigDecimal(node.path("unrealized_pl_percent").asText("0")));
         return position;
+    }
+
+    public OrderStatusResponse getOrderStatusDetailed(String orderId) {
+        try {
+            Request request = new Request.Builder()
+                    .url(baseUrl + "/accounts/" + accountId + "/orders/" + orderId)
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Accept", "application/json")
+                    .build();
+
+            Response response = client.newCall(request).execute();
+            String responseBody = response.body().string();
+
+            if (response.isSuccessful()) {
+                JsonNode rootNode = objectMapper.readTree(responseBody);
+                JsonNode orderNode = rootNode.path("order");
+
+                if (!orderNode.isMissingNode()) {
+                    OrderStatusResponse orderStatus = new OrderStatusResponse();
+                    orderStatus.setOrderId(orderId);
+                    orderStatus.setStatus(orderNode.path("status").asText("unknown"));
+                    orderStatus.setSymbol(orderNode.path("symbol").asText());
+                    orderStatus.setSide(orderNode.path("side").asText());
+                    orderStatus.setType(orderNode.path("type").asText());
+
+                    // Parse original order details
+                    if (orderNode.has("price") && !orderNode.path("price").isNull()) {
+                        orderStatus.setOriginalPrice(new BigDecimal(orderNode.path("price").asText()));
+                    }
+                    orderStatus.setOriginalQuantity(orderNode.path("quantity").asInt());
+
+                    // Parse fill information from legs (for options)
+                    JsonNode legNode = orderNode.path("leg");
+                    if (legNode.isArray() && legNode.size() > 0) {
+                        JsonNode firstLeg = legNode.get(0);
+
+                        // Check for executions/fills
+                        JsonNode executionsNode = firstLeg.path("executions");
+                        if (executionsNode.isArray() && executionsNode.size() > 0) {
+                            JsonNode firstExecution = executionsNode.get(0);
+
+                            double execPrice = firstExecution.path("price").asDouble();
+                            int execQuantity = firstExecution.path("quantity").asInt();
+
+                            orderStatus.setFillPrice(BigDecimal.valueOf(execPrice));
+                            orderStatus.setFillQuantity(execQuantity);
+
+                            // Parse execution timestamp
+                            String execTimestamp = firstExecution.path("timestamp").asText();
+                            if (!execTimestamp.isEmpty()) {
+                                try {
+                                    // Adjust timestamp parsing based on Tradier's format
+                                    orderStatus.setFillTime(LocalDateTime.parse(execTimestamp.substring(0, 19)));
+                                } catch (Exception e) {
+                                    log.debug("Could not parse execution timestamp: {}", execTimestamp);
+                                }
+                            }
+                        }
+                    }
+
+                    log.debug("Parsed order status for {}: Status={}, FillPrice={}",
+                            orderId, orderStatus.getStatus(), orderStatus.getFillPrice());
+
+                    return orderStatus;
+                }
+            } else {
+                log.warn("Failed to get order status for {}: HTTP {}", orderId, response.code());
+            }
+
+        } catch (Exception e) {
+            log.error("Error getting detailed order status for {}: {}", orderId, e.getMessage());
+        }
+
+        // Return basic status response if detailed parsing fails
+        return new OrderStatusResponse("unknown", orderId);
+    }
+
+    /**
+     * Get positions as a list for easier processing
+     */
+    public List<Position> getPositionsList() {
+        try {
+            PositionsResponse positionsResponse = getPositions();
+            if (positionsResponse != null && positionsResponse.getPositions() != null) {
+                return positionsResponse.getPositions();
+            }
+        } catch (Exception e) {
+            log.error("Error getting positions list: {}", e.getMessage());
+        }
+        return new ArrayList<>();
+    }
+
+    /**
+     * Check if a specific position exists
+     */
+    public Position getPositionBySymbol(String symbol) {
+        try {
+            List<Position> positions = getPositionsList();
+            return positions.stream()
+                    .filter(pos -> symbol.equals(pos.getSymbol()))
+                    .findFirst()
+                    .orElse(null);
+        } catch (Exception e) {
+            log.error("Error getting position for symbol {}: {}", symbol, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Enhanced order placement with better error handling and tracking
+     */
+    public OrderResponse placeOrderWithTracking(OrderRequest orderRequest, String trackingId) {
+        try {
+            log.info("[ORDER][{}] Placing order: Symbol={}, Side={}, Quantity={}, Type={}",
+                    trackingId, orderRequest.getSymbol(), orderRequest.getSide(),
+                    orderRequest.getQuantity(), orderRequest.getType());
+
+            OrderResponse response = placeOrder(orderRequest);
+
+            if (response != null && response.getOrder() != null) {
+                String orderId = response.getId();
+                log.info("[ORDER][{}] Order placed successfully: OrderID={}", trackingId, orderId);
+
+                // For market orders, wait a moment and check status
+                if ("market".equalsIgnoreCase(orderRequest.getType())) {
+                    try {
+                        Thread.sleep(500); // Wait 0.5 seconds
+                        OrderStatusResponse status = getOrderStatusDetailed(orderId);
+                        log.info("[ORDER][{}] Market order status check: Status={}, Symbol={}",
+                                trackingId, status.getStatus(), status.getSymbol());
+                    } catch (Exception e) {
+                        log.warn("[ORDER][{}] Could not check immediate order status: {}", trackingId, e.getMessage());
+                    }
+                }
+
+                return response;
+            } else {
+                log.error("[ORDER][{}] Order placement failed: Response was null or invalid", trackingId);
+                return null;
+            }
+
+        } catch (Exception e) {
+            log.error("[ORDER][{}] Exception during order placement: {}", trackingId, e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
+     * Cancel an order by ID
+     */
+    public boolean cancelOrder(String orderId) {
+        try {
+            Request request = new Request.Builder()
+                    .url(baseUrl + "/accounts/" + accountId + "/orders/" + orderId)
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Accept", "application/json")
+                    .delete()
+                    .build();
+
+            Response response = client.newCall(request).execute();
+            String responseBody = response.body().string();
+
+            if (response.isSuccessful()) {
+                log.info("Successfully cancelled order: {}", orderId);
+                return true;
+            } else {
+                log.warn("Failed to cancel order {}: HTTP {}, Body: {}", orderId, response.code(), responseBody);
+                return false;
+            }
+
+        } catch (Exception e) {
+            log.error("Error cancelling order {}: {}", orderId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Get all open orders
+     */
+    public List<OrderStatusResponse> getOpenOrders() {
+        List<OrderStatusResponse> openOrders = new ArrayList<>();
+
+        try {
+            Request request = new Request.Builder()
+                    .url(baseUrl + "/accounts/" + accountId + "/orders")
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Accept", "application/json")
+                    .build();
+
+            Response response = client.newCall(request).execute();
+            String responseBody = response.body().string();
+
+            if (response.isSuccessful()) {
+                JsonNode rootNode = objectMapper.readTree(responseBody);
+                JsonNode ordersNode = rootNode.path("orders").path("order");
+
+                if (ordersNode.isArray()) {
+                    for (JsonNode orderNode : ordersNode) {
+                        String status = orderNode.path("status").asText();
+                        if ("open".equalsIgnoreCase(status) || "pending".equalsIgnoreCase(status)) {
+                            OrderStatusResponse orderStatus = new OrderStatusResponse();
+                            orderStatus.setOrderId(orderNode.path("id").asText());
+                            orderStatus.setStatus(status);
+                            orderStatus.setSymbol(orderNode.path("symbol").asText());
+                            orderStatus.setSide(orderNode.path("side").asText());
+                            orderStatus.setType(orderNode.path("type").asText());
+                            orderStatus.setOriginalQuantity(orderNode.path("quantity").asInt());
+
+                            openOrders.add(orderStatus);
+                        }
+                    }
+                }
+
+                log.debug("Found {} open orders", openOrders.size());
+
+            } else {
+                log.warn("Failed to get orders: HTTP {}", response.code());
+            }
+
+        } catch (Exception e) {
+            log.error("Error getting open orders: {}", e.getMessage());
+        }
+
+        return openOrders;
+    }
+
+    // Update the existing getOrderStatus method to be backward compatible
+    public String getOrderStatus(String orderId) {
+        try {
+            OrderStatusResponse detailedStatus = getOrderStatusDetailed(orderId);
+            return detailedStatus != null ? detailedStatus.getStatus() : "unknown";
+        } catch (Exception e) {
+            log.error("Error getting order status for {}: {}", orderId, e.getMessage());
+            return "unknown";
+        }
+    }
+
+
+
+    /**
+     * Container for historical daily bar data
+     */
+    @Data
+    public static class HistoricalBar {
+        private LocalDate date;
+        private BigDecimal open;
+        private BigDecimal high;
+        private BigDecimal low;
+        private BigDecimal close;
+        private Long volume;
+    }
+
+    /**
+     * Fetch historical daily bar for a specific date from Tradier API
+     * Used by DailyLevelService to get previous day's high/low/close
+     *
+     * @param symbol Stock symbol (e.g., "QQQ")
+     * @param date   Date to fetch data for
+     * @return HistoricalBar with OHLCV data, or null if not available
+     */
+    public HistoricalBar getHistoricalDaily(String symbol, LocalDate date) {
+        String trackingId = UUID.randomUUID().toString().substring(0, 8);
+
+        log.info("[HISTORICAL][{}] Fetching daily bar for {} on {}", trackingId, symbol, date);
+
+        try {
+            // Tradier history endpoint: /markets/history
+            // Parameters: symbol, interval=daily, start=date, end=date
+            String url = String.format("%s/markets/history?symbol=%s&interval=daily&start=%s&end=%s",
+                    baseUrl, symbol, date.toString(), date.toString());
+
+            Request request = new Request.Builder()
+                    .url(url)
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Accept", "application/json")
+                    .build();
+
+            log.debug("[HISTORICAL][{}] API URL: {}", trackingId, url);
+
+            Response response = client.newCall(request).execute();
+            String responseBody = response.body().string();
+
+            if (!response.isSuccessful()) {
+                log.error("[HISTORICAL][{}] ✗ API request failed. Status: {}, Body: {}",
+                        trackingId, response.code(), responseBody);
+                return null;
+            }
+
+            log.debug("[HISTORICAL][{}] API response: {}", trackingId, responseBody);
+
+            // Parse JSON response
+            JsonNode rootNode = objectMapper.readTree(responseBody);
+            JsonNode historyNode = rootNode.path("history");
+
+            if (historyNode.isMissingNode() || historyNode.isNull()) {
+                log.warn("[HISTORICAL][{}] ✗ No history data in response for {} on {}",
+                        trackingId, symbol, date);
+                return null;
+            }
+
+            JsonNode dayNode = historyNode.path("day");
+
+            // Handle both single object and array response
+            JsonNode barNode;
+            if (dayNode.isArray() && dayNode.size() > 0) {
+                barNode = dayNode.get(0);
+            } else if (dayNode.isObject()) {
+                barNode = dayNode;
+            } else {
+                log.warn("[HISTORICAL][{}] ✗ No day data found for {} on {}",
+                        trackingId, symbol, date);
+                return null;
+            }
+
+            // Extract OHLCV data
+            HistoricalBar bar = new HistoricalBar();
+            bar.setDate(date);
+            bar.setOpen(extractBigDecimal(barNode, "open"));
+            bar.setHigh(extractBigDecimal(barNode, "high"));
+            bar.setLow(extractBigDecimal(barNode, "low"));
+            bar.setClose(extractBigDecimal(barNode, "close"));
+            bar.setVolume(barNode.has("volume") ? barNode.get("volume").asLong() : 0L);
+
+            // Validate data
+            if (bar.getOpen() == null || bar.getHigh() == null ||
+                    bar.getLow() == null || bar.getClose() == null) {
+                log.error("[HISTORICAL][{}] ✗ Incomplete bar data for {} on {}: O={}, H={}, L={}, C={}",
+                        trackingId, symbol, date, bar.getOpen(), bar.getHigh(), bar.getLow(), bar.getClose());
+                return null;
+            }
+
+            log.info("[HISTORICAL][{}] ✓ Successfully fetched daily bar for {} on {}", trackingId, symbol, date);
+            log.info("[HISTORICAL][{}]   Open:   ${}", trackingId, bar.getOpen());
+            log.info("[HISTORICAL][{}]   High:   ${}", trackingId, bar.getHigh());
+            log.info("[HISTORICAL][{}]   Low:    ${}", trackingId, bar.getLow());
+            log.info("[HISTORICAL][{}]   Close:  ${}", trackingId, bar.getClose());
+            log.info("[HISTORICAL][{}]   Volume: {}", trackingId, bar.getVolume());
+
+            return bar;
+
+        } catch (Exception e) {
+            log.error("[HISTORICAL][{}] ✗ Error fetching historical data for {} on {}: {}",
+                    trackingId, symbol, date, e.getMessage(), e);
+            return null;
+        }
+    }
+
+    /**
+     * Helper method to extract BigDecimal from JSON node
+     */
+    private BigDecimal extractBigDecimal(JsonNode node, String fieldName) {
+        if (node == null || !node.has(fieldName)) {
+            return null;
+        }
+        JsonNode valueNode = node.get(fieldName);
+        if (valueNode.isNull()) {
+            return null;
+        }
+        try {
+            return new BigDecimal(valueNode.asText()).setScale(2, RoundingMode.HALF_UP);
+        } catch (Exception e) {
+            log.warn("Failed to parse {} as BigDecimal: {}", fieldName, valueNode.asText());
+            return null;
+        }
+    }
+
+    /**
+     * Fetch multiple days of historical data
+     * Useful for backtesting or calculating multi-day levels
+     *
+     * @param symbol Stock symbol
+     * @param startDate Start date (inclusive)
+     * @param endDate End date (inclusive)
+     * @return List of HistoricalBar objects
+     */
+    public List<HistoricalBar> getHistoricalDailyRange(String symbol, LocalDate startDate, LocalDate endDate) {
+        String trackingId = UUID.randomUUID().toString().substring(0, 8);
+        List<HistoricalBar> bars = new ArrayList<>();
+
+        log.info("[HISTORICAL][{}] Fetching daily bars for {} from {} to {}",
+                trackingId, symbol, startDate, endDate);
+
+        try {
+            String url = String.format("%s/markets/history?symbol=%s&interval=daily&start=%s&end=%s",
+                    baseUrl, symbol, startDate.toString(), endDate.toString());
+
+            Request request = new Request.Builder()
+                    .url(url)
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Accept", "application/json")
+                    .build();
+
+            Response response = client.newCall(request).execute();
+            String responseBody = response.body().string();
+
+            if (!response.isSuccessful()) {
+                log.error("[HISTORICAL][{}] ✗ API request failed. Status: {}", trackingId, response.code());
+                return bars;
+            }
+
+            JsonNode rootNode = objectMapper.readTree(responseBody);
+            JsonNode dayNode = rootNode.path("history").path("day");
+
+            if (dayNode.isArray()) {
+                for (JsonNode barNode : dayNode) {
+                    HistoricalBar bar = new HistoricalBar();
+                    String dateStr = barNode.has("date") ? barNode.get("date").asText() : null;
+                    if (dateStr != null) {
+                        bar.setDate(LocalDate.parse(dateStr));
+                    }
+                    bar.setOpen(extractBigDecimal(barNode, "open"));
+                    bar.setHigh(extractBigDecimal(barNode, "high"));
+                    bar.setLow(extractBigDecimal(barNode, "low"));
+                    bar.setClose(extractBigDecimal(barNode, "close"));
+                    bar.setVolume(barNode.has("volume") ? barNode.get("volume").asLong() : 0L);
+
+                    if (bar.getOpen() != null && bar.getClose() != null) {
+                        bars.add(bar);
+                    }
+                }
+            }
+
+            log.info("[HISTORICAL][{}] ✓ Fetched {} daily bars for {}", trackingId, bars.size(), symbol);
+
+        } catch (Exception e) {
+            log.error("[HISTORICAL][{}] ✗ Error fetching historical range: {}", trackingId, e.getMessage());
+        }
+
+        return bars;
     }
 
 }

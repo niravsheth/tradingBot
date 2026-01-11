@@ -8,7 +8,7 @@ import java.math.BigDecimal;
 
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
-class OrderWrapper {
+public class OrderWrapper {
     private String id;
     private String status;
     private String symbol;

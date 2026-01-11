@@ -120,7 +120,7 @@ public class PositionSyncService {
                 updateCurrentPrices(positions);
             }
 
-            log.info("[SYNC] Retrieved {} option positions from broker", positions.size());
+            //log.info("[SYNC] Retrieved {} option positions from broker", positions.size());
 
         } catch (Exception e) {
             log.error("[SYNC] Error fetching positions from API: {}", e.getMessage(), e);
@@ -262,7 +262,7 @@ public class PositionSyncService {
     @Scheduled(fixedDelay = 300000, initialDelay = 10000) // 5 minutes
     @Transactional
     public void syncPositionsWithDatabase() {
-        log.info("[SYNC] Starting position sync with Tradier API");
+        //log.info("[SYNC] Starting position sync with Tradier API");
 
         try {
             // Get positions from API
@@ -299,6 +299,11 @@ public class PositionSyncService {
                 }
 
                 if (!brokerPositions.containsKey(symbol)) {
+                    if (trade.getStatus() == "MOCK") {
+                        log.debug("[SYNC] Skipping MOCK trade {} - not synced with broker", trade.getOptionSymbol());
+                        continue; // Don't close MOCK trades based on broker sync
+                    }
+
                     log.warn("[SYNC] Position {} in DB but not at broker - marking as CLOSED", symbol);
                     trade.setStatus("CLOSED");
                     trade.setExitTime(LocalDateTime.now());

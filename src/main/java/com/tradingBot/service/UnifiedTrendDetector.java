@@ -52,11 +52,11 @@ public class UnifiedTrendDetector {
             // Try ultra-sensitive reactive trend first
             String reactiveTrend = detectReactiveTrendSimplified(symbol);
             if (!"NEUTRAL".equals(reactiveTrend)) {
-                log.info("MAIN DETECTOR: Using reactive trend: {}", reactiveTrend);
+                //log.info("MAIN DETECTOR: Using reactive trend: {}", reactiveTrend);
                 return reactiveTrend;
             }
 
-            log.info("MAIN DETECTOR: Reactive neutral, staying neutral");
+            //log.info("MAIN DETECTOR: Reactive neutral, staying neutral");
             return "NEUTRAL";
 
         } catch (Exception e) {
@@ -76,7 +76,7 @@ public class UnifiedTrendDetector {
             // Step 1: Get direct QQQ price movement first
             String qqqDirect = getDirectQQQTrend(symbol);
             if (!"NEUTRAL".equals(qqqDirect)) {
-                log.info("REACTIVE SIMPLE: Direct QQQ trend detected: {}", qqqDirect);
+                //log.info("REACTIVE SIMPLE: Direct QQQ trend detected: {}", qqqDirect);
                 return qqqDirect;
             }
 
@@ -90,7 +90,7 @@ public class UnifiedTrendDetector {
             String trend = determineEnhancedTrend(signals);
 
             long latency = (System.nanoTime() - startTime) / 1_000_000;
-            log.info("REACTIVE SIMPLE: {} (latency:{}ms)", trend, latency);
+            //log.info("REACTIVE SIMPLE: {} (latency:{}ms)", trend, latency);
             return trend;
 
         } catch (Exception e) {
@@ -104,8 +104,8 @@ public class UnifiedTrendDetector {
      */
     private String determineEnhancedTrend(ReactiveSignals signals) {
 
-        log.info("REACTIVE SIMPLE: NVDA:{}%, MSFT:{}%, Combined:{}, Correlation:{}",
-                signals.nvdaMomentum * 100, signals.msftMomentum * 100, signals.combinedStrength, signals.correlation);
+        //log.info("REACTIVE SIMPLE: NVDA:{}%, MSFT:{}%, Combined:{}, Correlation:{}",
+ //               signals.nvdaMomentum * 100, signals.msftMomentum * 100, signals.combinedStrength, signals.correlation);
 
         // Check if we have strong individual signals that override combination
         if (Math.abs(signals.nvdaMomentum) > STRONG_SIGNAL_THRESHOLD ||
@@ -122,13 +122,13 @@ public class UnifiedTrendDetector {
 
         // Make final decision with ultra-sensitive thresholds
         if (finalSignal > ULTRA_SENSITIVE_THRESHOLD) {
-            log.info("REACTIVE SIMPLE: UP signal (final:{} > {})", finalSignal, ULTRA_SENSITIVE_THRESHOLD);
+            //log.info("REACTIVE SIMPLE: UP signal (final:{} > {})", finalSignal, ULTRA_SENSITIVE_THRESHOLD);
             return "UP";
         } else if (finalSignal < -ULTRA_SENSITIVE_THRESHOLD) {
-            log.info("REACTIVE SIMPLE: DOWN signal (final:{} < {})", finalSignal, -ULTRA_SENSITIVE_THRESHOLD);
+            //log.info("REACTIVE SIMPLE: DOWN signal (final:{} < {})", finalSignal, -ULTRA_SENSITIVE_THRESHOLD);
             return "DOWN";
         } else {
-            log.info("REACTIVE SIMPLE: NEUTRAL (final:{})", finalSignal);
+            //log.info("REACTIVE SIMPLE: NEUTRAL (final:{})", finalSignal);
             return "NEUTRAL";
         }
     }
@@ -143,27 +143,27 @@ public class UnifiedTrendDetector {
         if (nvdaStrong && !msftStrong) {
             // NVDA has strong signal, MSFT weak - follow NVDA (market leader)
             String direction = signals.nvdaMomentum > 0 ? "UP" : "DOWN";
-            log.info("STRONG SIGNAL: NVDA leading with {}% move, direction: {}",
-                    signals.nvdaMomentum * 100, direction);
+            //log.info("STRONG SIGNAL: NVDA leading with {}% move, direction: {}",
+             //       signals.nvdaMomentum * 100, direction);
             return direction;
         } else if (msftStrong && !nvdaStrong) {
             // MSFT has strong signal, NVDA weak - but weight by correlation
             if (signals.correlation > CORRELATION_THRESHOLD) {
                 String direction = signals.msftMomentum > 0 ? "UP" : "DOWN";
-                log.info("STRONG SIGNAL: MSFT strong with correlation {}, direction: {}",
-                        signals.correlation, direction);
+//                log.info("STRONG SIGNAL: MSFT strong with correlation {}, direction: {}",
+//                        signals.correlation, direction);
                 return direction;
             } else {
                 // Low correlation - MSFT strong signal gets reduced weight
                 double reducedSignal = signals.msftMomentum * 0.5; // Reduce impact
-                log.info("STRONG SIGNAL: MSFT strong but low correlation, reducing weight: {}%",
-                        reducedSignal * 100);
+//                log.info("STRONG SIGNAL: MSFT strong but low correlation, reducing weight: {}%",
+//                        reducedSignal * 100);
                 return reducedSignal > ULTRA_SENSITIVE_THRESHOLD ? "UP" :
                         reducedSignal < -ULTRA_SENSITIVE_THRESHOLD ? "DOWN" : "NEUTRAL";
             }
         } else if (nvdaStrong && msftStrong) {
             // Both strong - use original combined logic but with higher confidence
-            log.info("STRONG SIGNAL: Both strong, using combined: {}", signals.combinedStrength);
+            //log.info("STRONG SIGNAL: Both strong, using combined: {}", signals.combinedStrength);
             return signals.combinedStrength > 0 ? "UP" : signals.combinedStrength < 0 ? "DOWN" : "NEUTRAL";
         }
 
@@ -187,12 +187,12 @@ public class UnifiedTrendDetector {
         }
 
         if (nvdaLeadershipScore > msftLeadershipScore && Math.abs(signals.nvdaMomentum) > 0.001) {
-            log.debug("LEADER ANALYSIS: NVDA leading (score: {:.3f} vs {:.3f})",
-                    nvdaLeadershipScore, msftLeadershipScore);
+            //log.debug("LEADER ANALYSIS: NVDA vs msft leading (score: {} vs {})",
+         //           String.format("%.3f",nvdaLeadershipScore), String.format("%.3f",msftLeadershipScore));
             return new MarketLeader("NVDA", signals.nvdaMomentum, nvdaLeadershipScore);
         } else if (Math.abs(signals.msftMomentum) > 0.001) {
-            log.debug("LEADER ANALYSIS: MSFT leading (score: {:.3f} vs {:.3f})",
-                    msftLeadershipScore, nvdaLeadershipScore);
+//            log.debug("LEADER ANALYSIS: MSFT vs nvidia leading (score: {} vs {})",
+//                    String.format("%.3f",msftLeadershipScore), String.format("%.3f",nvdaLeadershipScore));
             return new MarketLeader("MSFT", signals.msftMomentum, msftLeadershipScore);
         } else {
             return new MarketLeader("NONE", 0.0, 0.0);
@@ -206,36 +206,36 @@ public class UnifiedTrendDetector {
 
         if (signals.correlation < CORRELATION_THRESHOLD) {
             // Low correlation: Use leader-weighted approach
-            log.debug("LOW CORRELATION: Using leader-weighted approach");
+            //log.debug("LOW CORRELATION: Using leader-weighted approach");
 
             if (leader.symbol.equals("NVDA")) {
                 // NVDA leading in low correlation environment
                 double leaderWeighted = (signals.nvdaMomentum * LEADER_WEIGHT) +
                         (signals.msftMomentum * OTHERS_WEIGHT);
-                log.debug("NVDA LEADER: weighted signal {:.4f} (NVDA: {:.1f}%, MSFT: {:.1f}%)",
-                        leaderWeighted, signals.nvdaMomentum * 100, signals.msftMomentum * 100);
+//                log.debug("NVDA LEADER: weighted signal {} (NVDA: {}%, MSFT: {}%)",
+//                        String.format("%.4f",leaderWeighted), String.format("%.1f",signals.nvdaMomentum * 100), String.format("%.1f",signals.msftMomentum * 100));
                 return leaderWeighted;
             } else if (leader.symbol.equals("MSFT")) {
                 // MSFT leading but with less weight than NVDA would get
                 double leaderWeighted = (signals.msftMomentum * 0.6) +
                         (signals.nvdaMomentum * 0.4);
-                log.debug("MSFT LEADER: weighted signal {:.4f}", leaderWeighted);
+                //log.debug("MSFT LEADER: weighted signal {}", String.format("%.4f",leaderWeighted));
                 return leaderWeighted;
             } else {
                 // No clear leader - use dampened average
                 double dampened = signals.combinedStrength * 0.7;
-                log.debug("NO LEADER: dampened signal {:.4f}", dampened);
+                //log.debug("NO LEADER: dampened signal {}", String.format("%.4f",dampened));
                 return dampened;
             }
 
         } else if (signals.correlation > HIGH_CORRELATION_THRESHOLD_NEW) {
             // High correlation: Use traditional weighted average
-            log.debug("HIGH CORRELATION: Using traditional weighted average");
+            //log.debug("HIGH CORRELATION: Using traditional weighted average");
             return signals.combinedStrength;
 
         } else {
             // Medium correlation: Blend approaches
-            log.debug("MEDIUM CORRELATION: Blending approaches");
+            //log.debug("MEDIUM CORRELATION: Blending approaches");
             double traditional = signals.combinedStrength;
 
             // Calculate leader-weighted
@@ -253,8 +253,8 @@ public class UnifiedTrendDetector {
                     (HIGH_CORRELATION_THRESHOLD_NEW - CORRELATION_THRESHOLD);
 
             double blended = (traditional * corrWeight) + (leaderWeighted * (1.0 - corrWeight));
-            log.debug("BLENDED: traditional {:.4f}, leader {:.4f}, final {:.4f}",
-                    traditional, leaderWeighted, blended);
+            log.debug("BLENDED: traditional {}, leader {}, final {}",
+                    String.format("%.4f",traditional), String.format("%.4f",leaderWeighted),String.format("%.4f",blended));
             return blended;
         }
     }
@@ -274,19 +274,19 @@ public class UnifiedTrendDetector {
             Quote qqq = qqqResponse.getQuote();
             double qqqChange = getPercentChange(qqq);
 
-            log.info("DIRECT QQQ: Price change {}% (current:{}, previous:{})",
-                    qqqChange * 100, qqq.getLast(), qqq.getPreviousClose());
+//            log.info("DIRECT QQQ: Price change {}% (current:{}, previous:{})",
+//                    qqqChange * 100, qqq.getLast(), qqq.getPreviousClose());
 
             // Ultra sensitive QQQ thresholds - should catch your -0.10% move
             if (qqqChange > QQQ_DIRECT_THRESHOLD) {
-                log.info("DIRECT QQQ: UP trend ({}% > {}%)", qqqChange * 100, QQQ_DIRECT_THRESHOLD * 100);
+                //log.info("DIRECT QQQ: UP trend ({}% > {}%)", qqqChange * 100, QQQ_DIRECT_THRESHOLD * 100);
                 return "UP";
             } else if (qqqChange < -QQQ_DIRECT_THRESHOLD) {
-                log.info("DIRECT QQQ: DOWN trend ({}% < -{}%)", qqqChange * 100, QQQ_DIRECT_THRESHOLD * 100);
+                //log.info("DIRECT QQQ: DOWN trend ({}% < -{}%)", qqqChange * 100, QQQ_DIRECT_THRESHOLD * 100);
                 return "DOWN";
             }
 
-            log.debug("DIRECT QQQ: Within neutral range ({}%)", qqqChange * 100);
+            //log.debug("DIRECT QQQ: Within neutral range ({}%)", qqqChange * 100);
             return "NEUTRAL";
 
         } catch (Exception e) {
@@ -301,14 +301,14 @@ public class UnifiedTrendDetector {
      */
     private ReactiveSignals getSimpleTechSignals() {
         try {
-            log.debug("REACTIVE SIGNALS: Fetching NVDA and MSFT quotes");
+           // log.debug("REACTIVE SIGNALS: Fetching NVDA and MSFT quotes");
 
             // Get quotes with timeout handling
             Quote nvdaQuote = getQuoteWithTimeout("NVDA");
             Quote msftQuote = getQuoteWithTimeout("MSFT");
 
             if (nvdaQuote == null || msftQuote == null) {
-                log.warn("REACTIVE SIGNALS: Missing quotes - NVDA:{}, MSFT:{}", nvdaQuote != null, msftQuote != null);
+               // log.warn("REACTIVE SIGNALS: Missing quotes - NVDA:{}, MSFT:{}", nvdaQuote != null, msftQuote != null);
                 return getLastKnownTechSignals();
             }
 
@@ -325,8 +325,8 @@ public class UnifiedTrendDetector {
             // Calculate divergence
             double divergence = Math.abs(nvdaMomentum - msftMomentum);
 
-            log.debug("REACTIVE SIGNALS: NVDA:{}%, MSFT:{}%, correlation:{}, combined:{}, divergence:{}",
-                    nvdaMomentum * 100, msftMomentum * 100, correlation, combinedStrength, divergence);
+//            log.debug("REACTIVE SIGNALS: NVDA:{}%, MSFT:{}%, correlation:{}, combined:{}, divergence:{}",
+//                    nvdaMomentum * 100, msftMomentum * 100, correlation, combinedStrength, divergence);
 
             ReactiveSignals signals = new ReactiveSignals(nvdaMomentum, msftMomentum, correlation, combinedStrength, divergence);
 

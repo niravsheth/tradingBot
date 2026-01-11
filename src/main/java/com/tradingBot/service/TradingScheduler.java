@@ -1,6 +1,5 @@
 package com.tradingBot.service;
 
-import com.tradingBot.QQQTradingBotApplication;
 import com.tradingBot.entity.Trade;
 import com.tradingBot.entity.MarketData;
 import com.tradingBot.entity.Signal;
@@ -48,6 +47,9 @@ public class TradingScheduler {
     private final ZeroDTEStrategy zeroDTEStrategy;
     private final MarketTrendMonitor marketTrendMonitor; // ADD THIS
 
+    // Cache for last cumulative volume per symbol to avoid frequent DB queries
+    private static final Map<String, Long> lastCumulativeVolume = new ConcurrentHashMap<>();
+
     @Scheduled(fixedRate = 60000) // Every minute
     public void executeScheduledAnalysis() {
         String analysisId = UUID.randomUUID().toString().substring(0, 8);
@@ -59,12 +61,12 @@ public class TradingScheduler {
             // ENHANCED: Log trend with more detail from monitor
             MarketTrendMonitor.TrendState trendState = marketTrendMonitor.getCurrentTrendState("QQQ");
             if (trendState != null) {
-                log.info("[{}] Market Trend: {} (Changes today: {}, Duration: {} min)",
-                        analysisId, marketTrend, trendState.getChangeCount(),
-                        trendState.getLastChangeTime() != null ?
-                                Duration.between(trendState.getLastChangeTime(), LocalDateTime.now()).toMinutes() : 0);
+//               // log.info("[{}] Market Trend: {} (Changes today: {}, Duration: {} min)",
+//                        analysisId, marketTrend, trendState.getChangeCount(),
+//                        trendState.getLastChangeTime() != null ?
+//                                Duration.between(trendState.getLastChangeTime(), LocalDateTime.now()).toMinutes() : 0);
             } else {
-                log.info("[{}] Market Trend: {} (No trend history yet)", analysisId, marketTrend);
+                //log.info("[{}] Market Trend: {} (No trend history yet)", analysisId, marketTrend);
             }
 
             // Continue with your existing analysis
@@ -115,7 +117,7 @@ public class TradingScheduler {
     public void analyzeMarketAndGenerateSignals() {
         String requestId = UUID.randomUUID().toString().substring(0, 8);
         LocalTime now = LocalTime.now();
-        log.info("[{}] ===== MARKET ANALYSIS START - {} =====", requestId, now);
+        //log.info("[{}] ===== MARKET ANALYSIS START - {} =====", requestId, now);
 
         try {
             // Safety checks
@@ -137,28 +139,28 @@ public class TradingScheduler {
                 return;
             }
 
-            log.info("[{}] Step 6: Starting option analysis for {}", requestId, tradingSymbol);
+            //log.info("[{}] Step 6: Starting option analysis for {}", requestId, tradingSymbol);
 
             // GET MARKET TREND
             String currentTrend = getQQQTrend();
-            log.info("[{}] Current market trend: {}", requestId, currentTrend);
+            //log.info("[{}] Current market trend: {}", requestId, currentTrend);
 
             // PASS TREND TO STRATEGY
             List<Signal> signals = strategy.analyzeOptions(tradingSymbol, currentTrend);
             log.info("[{}] Analysis complete - Generated {} signals", requestId, signals.size());
 
             if (!signals.isEmpty()) {
-                log.info("[v62][{}] === GENERATED SIGNALS ===", requestId);
+                //log.info("[v62][{}] === GENERATED SIGNALS ===", requestId);
                 for (Signal signal : signals) {
                     log.info("[v62][{}] Signal: {} {} - Strategy: {}, Confidence: {}%, Target: ${}, Stop: ${}, Trend: {}",
                             requestId, signal.getSignalType(), signal.getOptionSymbol(),
                             signal.getStrategy(), (int)(signal.getConfidence() * 100),
                             signal.getTargetPrice(), signal.getStopLoss(), currentTrend);
                 }
-                log.info("[v62][{}] ========================", requestId);
+               // log.info("[v62][{}] ========================", requestId);
             }
 
-            log.info("[v62][{}] ===== MARKET ANALYSIS COMPLETE =====", requestId);
+            //log.info("[v62][{}] ===== MARKET ANALYSIS COMPLETE =====", requestId);
         } catch (Exception e) {
             log.error("[v62][{}] ERROR in market analysis: {}", requestId, e.getMessage(), e);
             telegramService.sendMessage(String.format("⚠️ Market analysis error [%s]: %s", requestId, e.getMessage()));
@@ -170,7 +172,7 @@ public class TradingScheduler {
     public void executePendingSignals() {
         String executionId = UUID.randomUUID().toString().substring(0, 8);
         LocalTime now = LocalTime.now();
-        log.info("[v62][{}] ===== SIGNAL EXECUTION START - {} =====", executionId, now);
+        //log.info("[v62][{}] ===== SIGNAL EXECUTION START - {} =====", executionId, now);
 
         if (now.isBefore(LocalTime.of(9, 0)) || now.isAfter(LocalTime.of(16, 00))) {
             log.info("[v62][{}] Outside trading hours - skipping execution", executionId);
@@ -188,11 +190,11 @@ public class TradingScheduler {
                 return;
             }
 
-            log.info("[v62][{}] Executing pending signals - SHOULD PLACE BUY_TO_OPEN ORDERS", executionId);
+            //log.info("[v62][{}] Executing pending signals - SHOULD PLACE BUY_TO_OPEN ORDERS", executionId);
             // Remove this line if it exists and is calling wrong method:
             // tradingService.executeSignals();
 
-            log.info("[v62][{}] Monitoring open positions - SHOULD PLACE SELL_TO_CLOSE ORDERS", executionId);
+            //log.info("[v62][{}] Monitoring open positions - SHOULD PLACE SELL_TO_CLOSE ORDERS", executionId);
             List<Trade> openTrades = tradeRepository.findByStatusAndSymbol("OPEN", tradingSymbol);
             if (!openTrades.isEmpty()) {
                 log.info("[v62][{}] Monitoring {} open positions", executionId, openTrades.size());
@@ -204,7 +206,7 @@ public class TradingScheduler {
                 tradingService.checkOpenPositions();
             }
 
-            log.info("[v62][{}] ===== SIGNAL EXECUTION COMPLETE =====", executionId);
+            //log.info("[v62][{}] ===== SIGNAL EXECUTION COMPLETE =====", executionId);
         } catch (Exception e) {
             log.error("[v62][{}] ERROR in signal execution: {}", executionId, e.getMessage(), e);
         }
@@ -234,14 +236,62 @@ public class TradingScheduler {
                     MarketData marketData = new MarketData();
                     marketData.setSymbol(symbol); // ✅ Now handles both
                     marketData.setPrice(quote.getLast());
-                    marketData.setBid(quote.getBid());
-                    marketData.setAsk(quote.getAsk());
-                    marketData.setBidSize(quote.getBidSize());
-                    marketData.setAskSize(quote.getAskSize());
-                    marketData.setVolume(quote.getVolume());
+                    if (quote.getLast() != null) {
+                        marketData.setClose(quote.getLast());
+                        marketData.setPrice(quote.getLast());
+                    }
+
+                    // These fields might not be available from basic quote
+                    // You may need to use different API endpoints for full OHLC
+                    if (marketData.getOpen() == null) {
+                        marketData.setOpen(quote.getLast());
+                    }
+                    if (marketData.getHigh() == null) {
+                        marketData.setHigh(quote.getLast());
+                    }
+                    if (marketData.getLow() == null) {
+                        marketData.setLow(quote.getLast());
+                    }
+
+                    // Transform cumulative volume to interval volume
+                    Long currentCumulative = quote.getVolume();
+                    Long intervalVolume = currentCumulative; // Default for first record
+
+                    if (currentCumulative != null) {
+                        Long previousCumulative = lastCumulativeVolume.get(symbol);
+
+                        if (previousCumulative != null) {
+                            intervalVolume = currentCumulative - previousCumulative;
+
+                            // Handle negative intervals (data errors or new session)
+                            if (intervalVolume < 0) {
+                                // Check if we're at start of new session (9:25-9:35 AM)
+                                if (now.isAfter(LocalTime.of(9, 25)) && now.isBefore(LocalTime.of(9, 35))) {
+                                    // New session - use cumulative as interval
+                                    intervalVolume = currentCumulative;
+                                    //log.debug("New session start for {} - using cumulative: {}", symbol, intervalVolume);
+                                } else {
+                                    // Data error - skip this update
+                                    //log.warn("Invalid volume data for {} - Previous: {}, Current: {} - skipping",
+                                            //symbol, previousCumulative, currentCumulative);
+                                    continue; // Skip to next symbol
+                                }
+                            }
+
+                            // Sanity check for very large intervals (potential data gaps)
+                            if (previousCumulative > 0 && intervalVolume > previousCumulative) {
+                                log.warn("Large interval volume for {}: {} (potential data gap)", symbol, intervalVolume);
+                            }
+                        }
+
+                        // Update cache with current cumulative for next iteration
+                        lastCumulativeVolume.put(symbol, currentCumulative);
+                    }
+
+                    marketData.setVolume(intervalVolume);
+
                     marketData.setHigh(quote.getHigh());
                     marketData.setLow(quote.getLow());
-                    marketData.setPreviousClose(quote.getPreviousClose());
                     marketData.setTimestamp(LocalDateTime.now());
                     marketDataRepository.save(marketData);
 
@@ -256,120 +306,120 @@ public class TradingScheduler {
     @Autowired
     private TradingAnalysisService analysisService;
 
-    @Scheduled(cron = "0 0 16 * * MON-FRI")
-    public void dailySummary() {
-        log.info("[v62] Generating enhanced daily summary");
-
-        LocalDateTime startOfDay = LocalDateTime.now().withHour(0).withMinute(0);
-        List<Trade> todaysTrades = tradeRepository.findClosedTradesAfter(startOfDay);
-        BigDecimal totalProfit = tradeRepository.calculateProfitSince(startOfDay);
-        if (totalProfit == null) totalProfit = BigDecimal.ZERO;
-
-        // Original stats
-        long winners = todaysTrades.stream()
-                .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) > 0)
-                .count();
-        long losers = todaysTrades.size() - winners;
-
-        BigDecimal avgWin = BigDecimal.ZERO;
-        if (winners > 0) {
-            avgWin = todaysTrades.stream()
-                    .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) > 0)
-                    .map(Trade::getProfit)
-                    .reduce(BigDecimal.ZERO, BigDecimal::add)
-                    .divide(BigDecimal.valueOf(winners), 2, BigDecimal.ROUND_HALF_UP);
-        }
-
-        BigDecimal avgLoss = BigDecimal.ZERO;
-        if (losers > 0) {
-            avgLoss = todaysTrades.stream()
-                    .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) < 0)
-                    .map(Trade::getProfit)
-                    .reduce(BigDecimal.ZERO, BigDecimal::add)
-                    .divide(BigDecimal.valueOf(losers), 2, BigDecimal.ROUND_HALF_UP);
-        }
-
-        // Build enhanced summary
-        StringBuilder summary = new StringBuilder();
-        summary.append("📊 <b>DAILY TRADING SUMMARY</b>\n");
-        summary.append("═══════════════════════\n\n");
-
-        summary.append(String.format("📈 Trades: %d | Win Rate: %.1f%%\n",
-                todaysTrades.size(), winners > 0 ? (winners * 100.0 / todaysTrades.size()) : 0));
-        summary.append(String.format("✅ Winners: %d | ❌ Losers: %d\n", winners, losers));
-        summary.append(String.format("💰 Total P&L: $%.2f\n", totalProfit));
-        summary.append(String.format("📊 Avg Win: $%.2f | Avg Loss: $%.2f\n", avgWin, avgLoss));
-
-        // Add blocked signals analysis
-        String blockedAnalysis = analysisService.analyzeBlockedSignals();
-        if (!blockedAnalysis.isEmpty()) {
-            summary.append("\n🚫 <b>BLOCKED SIGNALS ANALYSIS</b>\n");
-            summary.append("════════════════════════\n");
-            summary.append(blockedAnalysis);
-        }
-
-        // Add failed trades analysis
-        String failedAnalysis = analysisService.analyzeFailedTrades(todaysTrades);
-        if (!failedAnalysis.isEmpty()) {
-            summary.append("\n" + failedAnalysis);
-        }
-
-        // Add optimization suggestions
-        summary.append("\n🔧 <b>OPTIMIZATION SUGGESTIONS</b>\n");
-        summary.append("══════════════════════════\n");
-        summary.append(generateOptimizationSuggestions(todaysTrades));
-
-        // Bot info
-        summary.append(String.format("\n🤖 Bot Version: %s | Date: %s",
-                QQQTradingBotApplication.VERSION, LocalDate.now()));
-
-        // Send the enhanced summary
-        telegramService.sendMessage(summary.toString());
-
-        log.info("[v62] Enhanced daily summary sent");
-    }
-//    private final ZeroDTEStrategy.SignalAttributeLearning attributeLearning = new ZeroDTEStrategy.SignalAttributeLearning();
-//    @Scheduled(cron = "0 30 16 * * MON-FRI", zone = "America/New_York") // 4:30 PM ET daily
-//    public void sendAILearningSummary() {
+//    @Scheduled(cron = "0 0 16 * * MON-FRI")
+//    public void dailySummary() {
+//        log.info("[v62] Generating enhanced daily summary");
 //
-//        try {
-//            attributeLearning.sendDailySummary();
-//        } catch (Exception e) {
-//            log.error("Error sending AI learning summary: {}", e.getMessage());
+//        LocalDateTime startOfDay = LocalDateTime.now().withHour(0).withMinute(0);
+//        List<Trade> todaysTrades = tradeRepository.findClosedTradesAfter(startOfDay);
+//        BigDecimal totalProfit = tradeRepository.calculateProfitSince(startOfDay);
+//        if (totalProfit == null) totalProfit = BigDecimal.ZERO;
+//
+//        // Original stats
+//        long winners = todaysTrades.stream()
+//                .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) > 0)
+//                .count();
+//        long losers = todaysTrades.size() - winners;
+//
+//        BigDecimal avgWin = BigDecimal.ZERO;
+//        if (winners > 0) {
+//            avgWin = todaysTrades.stream()
+//                    .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) > 0)
+//                    .map(Trade::getProfit)
+//                    .reduce(BigDecimal.ZERO, BigDecimal::add)
+//                    .divide(BigDecimal.valueOf(winners), 2, BigDecimal.ROUND_HALF_UP);
 //        }
+//
+//        BigDecimal avgLoss = BigDecimal.ZERO;
+//        if (losers > 0) {
+//            avgLoss = todaysTrades.stream()
+//                    .filter(t -> t.getProfit() != null && t.getProfit().compareTo(BigDecimal.ZERO) < 0)
+//                    .map(Trade::getProfit)
+//                    .reduce(BigDecimal.ZERO, BigDecimal::add)
+//                    .divide(BigDecimal.valueOf(losers), 2, BigDecimal.ROUND_HALF_UP);
+//        }
+//
+//        // Build enhanced summary
+//        StringBuilder summary = new StringBuilder();
+//        summary.append("📊 <b>DAILY TRADING SUMMARY</b>\n");
+//        summary.append("═══════════════════════\n\n");
+//
+//        summary.append(String.format("📈 Trades: %d | Win Rate: %.1f%%\n",
+//                todaysTrades.size(), winners > 0 ? (winners * 100.0 / todaysTrades.size()) : 0));
+//        summary.append(String.format("✅ Winners: %d | ❌ Losers: %d\n", winners, losers));
+//        summary.append(String.format("💰 Total P&L: $%.2f\n", totalProfit));
+//        summary.append(String.format("📊 Avg Win: $%.2f | Avg Loss: $%.2f\n", avgWin, avgLoss));
+//
+//        // Add blocked signals analysis
+//        String blockedAnalysis = analysisService.analyzeBlockedSignals();
+//        if (!blockedAnalysis.isEmpty()) {
+//            summary.append("\n🚫 <b>BLOCKED SIGNALS ANALYSIS</b>\n");
+//            summary.append("════════════════════════\n");
+//            summary.append(blockedAnalysis);
+//        }
+//
+//        // Add failed trades analysis
+//        String failedAnalysis = analysisService.analyzeFailedTrades(todaysTrades);
+//        if (!failedAnalysis.isEmpty()) {
+//            summary.append("\n" + failedAnalysis);
+//        }
+//
+//        // Add optimization suggestions
+//        summary.append("\n🔧 <b>OPTIMIZATION SUGGESTIONS</b>\n");
+//        summary.append("══════════════════════════\n");
+//        summary.append(generateOptimizationSuggestions(todaysTrades));
+//
+//        // Bot info
+//        summary.append(String.format("\n🤖 Bot Version: %s | Date: %s",
+//                QQQTradingBotApplication.VERSION, LocalDate.now()));
+//
+//        // Send the enhanced summary
+//        telegramService.sendMessage(summary.toString());
+//
+//        log.info("[v62] Enhanced daily summary sent");
 //    }
-
-    private String generateOptimizationSuggestions(List<Trade> trades) {
-        StringBuilder suggestions = new StringBuilder();
-
-        // Analyze stop losses
-        long stoppedOut = trades.stream()
-                .filter(t -> "STOP_LOSS".equals(t.getExitReason()))
-                .count();
-
-        if (stoppedOut > trades.size() * 0.3) {
-            suggestions.append("• High stop-out rate (")
-                    .append(stoppedOut * 100 / trades.size())
-                    .append("%) - Consider wider stops\n");
-        }
-
-        // Check if we're missing morning opportunities
-        LocalTime avgEntryTime = trades.stream()
-                .map(t -> t.getEntryTime().toLocalTime())
-                .reduce(LocalTime.of(0,0), (a, b) -> a.plusSeconds(b.toSecondOfDay()))
-                .withSecond(trades.size() > 0 ? trades.size() : 1);
-
-        if (avgEntryTime.isAfter(LocalTime.of(11, 0))) {
-            suggestions.append("• Missing morning opportunities - Check breadth thresholds\n");
-        }
-
-        // Add more based on your needs
-        if (suggestions.length() == 0) {
-            suggestions.append("• No specific optimizations identified\n");
-        }
-
-        return suggestions.toString();
-    }
+////    private final ZeroDTEStrategy.SignalAttributeLearning attributeLearning = new ZeroDTEStrategy.SignalAttributeLearning();
+////    @Scheduled(cron = "0 30 16 * * MON-FRI", zone = "America/New_York") // 4:30 PM ET daily
+////    public void sendAILearningSummary() {
+////
+////        try {
+////            attributeLearning.sendDailySummary();
+////        } catch (Exception e) {
+////            log.error("Error sending AI learning summary: {}", e.getMessage());
+////        }
+////    }
+//
+//    private String generateOptimizationSuggestions(List<Trade> trades) {
+//        StringBuilder suggestions = new StringBuilder();
+//
+//        // Analyze stop losses
+//        long stoppedOut = trades.stream()
+//                .filter(t -> "STOP_LOSS".equals(t.getExitReason()))
+//                .count();
+//
+//        if (stoppedOut > trades.size() * 0.3) {
+//            suggestions.append("• High stop-out rate (")
+//                    .append(stoppedOut * 100 / trades.size())
+//                    .append("%) - Consider wider stops\n");
+//        }
+//
+//        // Check if we're missing morning opportunities
+//        LocalTime avgEntryTime = trades.stream()
+//                .map(t -> t.getEntryTime().toLocalTime())
+//                .reduce(LocalTime.of(0,0), (a, b) -> a.plusSeconds(b.toSecondOfDay()))
+//                .withSecond(trades.size() > 0 ? trades.size() : 1);
+//
+//        if (avgEntryTime.isAfter(LocalTime.of(11, 0))) {
+//            suggestions.append("• Missing morning opportunities - Check breadth thresholds\n");
+//        }
+//
+//        // Add more based on your needs
+//        if (suggestions.length() == 0) {
+//            suggestions.append("• No specific optimizations identified\n");
+//        }
+//
+//        return suggestions.toString();
+//    }
 
     @Scheduled(cron = "0 30 9 * * MON-FRI")
     public void marketOpenNotification() {
@@ -429,7 +479,7 @@ public class TradingScheduler {
     @Scheduled(cron = "*/10 * 9-16 * * MON-FRI")
     public void monitorPositions() {
         String monitorId = generateExecutionId();
-        log.info("[MONITOR][{}] Checking OPEN positions only", monitorId);
+        //log.info("[MONITOR][{}] Checking OPEN positions only", monitorId);
 
         // ONLY monitor OPEN trades - ignore FAILED, REJECTED, etc.
         List<Trade> openTrades = tradeRepository.findByStatusAndSymbol("OPEN", tradingSymbol).stream()
@@ -450,8 +500,8 @@ public class TradingScheduler {
         long failedCount = tradeRepository.countByStatus("FAILED");
         long rejectedCount = tradeRepository.countByStatus("BAYESIAN_REJECTED");
 
-        log.info("[MONITOR][{}] Database status - OPEN: {}, FAILED: {}, REJECTED: {}",
-                monitorId, openTrades.size(), failedCount, rejectedCount);
+//        log.info("[MONITOR][{}] Database status - OPEN: {}, FAILED: {}, REJECTED: {}",
+//                monitorId, openTrades.size(), failedCount, rejectedCount);
 
         if (!openTrades.isEmpty()) {
             String currentTrend = getQQQTrend();
@@ -540,7 +590,7 @@ public class TradingScheduler {
             }
 
             // DYNAMIC ADJUSTMENTS
-            updateTrailingStopInline(trade, currentPrice);
+            //updateTrailingStopInline(trade, currentPrice);
             adjustForVolatility(trade, currentPrice);
             applyPositionSpecificStrategy(trade, currentPrice, marketTrend);
 

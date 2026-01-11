@@ -3,24 +3,48 @@ spring:
     name: QQQTradingBot
 
   datasource:
-    url: jdbc:postgresql://34.162.24.223:5432/postgres?sslmode=require
-    username: postgres
-    password: keshavamLLC2025!  # Set in environment variables
-    driver-class-name: org.postgresql.Driver
+    # NEW: Hostinger MySQL Configuration
+    url: jdbc:mysql://srv943.hstgr.io:3306/u369824008_tradingBot?useSSL=true&serverTimezone=UTC&allowPublicKeyRetrieval=true&autoReconnect=true&useUnicode=true&characterEncoding=UTF-8
+    username: u369824008_tradingBot
+    password: Haresh983 # Replace with your actual password
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+    # COMMENTED: Google Cloud PostgreSQL Configuration (for future use)
+    # url: jdbc:postgresql://34.162.24.223:5432/postgres?sslmode=require
+    # username: postgres
+    # password: keshavamLLC2025!
+    # driver-class-name: org.postgresql.Driver
+
     hikari:
-      maximum-pool-size: 5        # Good for GCP small tier
-      minimum-idle: 1             # Lower idle to avoid consuming all connections
-      connection-timeout: 20000   # 20 seconds
-      idle-timeout: 60000         # 1 minute
-      max-lifetime: 180000        # 3 minutes
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 300000
+      max-lifetime: 1200000
+      connection-test-query: SELECT 1
+      validation-timeout: 5000
+      leak-detection-threshold: 60000
+      keepalive-time: 60000
       data-source-properties:
-        prepareThreshold: 0
+        cachePrepStmts: true
+        prepStmtCacheSize: 250
+        prepStmtCacheSqlLimit: 2048
+        useServerPrepStmts: true
+        useLocalSessionState: true
+        rewriteBatchedStatements: true
+        cacheResultSetMetadata: true
+        cacheServerConfiguration: true
+        elideSetAutoCommits: true
+        maintainTimeStats: false
 
   jpa:
     hibernate:
       ddl-auto: update
     show-sql: false
-    database-platform: org.hibernate.dialect.PostgreSQLDialect
+    # UPDATED: MySQL Dialect
+    database-platform: org.hibernate.dialect.MySQL8Dialect
+    # COMMENTED: PostgreSQL Dialect
+    # database-platform: org.hibernate.dialect.PostgreSQLDialect
     properties:
       hibernate:
         format_sql: true
@@ -38,6 +62,26 @@ spring:
         max-size: 20
         queue-capacity: 100
 
+  # Circuit Breaker Configuration
+  cloud:
+    circuitbreaker:
+      resilience4j:
+        enabled: true
+
+  # Actuator for health checks
+  management:
+    endpoints:
+      web:
+        exposure:
+          include: health,metrics,info,loggers
+    endpoint:
+      health:
+        show-details: always
+    metrics:
+      export:
+        simple:
+          enabled: true
+
 # API Configuration
 tradier:
   api:
@@ -46,11 +90,26 @@ tradier:
     sandbox-url: https://sandbox.tradier.com/v1
     account-id: 6YB56930
     use-sandbox: false
+    rate-limit:
+      requests-per-second: 10
+      burst-capacity: 20
+    retry:
+      max-attempts: 3
+      backoff-delay: 1000
+      backoff-multiplier: 2
+    timeout:
+      connect: 5000
+      read: 10000
 
 telegram:
   bot:
     token: 7074621534:AAEUOUplsrPrpZgG0ghx7EU5efrHFdkkRbs
     chat-id: 1368492647
+    rate-limit:
+      messages-per-minute: 30
+    retry:
+      max-attempts: 3
+      backoff-delay: 2000
 
 # Safety Configuration
 safety:
@@ -59,6 +118,10 @@ safety:
   max-daily-loss: 1000
   max-position-value: 500
   max-open-positions: 10
+  circuit-breaker:
+    failure-rate-threshold: 50
+    wait-duration-in-open-state: 60000
+    sliding-window-size: 10
 
 # Trading Configuration
 trading:
@@ -87,9 +150,9 @@ trading:
 
   # Capital allocation by confidence
   confidence-allocation:
-    high: 0.60      # 60% for confidence > 0.8
-    medium: 0.20    # 20% for confidence 0.6-0.8
-    low: 0.10       # 10% for confidence < 0.6
+    high: 0.60
+    medium: 0.20
+    low: 0.10
 
   # Execution settings
   execution:
@@ -97,6 +160,8 @@ trading:
     high-priority-threshold: 0.85
     ml-threshold: 0.65
     account-value: 100000
+    timeout-ms: 2000
+    max-retries: 2
 
   # Position monitoring
   monitoring:
@@ -108,9 +173,9 @@ trading:
   # Trailing stop configuration
   trailing-stop:
     enabled: true
-    trigger-profit: 0.30    # Start trailing after 30% profit
-    distance: 0.20          # Trail by 20% from high
-    activation: 0.05        # Alternative: start at 5% profit
+    trigger-profit: 0.30
+    distance: 0.20
+    activation: 0.05
     levels:
       - profit: 0.02
         stop: 0.98
@@ -132,8 +197,8 @@ trading:
 
   # Price movement limits
   price-movement:
-    max-option-price-change: 0.15    # 15% max
-    max-underlying-change: 0.01      # 1% max
+    max-option-price-change: 0.15
+    max-underlying-change: 0.01
 
   # Neutral market handling
   neutral-market:
@@ -151,77 +216,65 @@ trading:
 
   # Enhanced trend detection configuration
   trend-detection:
-    # Choose service: enhanced (recommended), simple, or integrated
     service-type: enhanced
 
-    # Enhanced trend service settings
     enhanced:
       enabled: true
       cache-ttl-seconds: 10
 
-      # ML configuration
       ml:
         enabled: true
-        timeout-ms: 500          # Fast timeout to prevent delays
-        weight: 0.25             # ML influence on final trend
+        timeout-ms: 500
+        weight: 0.25
         min-confidence-to-override: 0.8
 
-      # Component weights (should sum to ~1.0)
       weights:
-        momentum: 0.35      # Short-term price movement
-        volume: 0.20        # Volume analysis
-        microstructure: 0.15 # Bid/ask imbalance
-        regime: 0.15        # Market regime alignment
-        statistical: 0.15   # Z-score and Bollinger
+        momentum: 0.35
+        volume: 0.20
+        microstructure: 0.15
+        regime: 0.15
+        statistical: 0.15
 
-      # Base trend thresholds
       base-trend:
-        momentum-3min: 8     # 0.08% for 3-minute
-        momentum-5min: 15    # 0.15% for 5-minute
-        momentum-day: 25     # 0.25% for daily
+        momentum-3min: 8
+        momentum-5min: 15
+        momentum-day: 25
         up-threshold: 4.0
         down-threshold: -4.0
         strong-threshold: 8.0
 
-      # Statistical factors
       statistical:
         enabled: true
         z-score-boost-threshold: 2.5
         bollinger-period: 20
 
-      # Volume analysis
       volume:
         enabled: true
         surge-threshold: 1.5
         confirmation-boost: 2.0
 
-      # Microstructure analysis
       microstructure:
         enabled: true
         imbalance-threshold: 0.65
         confidence-boost: 1.1
 
-      # Market regime adjustments
       regime:
         enabled: true
         trending-boost: 1.15
         choppy-penalty: 0.7
         high-vol-penalty: 0.85
 
-      # Alert thresholds
       alerts:
         extreme-z-score: 3.0
         ml-confirmation: 0.8
         min-confidence: 0.75
 
-    # Performance monitoring
     performance:
       log-detailed-analysis: true
       log-interval-seconds: 60
       track-calculation-time: true
       warn-if-slower-than-ms: 100
 
-    # Fallback settings
     fallback:
       on-ml-timeout: use-base
       on-calculation-error: neutral
@@ -257,18 +310,15 @@ tradingbot:
       queue-capacity: 30
       thread-prefix: "PositionMon-"
 
-  # Trading Configuration
   trading:
     market-open: "09:30"
     market-close: "16:00"
     timezone: "America/New_York"
 
-    # Position sizing
     default-position-size: 1
     max-positions: 100
     max-position-value: 1000
 
-    # Risk Management
     risk:
       max-daily-loss: 1000
       max-position-loss: 300
@@ -285,16 +335,15 @@ tradingbot:
       max-position-risk: 1000
 
     kelly:
-      fraction: 0.25  # 1/4 Kelly
-      min-trades: 20  # Minimum history needed
+      fraction: 0.25
+      min-trades: 20
       max-position-percentage: 5
       min-contracts: 1
       max-contracts: 20
 
-    # Update existing
-    signal-expiration-minutes: 0.5  # 30 seconds
+    signal-expiration-minutes: 0.5
 
-# Logging Configuration
+# Comprehensive Logging Configuration
 logging:
   level:
     root: INFO
@@ -304,29 +353,51 @@ logging:
     com.tradingBot.ml: INFO
     com.tradingBot.analytics: INFO
     com.tradingBot.service.EnhancedTrendService: DEBUG
+    com.tradingBot.execution: DEBUG
+    com.tradingBot.risk: INFO
+    com.tradingBot.signals: DEBUG
+    com.zaxxer.hikari: WARN
+    com.zaxxer.hikari.pool.HikariPool: WARN
+
   pattern:
     console: "%d{HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
-    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n"
 
-# ML Model Configuration (for MLTrendPredictor)
+  file:
+    # Main application log with daily rotation
+    name: ./logs/tradingbot.log
+
+  logback:
+    rollingpolicy:
+      # Keep 30 days of logs
+      max-history: 30
+      # Maximum 10GB total log files
+      total-size-cap: 10GB
+      # Each file max 100MB
+      max-file-size: 100MB
+      # Archive pattern
+      file-name-pattern: ./logs/archived/tradingbot-%d{yyyy-MM-dd}.%i.log.gz
+
+# ML Model Configuration
 ml:
   models:
     lstm:
       enabled: true
       weight: 0.6
+      cache-ttl-minutes: 5
 
     hmm:
       enabled: true
       weight: 0.4
+      cache-ttl-minutes: 5
 
-  # Feature extraction
   features:
     lookback-periods: [5, 10, 20, 30]
 
-  # Prediction settings
   prediction:
     horizon-minutes: 5
     min-data-points: 10
+    confidence-threshold: 0.7
 
 # Performance Settings
 performance:
@@ -338,3 +409,84 @@ performance:
   monitoring:
     metrics-enabled: true
     slow-query-threshold-ms: 1000
+    memory-threshold-mb: 512
+    cpu-threshold-percent: 80
+
+# Backup and Recovery
+backup:
+  database:
+    enabled: true
+    schedule: "0 0 2 * * ?" # Daily at 2 AM
+    retention-days: 7
+
+  logs:
+    enabled: true
+    schedule: "0 30 1 * * ?" # Daily at 1:30 AM
+    retention-days: 30
+
+# SSL Configuration
+server:
+  ssl:
+    enabled: false # Set to true in production
+    key-store: classpath:keystore.p12
+    key-store-password: changeit
+    key-store-type: PKCS12
+    key-alias: tradingbot
+  port: 8081
+
+# External Services Configuration
+external:
+  market-data:
+    timeout-ms: 5000
+    retry-attempts: 3
+    circuit-breaker:
+      failure-threshold: 5
+      recovery-timeout: 30000
+
+  notification:
+    timeout-ms: 3000
+    retry-attempts: 2
+
+# Resilience Configuration
+resilience4j:
+  circuitbreaker:
+    instances:
+      tradier-api:
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 30000
+        sliding-window-size: 10
+        minimum-number-of-calls: 5
+
+      database:
+        failure-rate-threshold: 60
+        wait-duration-in-open-state: 60000
+        sliding-window-size: 5
+
+  retry:
+    instances:
+      api-calls:
+        max-attempts: 3
+        wait-duration: 1000
+        retry-exceptions:
+          - java.net.SocketTimeoutException
+          - java.io.IOException
+
+  timelimiter:
+    instances:
+      api-calls:
+        timeout-duration: 5000
+        cancel-running-future: true
+
+# Application Health
+health:
+  checks:
+    enabled: true
+    database: true
+    external-apis: true
+    memory: true
+    disk-space: true
+
+  thresholds:
+    memory-usage-percent: 85
+    disk-usage-percent: 90
+    response-time-ms: 1000
