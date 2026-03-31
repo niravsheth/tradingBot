@@ -61,6 +61,19 @@ public class ZeroDTEStrategy {
         put("AAPL", 0.2);
     }};
 
+    private Map<String, Double> getRegimeAdjustedLeaderWeights() {
+        if (currentRegime == SessionRegime.TRENDING_UP || currentRegime == SessionRegime.TRENDING_DOWN) {
+            // In trending: elevate AAPL (institutional conviction), balance NVDA
+            return new HashMap<String, Double>() {{
+                put("NVDA", 0.35);
+                put("MSFT", 0.30);
+                put("AAPL", 0.35);
+            }};
+        }
+        // In ranging: keep original weights (NVDA short-term correlation most relevant)
+        return LEADER_WEIGHTS;
+    }
+
     private static final LocalTime PRIME_WINDOW_1_START = LocalTime.of(9, 45);
     private static final LocalTime PRIME_WINDOW_1_END = LocalTime.of(10, 30);
     private static final LocalTime PRIME_WINDOW_2_START = LocalTime.of(10, 30);
@@ -109,6 +122,73 @@ public class ZeroDTEStrategy {
     private static final double VOLUME_SURGE_THRESHOLD = 1.2; // 1.2x average volume required
     private static final int VWAP_SLOPE_LOOKBACK = 3; // bars for VWAP slope calculation
 
+    private final CoilTrackingService coilTrackingService;
+
+    private final DailyLevelService dailyLevelService;
+
+    private volatile SessionRegime currentRegime = SessionRegime.RANGING;
+    private volatile BigDecimal sessionOpenPrice = null;
+    private volatile LocalDate sessionDate = null;
+    private volatile LocalDateTime lastVwapCrossTime = null;
+    private volatile BigDecimal lastVwapCrossPrice = null;
+    private volatile long continuousAboveVwapMinutes = 0;
+    private volatile long continuousBelowVwapMinutes = 0;
+    private volatile BigDecimal sessionHighPrice = BigDecimal.ZERO;
+    private volatile BigDecimal sessionLowPrice = new BigDecimal("9999");
+    private volatile BigDecimal rollingVwapSlope30min = BigDecimal.ZERO;
+    private volatile int higherHighCount15m = 0;
+    private volatile int lowerLowCount15m = 0;
+    private volatile int signalsGeneratedToday = 0;
+    private volatile int signalsKilledByCoilToday = 0;
+    private volatile int putSignalsToday = 0;
+    private volatile int callSignalsToday = 0;
+
+    // --- Trend-following state tracking ---
+    private volatile int consecutiveBarsBelow = 0;      // Consecutive 1-min closes below VWAP
+    private volatile int consecutiveBarsAbove = 0;      // Consecutive 1-min closes above VWAP
+    private volatile boolean vwapBreachSignalFired = false;  // Prevent duplicate breach signals per direction
+    private volatile String lastBreachDirection = null;       // "DOWN" or "UP"
+    private volatile LocalDateTime lastTrendSignalTime = null; // Debounce for trend signals
+    private volatile LocalDateTime regimeTrendingStartTime = null; // When current TRENDING regime began
+
+    private final Map<String, LocalDateTime> lastSignalByTypeAndStrike = new ConcurrentHashMap<>();
+
+    // --- Big-move catcher state ---
+    private volatile int trendContinuationCallCount = 0;
+
+    private volatile int trendContinuationPutCount = 0;
+    private volatile double averageDailyRange = 10.0;       // default $10 for QQQ
+    private volatile double regimeStartRSI = 50.0;
+
+    private volatile double peakVelocityLast10Bars = 0.0;
+    private volatile LocalDateTime lastDepartureSignalTime = null;
+
+    private volatile LocalDateTime lastCallCrossSignalTime = null;
+
+    private volatile LocalDateTime lastPutCrossSignalTime = null;
+
+    // --- V2: Exhaustion reversal structural tracking ---
+    private volatile double sessionPeakRSI = 0.0;
+    private volatile double sessionTroughRSI = 100.0;
+    private volatile BigDecimal swingLowAfterRSIPeak = null;
+    private volatile BigDecimal swingHighAfterRSITrough = null;
+    private volatile boolean rsiHasPeaked = false;
+    private volatile boolean rsiHasTroughed = false;
+
+    // Thread safety for analyzeOptions
+    private final java.util.concurrent.atomic.AtomicBoolean analysisRunning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    // Leader persistence tracking
+    private final Map<String, Integer> leaderOppositionStreaks = new ConcurrentHashMap<>();
+// key = "AAPL_PUT" or "NVDA_CALL", value = consecutive opposing cycle count
+
+    private enum SessionRegime {
+        TRENDING_UP,
+        TRENDING_DOWN,
+        TREND_EXHAUSTING,  // NEW: trend losing steam, allow counter-trend with penalty
+        RANGING
+    }
 
     // NEW: Scheduled momentum tracking updates every minute
     @Scheduled(fixedDelay = 60000) // Every 1 minute
@@ -203,586 +283,918 @@ public class ZeroDTEStrategy {
 
 
 
-    /**
-     * Complete rewritten analyzeOptions function with 6 confirmation checks
-     * This replaces your existing analyzeOptions method entirely
-     */
+    // ============================================================================
+// COMPLETE analyzeOptions() METHOD - COPY AND REPLACE ENTIRE METHOD
+// ============================================================================
+// Location: ZeroDTEStrategy.java, lines 213-820 approximately
+//
+// Changes made:
+// 1. VWAP distance threshold: 0.02 → 0.08 (Change 3)
+// 2. Bar filter REMOVED - no longer rejects based on bar color (Change 6)
+// 3. Still uses confirmationBar for momentum calculation (preserved)
+// 4. wickRejectionBonus set to 0 (no bar-based bonus)
+// ============================================================================
+
     public List<Signal> analyzeOptions(String symbol, String marketTrend) {
         String analysisId = UUID.randomUUID().toString().substring(0, 8);
         List<Signal> signals = new ArrayList<>();
 
+        // ═══ THREAD SAFETY: Only one analysis cycle at a time ═══
+        if (!analysisRunning.compareAndSet(false, true)) {
+            log.debug("[{}] Analysis already running on another thread — skipping", analysisId);
+            return signals;
+        }
+
+        try {
+            return analyzeOptionsInternal(symbol, marketTrend, analysisId, signals);
+        } finally {
+            analysisRunning.set(false);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+// CHANGE 5: REPLACE the analyzeOptionsInternal method (line 283-1070)
+// This is the CORE change — integrates all 7 improvements
+// Key changes:
+//   - Key-level and POC converted from hard gates to confidence modifiers
+//   - Momentum 0.0 == 0.0 treated as slowing
+//   - Regime gate now ALSO calls trend-following path instead of just blocking
+//   - Target caps scaled by regime
+//   - MR signals suppressed when strong trend confirmed
+//   - VWAP breach detection added
+// ═══════════════════════════════════════════════════════════════════════════
+
+    private List<Signal> analyzeOptionsInternal(String symbol, String marketTrend,
+                                                String analysisId, List<Signal> signals) {
         try {
             log.info("========================================");
-            log.info("[{}] CONFIRMATION-BASED SIGNAL ANALYSIS START", analysisId);
+            log.info("[{}] BIG-MOVE CATCHER ANALYSIS START", analysisId);
             log.info("[{}] Symbol: {}, Market Trend: {}", analysisId, symbol, marketTrend);
             log.info("========================================");
 
-            // Time validation
             LocalTime now = LocalTime.now(ET_ZONE);
             if (!isGoodTradingTime(now)) {
                 log.warn("[{}] Outside trading window, skipping analysis", analysisId);
                 return signals;
             }
 
-            // Get technical analysis for QQQ
             TechnicalAnalysis ta = technicalAnalysisService.analyze(symbol);
             if (ta == null || ta.getCurrentPrice() == null || ta.getVwap() == null) {
                 log.error("[{}] Technical analysis failed or incomplete", analysisId);
                 return signals;
             }
 
+            log.info("[{}] Current session regime: {}", analysisId, currentRegime);
+
             BigDecimal currentPrice = ta.getCurrentPrice();
             BigDecimal vwap = ta.getVwap();
+            BigDecimal distanceFromVWAP = currentPrice.subtract(vwap).abs();
+            BigDecimal atr = ta.getAverageTrueRange();
+            if (atr == null || atr.compareTo(new BigDecimal("0.50")) < 0) {
+                atr = new BigDecimal("0.50");
+            }
 
-            // ====================================================================
-            // DETERMINE SIGNAL TYPE BASED ON PRICE/VWAP RELATIONSHIP
-            // ====================================================================
+            boolean priceAboveVWAP = currentPrice.compareTo(vwap) > 0;
+            boolean priceBelowVWAP = currentPrice.compareTo(vwap) < 0;
+            double rsi = ta.getRsi();
+            boolean isPowerHour = now.isAfter(LocalTime.of(14, 45));
+
+            // ═══════════════════════════════════════════════════════════════
+            // EXTENDED-MOVE INHIBITOR
+            // ═══════════════════════════════════════════════════════════════
+            BigDecimal sessionRange = sessionHighPrice.subtract(sessionLowPrice);
+            double moveFromLOD = currentPrice.subtract(sessionLowPrice).doubleValue();
+            double moveFromHOD = sessionHighPrice.subtract(currentPrice).doubleValue();
+            double totalRangeRatio = sessionRange.doubleValue() / averageDailyRange;
+
+            // V3: Dynamic departure exhaustion gate
+            // When session has exceeded 80% ADR and regime is TRENDING, raise to 95%
+            double departThreshVal = 0.65;
+            boolean sessionExtending = totalRangeRatio > 0.80;
+            boolean trendingSession = (currentRegime == SessionRegime.TRENDING_UP
+                    || currentRegime == SessionRegime.TRENDING_DOWN);
+            if (sessionExtending && trendingSession) {
+                departThreshVal = 0.95;
+                log.info("[{}] V3 dynamic departure gate: session {}% ADR + TRENDING → threshold 95%",
+                        analysisId, String.format("%.0f", totalRangeRatio * 100));
+            }
+            boolean bullDepartExhausted = (moveFromLOD / averageDailyRange > departThreshVal)
+                    || (totalRangeRatio > 1.2);
+            boolean bearDepartExhausted = (moveFromHOD / averageDailyRange > departThreshVal)
+                    || (totalRangeRatio > 1.2);
+
+            // V3: Continuation — lowered from 80% to 70% to prevent chasing exhausted moves
+            // Feb 23: PUT continuations fired at bearDir 71-80% (most of move consumed)
+            double contThresh = isPowerHour ? 1.50 : 0.70;
+            boolean bullContExhausted = moveFromLOD / averageDailyRange > contThresh;
+            boolean bearContExhausted = moveFromHOD / averageDailyRange > contThresh;
+
+            // V3: Counter-session-trend gate for continuations
+            double bullDirCont = moveFromLOD / averageDailyRange;
+            double bearDirCont = moveFromHOD / averageDailyRange;
+            if (bullDirCont > 0.01 && bearDirCont > 0.01) {
+                if (bullDirCont / bearDirCont > 2.0) {
+                    bearContExhausted = true;
+                    log.info("[{}] V3 counter-session: blocking PUT continuation (bull {}%/bear {}%)",
+                            analysisId, String.format("%.0f", bullDirCont * 100),
+                            String.format("%.0f", bearDirCont * 100));
+                }
+                if (bearDirCont / bullDirCont > 2.0) {
+                    bullContExhausted = true;
+                    log.info("[{}] V3 counter-session: blocking CALL continuation (bear {}%/bull {}%)",
+                            analysisId, String.format("%.0f", bearDirCont * 100),
+                            String.format("%.0f", bullDirCont * 100));
+                }
+            }
+
+            int maxCont = isPowerHour ? 3 : 2;
+
+            log.info("[{}] Ext-move: range=${}, ratio={}%, bullDir={}%, bearDir={}%, powerHr={}",
+                    analysisId,
+                    sessionRange.setScale(2, RoundingMode.HALF_UP),
+                    String.format("%.0f", totalRangeRatio * 100),
+                    String.format("%.0f", moveFromLOD / averageDailyRange * 100),
+                    String.format("%.0f", moveFromHOD / averageDailyRange * 100),
+                    isPowerHour);
+
+            // Debounce: 20 min between departure/continuation signals
+            boolean debounceOk = (lastDepartureSignalTime == null ||
+                    lastDepartureSignalTime.isBefore(LocalDateTime.now(ET_ZONE).minusMinutes(20)));
+
+            if (debounceOk) {
+                List<Signal> adrSignals = checkADRExhaustionReversal(symbol, ta, atr, currentPrice, vwap,
+                        rsi, totalRangeRatio, moveFromLOD, moveFromHOD, priceBelowVWAP, priceAboveVWAP, analysisId);
+                if (!adrSignals.isEmpty()) {
+                    signals.addAll(adrSignals);
+                    lastDepartureSignalTime = LocalDateTime.now(ET_ZONE);
+                    return signals;
+                }
+            }
+
+            if (debounceOk && now.isAfter(LocalTime.of(13, 30))) {
+                List<Signal> compressionSignals = checkCompressionBreakout(symbol, ta, atr, currentPrice, vwap,
+                        rsi, priceAboveVWAP, priceBelowVWAP, analysisId);
+                if (!compressionSignals.isEmpty()) {
+                    signals.addAll(compressionSignals);
+                    lastDepartureSignalTime = LocalDateTime.now(ET_ZONE);
+                    return signals;
+                }
+            }
+
+            // Helper: check sustained momentum (2 consecutive bars same direction)
+            boolean momentumSustained = false;
+            boolean momentumReversing = false;
+            double vel0 = 0, vel1 = 0;
+            {
+                List<MarketData> momBars = barAggregationService.getRecentBars(symbol, 5);
+                if (momBars != null && momBars.size() >= 3) {
+                    int li = momBars.size() - 1;
+                    MarketData b0 = momBars.get(li), b1 = momBars.get(li - 1), b2 = momBars.get(li - 2);
+                    if (b0.getClose() != null && b1.getClose() != null && b2.getClose() != null) {
+                        vel0 = b0.getClose().subtract(b1.getClose()).doubleValue();
+                        vel1 = b1.getClose().subtract(b2.getClose()).doubleValue();
+                        momentumSustained = (vel0 > 0 && vel1 > 0) || (vel0 < 0 && vel1 < 0);
+                        // Reversing = 2 bars opposite to the VWAP side
+                        if (priceAboveVWAP) momentumReversing = (vel0 < 0 && vel1 < 0);
+                        if (priceBelowVWAP) momentumReversing = (vel0 > 0 && vel1 > 0);
+                    }
+                }
+            }
+
+            {
+                // Per-direction debounce: 15 minutes between same-direction signals
+                boolean callDebounceOk = (lastCallCrossSignalTime == null ||
+                        lastCallCrossSignalTime.isBefore(LocalDateTime.now(ET_ZONE).minusMinutes(15)));
+                boolean putDebounceOk = (lastPutCrossSignalTime == null ||
+                        lastPutCrossSignalTime.isBefore(LocalDateTime.now(ET_ZONE).minusMinutes(15)));
+
+                if (callDebounceOk || putDebounceOk) {
+                    List<Signal> crossSignals = checkVWAPCrossSignal(symbol, ta, atr,
+                            currentPrice, vwap, rsi, callDebounceOk, putDebounceOk, analysisId);
+                    if (!crossSignals.isEmpty()) {
+                        signals.addAll(crossSignals);
+
+                        String crossDir = crossSignals.get(0).getSignalType();
+                        if ("CALL".equals(crossDir)) {
+                            lastCallCrossSignalTime = LocalDateTime.now(ET_ZONE);
+                        } else {
+                            lastPutCrossSignalTime = LocalDateTime.now(ET_ZONE);
+                        }
+                        lastDepartureSignalTime = LocalDateTime.now(ET_ZONE);
+                        return signals;
+                    }
+                }
+            }
+
+
+
+            // ═══════════════════════════════════════════════════════════════
+            // PATH A5: EXHAUSTION REVERSAL — V2: RSI-peaked + structural swing
+            // ═══════════════════════════════════════════════════════════════
+            BigDecimal exhaustThreshold = atr.multiply(new BigDecimal("1.50"));
+
+            if (debounceOk && distanceFromVWAP.compareTo(exhaustThreshold) > 0) {
+
+                // PUT on exhausted rally
+                if (priceAboveVWAP && continuousAboveVwapMinutes >= 25
+                        && rsi > 72 && momentumReversing) {
+
+                    // V3: Textbook exhaustion gates — require ALL three for genuine structural exhaustion
+                    double bullDirPct = moveFromLOD / averageDailyRange;
+                    double volRatioExhaust = ta.getVolumeRatio();
+                    boolean dirExhausted = bullDirPct >= 0.75;
+                    boolean rsiExtreme = rsi > 80;
+                    boolean volumeDriedUp = volRatioExhaust < 0.30;
+
+                    if (!dirExhausted) {
+                        log.info("[EXHAUST-REV][{}] ⛔ PUT exhaust blocked — bullDir {}% < 75% (not truly exhausted)",
+                                analysisId, String.format("%.0f", bullDirPct * 100));
+                    } else if (!rsiExtreme) {
+                        log.info("[EXHAUST-REV][{}] ⛔ PUT exhaust blocked — RSI {} < 80 (not extreme enough)",
+                                analysisId, String.format("%.1f", rsi));
+                    } else if (!volumeDriedUp) {
+                        log.info("[EXHAUST-REV][{}] ⛔ PUT exhaust blocked — volume {}x > 0.30 (fuel remains)",
+                                analysisId, String.format("%.2f", volRatioExhaust));
+                    }
+
+                    if (!dirExhausted || !rsiExtreme || !volumeDriedUp) {
+                        // Log but skip — not a textbook exhaustion
+                        log.info("[EXHAUST-REV][{}] PUT exhaust conditions partial: dirExh={}, rsiExt={}, volDry={}",
+                                analysisId, dirExhausted, rsiExtreme, volumeDriedUp);
+                    } else {
+
+                        // V2: RSI must have peaked (declined 10+ from session peak)
+                        boolean rsiPeakConfirmed = rsiHasPeaked && (sessionPeakRSI - rsi >= 10.0);
+
+                        // V2: Structural — price broke below swing low formed after RSI peak
+                        boolean structConfirmed = swingLowAfterRSIPeak != null
+                                && currentPrice.compareTo(swingLowAfterRSIPeak) <= 0;
+
+                        if (rsiPeakConfirmed && structConfirmed) {
+                            int lp = checkLeadersForDirection(symbol, "PUT");
+                            if (lp >= 2) {
+                                log.info("[EXHAUST-REV][{}] ⚡ PUT EXHAUSTION (V2) — peakRSI={}, now={}, swingLow=${}",
+                                        analysisId, String.format("%.1f", sessionPeakRSI),
+                                        String.format("%.1f", rsi), swingLowAfterRSIPeak);
+
+                                BigDecimal target = vwap;
+                                BigDecimal stop = sessionHighPrice.add(atr.multiply(new BigDecimal("0.3")));
+
+                                signals = buildAndRouteSignal(symbol, "PUT", currentPrice, target, stop,
+                                        lp, ta, "EXHAUSTION_REVERSAL_DOWN", analysisId);
+                                if (!signals.isEmpty()) {
+                                    lastDepartureSignalTime = LocalDateTime.now(ET_ZONE);
+                                }
+                                return signals;
+                            }
+                        } else {
+                            log.info("[EXHAUST-REV][{}] PUT exhaust raw conditions met, V2 NOT confirmed: " +
+                                            "peaked={}, peakRSI={}, swingLow={}, struct={}",
+                                    analysisId, rsiHasPeaked, String.format("%.1f", sessionPeakRSI),
+                                    swingLowAfterRSIPeak, structConfirmed);
+                        }
+                    } // closes the V3 dirExhausted/rsiExtreme/volumeDriedUp else block
+                }
+
+                if (priceBelowVWAP && rsi < 40) {
+
+                    double velocityCollapseRatio = momentumTracker.getVelocityCollapseRatio(symbol, 8);
+                    double peakVelocity = momentumTracker.getPeakVelocity(symbol, 8);
+
+                    // ═══ INTRADAY CAPITULATION: Independent gates (not exhaustion score) ═══
+                    // Capitulation is a sharp V-bottom — different from gradual exhaustion.
+                    // DecliningRange is irrelevant (cap bar is typically the widest bar).
+                    // Instead: velocity collapse + trough RSI extreme + volume spike on cap bar + stabilization.
+
+                    // Gate 1: Velocity collapse > 3.0x (mandatory — this IS the capitulation signature)
+                    boolean velCollapsePass = velocityCollapseRatio > 3.0;
+
+                    // Gate 2: Session trough RSI < 25 (must have hit extreme, not just "oversold")
+                    // Current RSI may have recovered (that's the divergence), but the trough must be deep
+                    boolean troughRsiPass = sessionTroughRSI < 25.0;
+
+                    // Gate 3: Capitulation bar volume spike — cap bar should have higher incremental
+                    // volume than the average of the 2-3 bars after it (selling climax then volume dries up)
+                    boolean capVolumePass = false;
+                    String capVolReason = "no data";
+                    try {
+                        List<MarketData> capBars = barAggregationService.getRecentBars(symbol, 8);
+                        if (capBars != null && capBars.size() >= 5) {
+                            // Find the bar with the lowest low (the capitulation bar)
+                            int capBarIdx = 0;
+                            BigDecimal lowestLow = null;
+                            for (int ci = 0; ci < capBars.size(); ci++) {
+                                if (capBars.get(ci).getLow() != null) {
+                                    if (lowestLow == null || capBars.get(ci).getLow().compareTo(lowestLow) < 0) {
+                                        lowestLow = capBars.get(ci).getLow();
+                                        capBarIdx = ci;
+                                    }
+                                }
+                            }
+
+                            // Get incremental volume of cap bar vs average of 2-3 bars after it
+                            Long capBarIncVol = capBars.get(capBarIdx).getIncrementalVolume();
+                            if (capBarIncVol == null || capBarIncVol <= 0) {
+                                capBarIncVol = capBars.get(capBarIdx).getVolume(); // fallback
+                            }
+
+                            int afterCount = 0;
+                            long afterVolSum = 0;
+                            for (int ai = capBarIdx + 1; ai < Math.min(capBarIdx + 4, capBars.size()); ai++) {
+                                Long incVol = capBars.get(ai).getIncrementalVolume();
+                                if (incVol != null && incVol > 0) {
+                                    afterVolSum += incVol;
+                                    afterCount++;
+                                }
+                            }
+
+                            if (afterCount > 0 && capBarIncVol != null && capBarIncVol > 0) {
+                                double avgAfterVol = (double) afterVolSum / afterCount;
+                                capVolumePass = capBarIncVol > avgAfterVol;
+                                capVolReason = String.format("capVol=%d vs avgAfter=%.0f → %s",
+                                        capBarIncVol, avgAfterVol, capVolumePass ? "SPIKE" : "no spike");
+                            } else {
+                                // If we can't determine volume, use TA volumeRatio as fallback
+                                // Low volume ratio after cap = volume dried up = pass
+                                double volRatio = (ta != null) ? ta.getVolumeRatio() : 1.0;
+                                capVolumePass = volRatio < 0.60;
+                                capVolReason = String.format("fallback: volRatio=%.2fx %s 0.60",
+                                        volRatio, capVolumePass ? "<" : ">=");
+                            }
+                        }
+                    } catch (Exception e) {
+                        log.debug("[INTRADAY-CAP][{}] Volume check error: {}", analysisId, e.getMessage());
+                        capVolumePass = false;
+                        capVolReason = "error: " + e.getMessage();
+                    }
+
+                    log.info("[INTRADAY-CAP][{}] Checking: RSI={}, troughRSI={}, velCollapse={}x, peakVel={}%, capVol={} " +
+                                    "| Gates: velCollapse={}, troughRSI={}, capVolume={}",
+                            analysisId, String.format("%.1f", rsi),
+                            String.format("%.1f", sessionTroughRSI),
+                            String.format("%.1f", velocityCollapseRatio),
+                            String.format("%.4f", peakVelocity * 100),
+                            capVolReason,
+                            velCollapsePass ? "✓" : "✗",
+                            troughRsiPass ? "✓" : "✗",
+                            capVolumePass ? "✓" : "✗");
+
+                    // All 3 independent gates must pass
+                    if (velCollapsePass && troughRsiPass && capVolumePass) {
+                        int lc = checkLeadersForDirection(symbol, "CALL");
+
+                        // Minimum 1/3 leaders (was 2/3 in session exhaustion path)
+                        if (lc >= 1) {
+
+                            // Confirm price has stabilized: at least 2 bars above the recent low
+                            List<MarketData> capBars = barAggregationService.getRecentBars(symbol, 5);
+                            boolean stabilized = false;
+                            if (capBars != null && capBars.size() >= 3) {
+                                BigDecimal recentLow = getRecentLow(capBars, capBars.size());
+                                int barsAboveLow = 0;
+                                for (int bi = capBars.size() - 1; bi >= Math.max(0, capBars.size() - 3); bi--) {
+                                    if (capBars.get(bi).getClose() != null && recentLow != null &&
+                                            capBars.get(bi).getClose().compareTo(recentLow.add(new BigDecimal("0.10"))) > 0) {
+                                        barsAboveLow++;
+                                    }
+                                }
+                                stabilized = barsAboveLow >= 2;
+                            }
+
+                            if (stabilized) {
+                                log.info("═══════════════════════════════════════════════════════════════");
+//                                log.info("[INTRADAY-CAP][{}] ⚡ CALL INTRADAY CAPITULATION — RSI={}, velCollapse={}x, exh={}/4, leaders={}/3",
+//                                        analysisId, String.format("%.1f", rsi), String.format("%.1f", velocityCollapseRatio),
+//                                        exhaustionScore, lc);
+                                log.info("[INTRADAY-CAP][{}] Price=${}, VWAP=${}, peakVel={}%",
+                                        analysisId, currentPrice, vwap, String.format("%.4f", peakVelocity * 100));
+                                log.info("═══════════════════════════════════════════════════════════════");
+
+                                BigDecimal target = vwap; // mean reversion to VWAP
+                                BigDecimal recentLow = getRecentLow(
+                                        barAggregationService.getRecentBars(symbol, 8), 8);
+                                BigDecimal stop = recentLow != null
+                                        ? recentLow.subtract(new BigDecimal("0.50"))
+                                        : sessionLowPrice.subtract(atr.multiply(new BigDecimal("0.3")));
+
+                                // Check VWAP slope — don't call capitulation if VWAP is steeply
+                                // sloping in the sell direction (the selling IS the trend)
+                                double capSlopeVal = rollingVwapSlope30min.doubleValue();
+                                if (capSlopeVal < -0.50) {
+                                    log.info("[INTRADAY-CAP][{}] SUPPRESSED — VWAP slope ${}/30m " +
+                                                    "strongly bearish. Selling is the trend, not a capitulation",
+                                            analysisId, String.format("%.2f", capSlopeVal));
+                                    // Don't generate the signal — let it continue to the next path
+                                    // (fall through instead of returning)
+                                    return signals;
+                                }
+
+                                signals = buildAndRouteSignal(symbol, "CALL", currentPrice, target, stop,
+                                        lc, ta, "INTRADAY_CAPITULATION_UP", analysisId);
+                                if (!signals.isEmpty()) {
+                                    lastDepartureSignalTime = LocalDateTime.now(ET_ZONE);
+                                }
+                                return signals;
+                            } else {
+                                log.info("[INTRADAY-CAP][{}] Price not stabilized — waiting for 2+ bars above low",
+                                        analysisId);
+                            }
+                        } else {
+                            log.info("[INTRADAY-CAP][{}] Only {}/3 leaders — need minimum 1", analysisId, lc);
+                        }
+                    } else {
+                        if (velocityCollapseRatio <= 3.0) {
+                            log.debug("[INTRADAY-CAP][{}] Velocity collapse {}x < 3.0 threshold",
+                                    analysisId, String.format("%.1f", velocityCollapseRatio));
+                        }
+                    }
+                }
+
+                // CALL on exhausted selloff
+                if (priceBelowVWAP && continuousBelowVwapMinutes >= 25
+                        && rsi < 28 && momentumReversing) {
+
+                    // V3: Textbook exhaustion gates — require ALL three for genuine structural exhaustion
+                    double bearDirPct = moveFromHOD / averageDailyRange;
+                    double volRatioExhaustCall = ta.getVolumeRatio();
+                    boolean dirExhaustedCall = bearDirPct >= 0.75;
+                    boolean rsiExtremeCall = rsi < 25;
+                    boolean volumeDriedUpCall = volRatioExhaustCall < 0.30;
+
+                    if (!dirExhaustedCall) {
+                        log.info("[EXHAUST-REV][{}] ⛔ CALL exhaust blocked — bearDir {}% < 75% (not truly exhausted)",
+                                analysisId, String.format("%.0f", bearDirPct * 100));
+                    } else if (!rsiExtremeCall) {
+                        log.info("[EXHAUST-REV][{}] ⛔ CALL exhaust blocked — RSI {} > 25 (not extreme enough)",
+                                analysisId, String.format("%.1f", rsi));
+                    } else if (!volumeDriedUpCall) {
+                        log.info("[EXHAUST-REV][{}] ⛔ CALL exhaust blocked — volume {}x > 0.30 (fuel remains)",
+                                analysisId, String.format("%.2f", volRatioExhaustCall));
+                    }
+
+                    if (dirExhaustedCall && rsiExtremeCall && volumeDriedUpCall) {
+
+                        // V2: RSI must have troughed (risen 10+ from session trough)
+                        boolean rsiTroughConfirmed = rsiHasTroughed && (rsi - sessionTroughRSI >= 10.0);
+
+                        // V2: Structural — price broke above swing high formed after RSI trough
+                        boolean structConfirmed = swingHighAfterRSITrough != null
+                                && currentPrice.compareTo(swingHighAfterRSITrough) >= 0;
+
+                        if (rsiTroughConfirmed && structConfirmed) {
+                            int lc = checkLeadersForDirection(symbol, "CALL");
+                            if (lc >= 2) {
+                                log.info("[EXHAUST-REV][{}] ⚡ CALL EXHAUSTION (V2+V3) — troughRSI={}, now={}, swingHigh=${}",
+                                        analysisId, String.format("%.1f", sessionTroughRSI),
+                                        String.format("%.1f", rsi), swingHighAfterRSITrough);
+
+                                BigDecimal target = vwap;
+                                BigDecimal stop = sessionLowPrice.subtract(atr.multiply(new BigDecimal("0.3")));
+
+                                signals = buildAndRouteSignal(symbol, "CALL", currentPrice, target, stop,
+                                        lc, ta, "EXHAUSTION_REVERSAL_UP", analysisId);
+                                if (!signals.isEmpty()) {
+                                    lastDepartureSignalTime = LocalDateTime.now(ET_ZONE);
+                                }
+                                return signals;
+                            }
+                        } else {
+                            log.info("[EXHAUST-REV][{}] CALL exhaust V3 gates passed but V2 NOT confirmed: " +
+                                            "troughed={}, troughRSI={}, swingHigh={}, struct={}",
+                                    analysisId, rsiHasTroughed, String.format("%.1f", sessionTroughRSI),
+                                    swingHighAfterRSITrough, structConfirmed);
+                        }
+                    } else {
+                        log.info("[EXHAUST-REV][{}] CALL exhaust conditions partial: dirExh={}, rsiExt={}, volDry={}",
+                                analysisId, dirExhaustedCall, rsiExtremeCall, volumeDriedUpCall);
+                    }
+                }
+            }
+
+
+            // ═══════════════════════════════════════════════════════════════
+            // REGIME BLOCKS FOR MEAN REVERSION (relaxed for TREND_EXHAUSTING)
+            // ═══════════════════════════════════════════════════════════════
+            if (currentRegime == SessionRegime.TRENDING_UP && priceAboveVWAP) {
+                log.info("[{}] ⛔ REGIME BLOCK: TRENDING_UP — PUT MR suppressed. Above VWAP {} cycles",
+                        analysisId, continuousAboveVwapMinutes);
+                return signals;
+            }
+            if (currentRegime == SessionRegime.TRENDING_DOWN && priceBelowVWAP) {
+                log.info("[{}] ⛔ REGIME BLOCK: TRENDING_DOWN — CALL MR suppressed. Below VWAP {} cycles",
+                        analysisId, continuousBelowVwapMinutes);
+                return signals;
+            }
+            // TREND_EXHAUSTING: allow MR with confidence penalty (handled below)
+
+            // ═══════════════════════════════════════════════════════════════
+            // PATH B: MEAN-REVERSION SIGNALS (existing logic, with soft gates)
+            // ═══════════════════════════════════════════════════════════════
+
             String signalType = null;
-            if (currentPrice.compareTo(vwap) < 0) {
-                signalType = "CALL"; // Price below VWAP, look for bounce
-            } else if (currentPrice.compareTo(vwap) > 0) {
-                signalType = "PUT"; // Price above VWAP, look for rejection
+            if (priceBelowVWAP) {
+                signalType = "CALL";
+            } else if (priceAboveVWAP) {
+                signalType = "PUT";
             } else {
                 log.info("[MR-SIGNAL][{}] Price exactly at VWAP, no signal", analysisId);
                 return signals;
             }
 
-            // Calculate distance from VWAP
-            double distanceFromVWAP = Math.abs(currentPrice.subtract(vwap)
-                    .divide(vwap, 4, RoundingMode.HALF_UP)
-                    .doubleValue() * 100);
-
-            log.info("[MR-SIGNAL][{}] Price: ${}, VWAP: ${}, Distance: {}%",
-                    analysisId, currentPrice, vwap, String.format("%.4f", distanceFromVWAP));
-
-            // Check if distance is significant enough
-            if (distanceFromVWAP < 0.02) {
-                log.info("[MR-SIGNAL][{}] ❌ REJECTED - Distance too small: {}%", analysisId, String.format("%.4f", distanceFromVWAP));
+            // Debounce
+            String dedupeKey = signalType + "_" + symbol;
+            LocalDateTime lastGenerated = lastSignalByTypeAndStrike.get(dedupeKey);
+            if (lastGenerated != null && lastGenerated.isAfter(LocalDateTime.now(ET_ZONE).minusSeconds(60))) {
+                log.debug("[{}] Debounce: {} signal generated recently — skipping", analysisId, signalType);
                 return signals;
             }
 
-            log.info("[MR-SIGNAL][{}] {} opportunity - Price {} VWAP by {}%",
-                    analysisId, signalType, signalType.equals("CALL") ? "below" : "above", String.format("%.4f", distanceFromVWAP));
+            // VWAP distance gate (unchanged)
+            if (distanceFromVWAP.compareTo(new BigDecimal("0.50")) < 0) {
+                log.info("[MR-SIGNAL][{}] ❌ SKIP - VWAP distance ${} < $0.50 threshold",
+                        analysisId, distanceFromVWAP.setScale(2, RoundingMode.HALF_UP));
+                return signals;
+            }
 
-            // ====================================================================
-            // CONFIRMATION 1: Price-VWAP Position (already verified above)
-            // ====================================================================
-            boolean confirmation1 = true;
+            log.info("[MR-SIGNAL][{}] ✓ VWAP distance ${} >= $0.50", analysisId,
+                    distanceFromVWAP.setScale(2, RoundingMode.HALF_UP));
+            log.info("[MR-SIGNAL][{}] {} opportunity - Price {} VWAP by {}%", analysisId, signalType,
+                    signalType.equals("CALL") ? "below" : "above",
+                    String.format("%.4f", distanceFromVWAP));
 
-            // ====================================================================
-            // CONFIRMATION 2: VWAP Interaction (touched within last 10 bars)
-            // ====================================================================
-            boolean confirmation2 = false;
-            if (distanceFromVWAP > 0.10) {
-                confirmation2 = true;
-                log.info("[VWAP-INTERACTION][{}] ✓ Distance {}% sufficient, VWAP touch not required",
-                        analysisId, String.format("%.4f", distanceFromVWAP));
-            } else {
-                // For smaller distances, require recent VWAP touch
-                LocalDateTime vwapTouchTime = findRecentVWAPTouch(symbol, 10);
-                if (vwapTouchTime != null) {
-                    confirmation2 = true;
-                    log.info("[VWAP-INTERACTION][{}] ✓ Found VWAP touch at {}", analysisId, vwapTouchTime);
-                } else {
-                    log.info("[VWAP-INTERACTION][{}] ✗ No VWAP touch in last 10 bars (distance: {}%)",
-                            analysisId, String.format("%.4f", distanceFromVWAP));
+            // ═══ POC: SOFT GATE ═══
+            double pocConfidenceAdj = 0.0;
+            BigDecimal poc = targetCalculationService.getPOC(symbol, analysisId);
+            if (poc != null) {
+                BigDecimal pocDistanceDollars = currentPrice.subtract(poc).abs();
+                if (pocDistanceDollars.compareTo(new BigDecimal("0.50")) < 0) {
+                    pocConfidenceAdj = -0.10;
+                    log.info("[MR-SIGNAL][{}] ⚠ POC distance ${} < $0.50 — confidence -10%",
+                            analysisId, pocDistanceDollars.setScale(2, RoundingMode.HALF_UP));
                 }
             }
 
-            if (!confirmation2) {
-                log.info("[{}] No valid confirmation signal generated", analysisId);
-                log.info("[{}] Rejection reasons:", analysisId);
-                log.info("[{}]   ✗ [VWAP-INTERACTION] Distance too small ({}%) and no recent VWAP touch",
-                        analysisId, String.format("%.4f", distanceFromVWAP));
-                return signals;
+            // ═══ KEY LEVEL: SOFT GATE ═══
+            double keyLevelConfidenceAdj = 0.0;
+            DailyLevelService.DailyLevels levels = dailyLevelService.getQQQDailyLevels();
+            BigDecimal levelProximityThreshold = atr.multiply(new BigDecimal("0.3"));
+            boolean nearKeyLevel = false;
+            String nearestLevel = "NONE";
+            BigDecimal nearestLevelPrice = null;
+            BigDecimal nearestLevelDistance = new BigDecimal("999");
+
+            if (levels != null) {
+                if (signalType.equals("CALL")) {
+                    if (levels.getTodayLow() != null) {
+                        BigDecimal dist = currentPrice.subtract(levels.getTodayLow()).abs();
+                        if (dist.compareTo(nearestLevelDistance) < 0) {
+                            nearestLevelDistance = dist; nearestLevelPrice = levels.getTodayLow(); nearestLevel = "LOD";
+                        }
+                    }
+                    if (poc != null && poc.compareTo(currentPrice) < 0) {
+                        BigDecimal dist = currentPrice.subtract(poc).abs();
+                        if (dist.compareTo(nearestLevelDistance) < 0) {
+                            nearestLevelDistance = dist; nearestLevelPrice = poc; nearestLevel = "POC";
+                        }
+                    }
+                    if (levels.getPreviousDayLow() != null) {
+                        BigDecimal dist = currentPrice.subtract(levels.getPreviousDayLow()).abs();
+                        if (dist.compareTo(nearestLevelDistance) < 0) {
+                            nearestLevelDistance = dist; nearestLevelPrice = levels.getPreviousDayLow(); nearestLevel = "PREV_DAY_LOW";
+                        }
+                    }
+                } else {
+                    if (levels.getTodayHigh() != null) {
+                        BigDecimal dist = levels.getTodayHigh().subtract(currentPrice).abs();
+                        if (dist.compareTo(nearestLevelDistance) < 0) {
+                            nearestLevelDistance = dist; nearestLevelPrice = levels.getTodayHigh(); nearestLevel = "HOD";
+                        }
+                    }
+                    if (poc != null && poc.compareTo(currentPrice) > 0) {
+                        BigDecimal dist = poc.subtract(currentPrice).abs();
+                        if (dist.compareTo(nearestLevelDistance) < 0) {
+                            nearestLevelDistance = dist; nearestLevelPrice = poc; nearestLevel = "POC";
+                        }
+                    }
+                    if (levels.getPreviousDayHigh() != null) {
+                        BigDecimal dist = levels.getPreviousDayHigh().subtract(currentPrice).abs();
+                        if (dist.compareTo(nearestLevelDistance) < 0) {
+                            nearestLevelDistance = dist; nearestLevelPrice = levels.getPreviousDayHigh(); nearestLevel = "PREV_DAY_HIGH";
+                        }
+                    }
+                }
+
+                nearKeyLevel = nearestLevelDistance.compareTo(levelProximityThreshold) <= 0;
+                log.info("[MR-SIGNAL][{}] Key Level: {} at ${}, Distance=${}, Near={}",
+                        analysisId, nearestLevel,
+                        nearestLevelPrice != null ? nearestLevelPrice.setScale(2, RoundingMode.HALF_UP) : "N/A",
+                        nearestLevelDistance.setScale(2, RoundingMode.HALF_UP), nearKeyLevel);
             }
 
-            // ====================================================================
-            // CONFIRMATION 3: Momentum Slowing
-            // ====================================================================
-            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 5);
+            if (nearKeyLevel) {
+                keyLevelConfidenceAdj = 0.10;
+            } else {
+                keyLevelConfidenceAdj = -0.10;
+                log.info("[MR-SIGNAL][{}] ⚠ Not near key level — confidence -10%", analysisId);
+            }
+
+            // ═══ CONFIRMATION 1: VWAP Distance meaningful ═══
+            boolean confirmation1 = true;
+            if (sessionRange.compareTo(new BigDecimal("1.00")) > 0) {
+                BigDecimal minMeaningfulDistance = sessionRange.multiply(new BigDecimal("0.05"));
+                confirmation1 = distanceFromVWAP.compareTo(minMeaningfulDistance) >= 0;
+                if (!confirmation1) {
+                    log.info("[MR-SIGNAL][{}] ✗ VWAP distance below 5% of session range", analysisId);
+                    return signals;
+                }
+            }
+
+            // ═══ CONFIRMATION 2: VWAP Interaction ═══
+            boolean confirmation2 = false;
+            if (distanceFromVWAP.compareTo(new BigDecimal("1.00")) > 0) {
+                LocalDateTime vwapTouchTime = findRecentVWAPTouch(symbol, 15);
+                if (vwapTouchTime != null) {
+                    confirmation2 = true;
+                } else {
+                    log.info("[MR-SIGNAL][{}] ✗ Large distance but no recent VWAP touch", analysisId);
+                    return signals;
+                }
+            } else {
+                confirmation2 = true;
+            }
+
+            // ═══ CONFIRMATION 3: Momentum Slowing (MR requires deceleration) ═══
+            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 10);
             boolean confirmation3 = false;
+            double wickRejectionBonus = 0.0;
 
-            if (recentBars.size() >= 3) {
-                // Calculate velocity (rate of price change)
-                MarketData currentBar = recentBars.get(recentBars.size() - 1);
+            MarketData confirmationBar = null;
+            if (recentBars != null && recentBars.size() >= 2) {
+                MarketData latestBar = recentBars.get(recentBars.size() - 1);
                 MarketData previousBar = recentBars.get(recentBars.size() - 2);
-                MarketData olderBar = recentBars.get(recentBars.size() - 3);
+                LocalDateTime barEndTime = latestBar.getTimestamp().plusMinutes(1);
+                boolean isBarClosed = LocalDateTime.now(ET_ZONE).isAfter(barEndTime);
+                confirmationBar = isBarClosed ? latestBar : previousBar;
+            }
 
-                if (currentBar.getClose() != null && previousBar.getClose() != null && olderBar.getClose() != null) {
-                    double currentVelocity = Math.abs(currentBar.getClose().subtract(previousBar.getClose())
-                            .divide(previousBar.getClose(), 4, RoundingMode.HALF_UP).doubleValue() * 100);
-                    double previousVelocity = Math.abs(previousBar.getClose().subtract(olderBar.getClose())
-                            .divide(olderBar.getClose(), 4, RoundingMode.HALF_UP).doubleValue() * 100);
+            if (recentBars != null && recentBars.size() >= 3 && confirmationBar != null) {
+                int currentIndex = recentBars.indexOf(confirmationBar);
+                if (currentIndex >= 2) {
+                    MarketData currentBar = confirmationBar;
+                    MarketData prevBar = recentBars.get(currentIndex - 1);
+                    MarketData olderBar = recentBars.get(currentIndex - 2);
 
-                    confirmation3 = currentVelocity < previousVelocity;
+                    if (currentBar.getClose() != null && prevBar.getClose() != null && olderBar.getClose() != null) {
+                        double currentVelocity = Math.abs(currentBar.getClose().subtract(prevBar.getClose())
+                                .divide(prevBar.getClose(), 4, RoundingMode.HALF_UP).doubleValue() * 100);
+                        double previousVelocity = Math.abs(prevBar.getClose().subtract(olderBar.getClose())
+                                .divide(olderBar.getClose(), 4, RoundingMode.HALF_UP).doubleValue() * 100);
 
-                    log.info("[MOMENTUM][{}] Current velocity: {}%, Previous: {}%, Slowing: {}",
-                            analysisId, String.format("%.4f", currentVelocity),
-                            String.format("%.4f", previousVelocity), confirmation3);
+                        confirmation3 = currentVelocity < previousVelocity ||
+                                (currentVelocity == previousVelocity && currentVelocity < 0.02);
+
+                        log.info("[MOMENTUM][{}] Current velocity: {}%, Previous: {}%, Slowing: {}",
+                                analysisId, String.format("%.4f", currentVelocity),
+                                String.format("%.4f", previousVelocity), confirmation3);
+                    }
                 }
             }
 
             if (!confirmation3) {
-                log.info("[{}] No valid confirmation signal generated", analysisId);
-                log.info("[{}] Rejection reasons:", analysisId);
-                log.info("[{}]   ✗ [MOMENTUM-SLOW] Momentum not slowing", analysisId);
+                log.info("[{}] Rejection: ✗ [MOMENTUM-SLOW] Momentum not slowing", analysisId);
                 return signals;
             }
 
-            // ====================================================================
-            // CONFIRMATION 4: Leaders Confirming (at least 2 of 3)
-            // ====================================================================
+            // ═══ CONFIRMATION 3b: Volume Exhaustion ═══
+            boolean volumeExhaustion = false;
+            try {
+                boolean hasExhaust = volumeTracker.hasExhaustionPattern("QQQ");
+                double volRatio = ta.getVolumeRatio();
+                volumeExhaustion = hasExhaust || volRatio < 0.8;
+
+                if (!volumeExhaustion && currentRegime != SessionRegime.RANGING
+                        && currentRegime != SessionRegime.TREND_EXHAUSTING) {
+                    log.info("[{}] ✗ Volume not showing exhaustion in {} regime", analysisId, currentRegime);
+                    return signals;
+                }
+            } catch (Exception e) {
+                log.debug("[VOLUME-GATE][{}] Error: {}", analysisId, e.getMessage());
+            }
+
+            // ═══ CONFIRMATION 4: Leaders ═══
             int leadersConfirming = checkLeadersForDirection(symbol, signalType);
             boolean confirmation4 = leadersConfirming >= 2;
+            if (currentRegime == SessionRegime.TRENDING_UP && "PUT".equals(signalType)) {
+                confirmation4 = leadersConfirming >= 3;
+            }
+            if (currentRegime == SessionRegime.TRENDING_DOWN && "CALL".equals(signalType)) {
+                confirmation4 = leadersConfirming >= 3;
+            }
 
             if (!confirmation4) {
-                log.info("[{}] No valid confirmation signal generated", analysisId);
-                log.info("[{}] Rejection reasons:", analysisId);
-                log.info("[{}]   ✗ [LEADERS] Only {}/3 leaders confirming (need 2)", analysisId, leadersConfirming);
+                log.info("[{}] Rejection: ✗ [LEADERS] Only {}/3 confirming", analysisId, leadersConfirming);
                 return signals;
             }
 
-            log.info("[LEADERS][{}] Result: {}/3 valid leaders confirming (need 2)", analysisId, leadersConfirming);
-
-            // ====================================================================
-            // CONFIRMATION 5: Price Momentum Alignment (NEW - replaces Historical)
-            // ====================================================================
+            // ═══ CONFIRMATION 5: Price Momentum Alignment ═══
             boolean confirmation5 = checkPriceMomentumAlignment(symbol, signalType);
-
             if (!confirmation5) {
-                log.info("[{}] No valid confirmation signal generated", analysisId);
-                log.info("[{}] Rejection reasons:", analysisId);
-                log.info("[{}]   ✗ [PRICE-MOMENTUM] Price momentum not aligned with {} direction", analysisId, signalType);
+                log.info("[{}] Rejection: ✗ [PRICE-MOMENTUM] Not aligned with {}", analysisId, signalType);
                 return signals;
             }
 
-            // ====================================================================
-            // CALCULATE ENTRY, TARGET, STOP LOSS
-            // ====================================================================
+            // ═══ ENTRY, TARGET, STOP LOSS ═══
             BigDecimal entryPrice = currentPrice;
-            BigDecimal atr = ta.getAverageTrueRange();
-            if (atr == null || atr.compareTo(new BigDecimal("0.50")) < 0) {
-                atr = new BigDecimal("0.50"); // Minimum realistic ATR for QQQ
-            }
-//
-            BigDecimal adjustedATR = atr; // You can apply multipliers here if needed
-//            BigDecimal targetPrice;
-//            BigDecimal stopLoss;
-//
-//            if (signalType.equals("CALL")) {
-//                targetPrice = entryPrice.add(adjustedATR);
-//                stopLoss = entryPrice.subtract(adjustedATR.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP));
-//            } else {
-//                targetPrice = entryPrice.subtract(adjustedATR);
-//                stopLoss = entryPrice.add(adjustedATR.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP));
-//            }
+            atr = ta.getAverageTrueRange();
+            if (atr == null || atr.compareTo(new BigDecimal("0.50")) < 0) atr = new BigDecimal("0.50");
 
-            BigDecimal targetPrice;
-            BigDecimal stopLoss;
-
-            // Calculate level-based target using TargetCalculationService
             TargetCalculationService.TargetResult targetResult =
                     targetCalculationService.calculateMeanReversionTarget(entryPrice, signalType, vwap, analysisId);
 
             if (!targetResult.isValid()) {
-                log.warn("[MR-SIGNAL][{}] ✗ No valid target level found - {}", analysisId, targetResult.getReason());
+                log.warn("[MR-SIGNAL][{}] ✗ No valid target — {}", analysisId, targetResult.getReason());
                 return signals;
             }
 
-            targetPrice = targetResult.getTargetPrice();
+            BigDecimal targetPrice = targetResult.getTargetPrice();
             BigDecimal targetDistance = targetResult.getDistance();
 
-            log.info("[MR-SIGNAL][{}] Target calculated: {} at ${} (distance: ${})",
-                    analysisId, targetResult.getTargetLevel(), targetPrice, targetDistance);
+            // Regime-aware stop loss
+            BigDecimal stopDistance;
+            if (currentRegime == SessionRegime.RANGING) {
+                BigDecimal atrStop = atr.multiply(new BigDecimal("0.5"));
+                BigDecimal halfTarget = targetDistance.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP);
+                stopDistance = atrStop.min(halfTarget);
+            } else {
+                stopDistance = atr.multiply(new BigDecimal("0.75"));
+                BigDecimal vwapBuffer = distanceFromVWAP.add(new BigDecimal("0.30"));
+                if (vwapBuffer.compareTo(stopDistance) < 0) stopDistance = vwapBuffer;
+            }
+            if (stopDistance.compareTo(new BigDecimal("0.30")) < 0) stopDistance = new BigDecimal("0.30");
 
-            // Calculate stop loss based on target distance (1:2 risk/reward)
-            BigDecimal stopDistance = targetDistance.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP);
+            BigDecimal stopLoss;
             if (signalType.equals("CALL")) {
                 stopLoss = entryPrice.subtract(stopDistance);
             } else {
                 stopLoss = entryPrice.add(stopDistance);
             }
 
-            log.info("[MR-SIGNAL][{}] Stop loss: ${} (distance: ${}, R:R = 1:2)",
-                    analysisId, stopLoss, stopDistance);
-
-            if (targetPrice.subtract(entryPrice).abs().compareTo(new BigDecimal("1.00")) < 0) {
-                log.info("[MR-SIGNAL] ❌ [{}] Rejected - entry/target difference less than $1.00 (Entry: ${}, Target: ${})",
-                        analysisId, entryPrice, targetPrice);
+            BigDecimal targetDistanceAbs = targetPrice.subtract(entryPrice).abs();
+            if (targetDistanceAbs.compareTo(new BigDecimal("1.00")) < 0) {
+                log.info("[MR-SIGNAL] ❌ [{}] target distance ${} < $1.00", analysisId, targetDistanceAbs);
                 return signals;
             }
 
-            // ====================================================================
-            // ALL 5 BASIC CONFIRMATIONS PASSED - LOG SIGNAL GENERATED
-            // ====================================================================
-            log.info("[MR-SIGNAL][{}] Time: {}, ATR: ${}, Adjusted ATR: ${}",
-                    analysisId, LocalTime.now(), atr, adjustedATR);
+            double maxTargetPct;
+            if (currentRegime == SessionRegime.TRENDING_DOWN || currentRegime == SessionRegime.TRENDING_UP) {
+                maxTargetPct = 0.020;
+            } else {
+                maxTargetPct = 0.010;
+            }
+            BigDecimal maxAbsoluteDistance = entryPrice.multiply(new BigDecimal(String.valueOf(maxTargetPct)));
+            if (targetDistanceAbs.compareTo(maxAbsoluteDistance) > 0) {
+                return signals;
+            }
 
-            log.info("[MR-SIGNAL][{}] ✅ {} SIGNAL GENERATED - 5/5 confirmations | Entry: ${} | Target: ${}",
-                    analysisId, signalType, entryPrice, targetPrice);
+            sessionRange = sessionHighPrice.subtract(sessionLowPrice);
+            if (sessionRange.compareTo(new BigDecimal("1.00")) > 0) {
+                BigDecimal maxRelativeDistance = sessionRange.multiply(new BigDecimal("0.50"));
+                if (targetDistanceAbs.compareTo(maxRelativeDistance) > 0) return signals;
+            }
 
-            log.info("[MR-SIGNAL][{}]   ✓ [PRICE-VWAP] Price {} VWAP by {}%",
-                    analysisId, signalType.equals("CALL") ? "below" : "above", String.format("%.2f",distanceFromVWAP));
-            log.info("[MR-SIGNAL][{}]   ✓ [VWAP-INTERACTION] Price touched VWAP within last 10 bars", analysisId);
-            log.info("[MR-SIGNAL][{}]   ✓ [MOMENTUM-SLOW] Momentum slowing - price velocity decreasing", analysisId);
-            log.info("[MR-SIGNAL][{}]   ✓ [LEADERS] {}/3 leaders confirming direction with valid RSI", analysisId, leadersConfirming);
-            log.info("[MR-SIGNAL][{}]   ✓ [PRICE-MOMENTUM] Price momentum aligned with signal direction", analysisId);
+            double minutesToClose = java.time.Duration.between(now, LocalTime.of(16, 0)).toMinutes();
+            if (minutesToClose > 0 && minutesToClose < 390) {
+                double maxDistanceByTime = Math.max(1.0, 6.0 * (minutesToClose / 390.0));
+                if (targetDistanceAbs.doubleValue() > maxDistanceByTime) return signals;
+            }
 
-// ============================================================
-// CRITICAL: DIRECTIONAL VALIDATION WITH BREAKOUT/BREAKDOWN FLIP
-// ============================================================
-            log.info("[{}] Step 7: Validating signal direction with candles and leaders", analysisId);
+            // ═══ ALL MR CONFIRMATIONS PASSED ═══
+            log.info("[MR-SIGNAL][{}] ✅ {} MR SIGNAL — 5/5 confirmations", analysisId, signalType);
 
+            // ═══ CONFIRMATION 6: Directional Validation ═══
             DirectionalConfirmationService.DirectionalResult directionalResult =
-                    directionalConfirmationService.validateSignalDirectionWithFlip(signalType, analysisId, distanceFromVWAP);
+                    directionalConfirmationService.validateSignalDirectionWithFlip(signalType, analysisId, currentPrice, vwap);
 
             if (!directionalResult.isValid()) {
-                // Check if we should flip to breakout/breakdown trade
                 if (directionalResult.shouldFlip() && directionalResult.getFlipDirection() != null) {
                     String originalSignal = signalType;
                     signalType = directionalResult.getFlipDirection();
+                    log.info("[{}] ⚡ SIGNAL FLIPPED: {} → {}", analysisId, originalSignal, signalType);
 
-                    log.info("========================================");
-                    log.info("[{}] ⚡ SIGNAL FLIPPED: {} → {} (Breakout/Breakdown at VWAP)",
-                            analysisId, originalSignal, signalType);
-                    log.info("[{}] QQQ Candles: {}/5 green, {}/5 red = {}",
-                            analysisId, directionalResult.getGreenCandles(),
-                            directionalResult.getRedCandles(), directionalResult.getQqqDirection());
-                    log.info("[{}] Leaders confirming flip: {}/3",
-                            analysisId, directionalResult.getLeadersConfirmingFlip());
-                    log.info("[{}] Distance from VWAP: {}% (within flip threshold)",
-                            analysisId, String.format("%.4f", distanceFromVWAP));
-                    log.info("========================================");
+                    TargetCalculationService.TargetResult flipTarget =
+                            targetCalculationService.calculateMeanReversionTarget(entryPrice, signalType, vwap, analysisId);
 
-                    // Recalculate target for breakout/breakdown trade using level-based calculation
-                    TargetCalculationService.TargetResult breakoutTarget =
-                            targetCalculationService.calculateBreakoutTarget(entryPrice, signalType, vwap, analysisId);
-
-                    if (!breakoutTarget.isValid()) {
-                        log.warn("[{}] ✗ No valid breakout target found - {}", analysisId, breakoutTarget.getReason());
-                        log.info("[{}] Trying mean reversion target instead of ATR fallback", analysisId);
-
-                        TargetCalculationService.TargetResult fallbackTarget =
-                                targetCalculationService.calculateMeanReversionTarget(entryPrice, signalType, vwap, analysisId);
-
-                        if (fallbackTarget.isValid()) {
-                            targetPrice = fallbackTarget.getTargetPrice();
-                            BigDecimal fallbackDistance = fallbackTarget.getDistance();
-
-                            log.info("[{}] ✓ Using {} at ${} (distance: ${})",
-                                    analysisId, fallbackTarget.getTargetLevel(), targetPrice, fallbackDistance);
-
-                            BigDecimal stopDist = fallbackDistance.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP);
-                            if (signalType.equals("PUT")) {
-                                stopLoss = entryPrice.add(stopDist);
-                            } else {
-                                stopLoss = entryPrice.subtract(stopDist);
-                            }
+                    if (!flipTarget.isValid()) {
+                        TargetCalculationService.TargetResult breakoutTarget =
+                                targetCalculationService.calculateBreakoutTarget(entryPrice, signalType, vwap, analysisId);
+                        if (breakoutTarget != null && breakoutTarget.isValid()) {
+                            targetPrice = breakoutTarget.getTargetPrice();
+                            BigDecimal bStop = breakoutTarget.getDistance().divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP);
+                            stopLoss = signalType.equals("CALL") ? entryPrice.subtract(bStop) : entryPrice.add(bStop);
                         } else {
-                            log.warn("[{}] ✗ No valid target available - rejecting flipped signal", analysisId);
                             return signals;
                         }
                     } else {
-                        // breakoutTarget IS valid - use it
-                        targetPrice = breakoutTarget.getTargetPrice();
-                        BigDecimal breakoutDistance = breakoutTarget.getDistance();
-
-                        if (signalType.equals("PUT")) {
-                            log.info("[{}] 💥 BREAKDOWN TARGET: {} at ${} (distance: ${})",
-                                    analysisId, breakoutTarget.getTargetLevel(), targetPrice, breakoutDistance);
-                            stopLoss = entryPrice.add(breakoutDistance.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP));
-                        } else {
-                            log.info("[{}] 🚀 BREAKOUT TARGET: {} at ${} (distance: ${})",
-                                    analysisId, breakoutTarget.getTargetLevel(), targetPrice, breakoutDistance);
-                            stopLoss = entryPrice.subtract(breakoutDistance.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP));
-                        }
+                        targetPrice = flipTarget.getTargetPrice();
+                        BigDecimal flipStopDist = flipTarget.getDistance().divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP);
+                        stopLoss = signalType.equals("CALL") ? entryPrice.subtract(flipStopDist) : entryPrice.add(flipStopDist);
                     }
-
-                    log.info("[{}] Recalculated - Entry: ${}, Target: ${}, Stop: ${}",
-                            analysisId, entryPrice, targetPrice, stopLoss);
-
                 } else {
-                    // No flip possible - check for momentum continuation
-                    boolean canConvertToMomentumTrade = false;
-                    String momentumDirection = null;
-
-                    if (signalType.equals("CALL") && "BEARISH".equals(directionalResult.getQqqDirection())) {
-                        canConvertToMomentumTrade = true;
-                        momentumDirection = "PUT";
-                        log.info("[{}] 📉 CALL rejected with bearish momentum - checking for continuation PUT", analysisId);
-                    } else if (signalType.equals("PUT") && "BULLISH".equals(directionalResult.getQqqDirection())) {
-                        canConvertToMomentumTrade = true;
-                        momentumDirection = "CALL";
-                        log.info("[{}] 📈 PUT rejected with bullish momentum - checking for continuation CALL", analysisId);
-                    }
-
-                    if (canConvertToMomentumTrade && directionalResult.getLeadersConfirmingFlip() >= 2) {
-                        String originalSignal = signalType;
-                        signalType = momentumDirection;
-
-                        log.info("========================================");
-                        log.info("[{}] ⚡ MOMENTUM CONTINUATION: {} → {} (following candle direction)",
-                                analysisId, originalSignal, signalType);
-                        log.info("[{}] QQQ Candles: {}/5 green, {}/5 red = {}",
-                                analysisId, directionalResult.getGreenCandles(),
-                                directionalResult.getRedCandles(), directionalResult.getQqqDirection());
-                        log.info("[{}] Leaders confirming momentum: {}/3",
-                                analysisId, directionalResult.getLeadersConfirmingFlip());
-                        log.info("========================================");
-
-                        TargetCalculationService.TargetResult momentumTarget =
-                                targetCalculationService.calculateMeanReversionTarget(entryPrice, signalType, vwap, analysisId);
-
-                        if (momentumTarget.isValid()) {
-                            targetPrice = momentumTarget.getTargetPrice();
-                            BigDecimal momentumDistance = momentumTarget.getDistance();
-
-                            log.info("[{}] 🎯 MOMENTUM TARGET: {} at ${} (distance: ${})",
-                                    analysisId, momentumTarget.getTargetLevel(), targetPrice, momentumDistance);
-
-                            BigDecimal stopDist = momentumDistance.divide(new BigDecimal("2"), 2, RoundingMode.HALF_UP);
-                            if (signalType.equals("PUT")) {
-                                stopLoss = entryPrice.add(stopDist);
-                            } else {
-                                stopLoss = entryPrice.subtract(stopDist);
-                            }
-
-                            log.info("[{}] Momentum trade - Entry: ${}, Target: ${}, Stop: ${}",
-                                    analysisId, entryPrice, targetPrice, stopLoss);
-                        } else {
-                            log.warn("[{}] ✗ No valid momentum target found - {}", analysisId, momentumTarget.getReason());
-                            log.info("[{}] ✗✗✗ SIGNAL REJECTED - NO VALID TARGET ✗✗✗", analysisId);
-                            return signals;
-                        }
-                    } else {
-                        log.info("[{}] ✗✗✗ SIGNAL REJECTED - DIRECTIONAL CONFLICT ✗✗✗", analysisId);
-                        log.info("[{}] No valid confirmation signal generated", analysisId);
-                        log.info("[{}] Rejection reasons:", analysisId);
-                        if (directionalResult.getRejectionReason() != null) {
-                            log.info("[{}]   ✗ [DIRECTIONAL] {}", analysisId, directionalResult.getRejectionReason());
-                        } else {
-                            log.info("[{}]   ✗ [DIRECTIONAL-CONFLICT] Signal {} conflicts with QQQ candles ({}) or insufficient leader confirmation",
-                                    analysisId, signalType, directionalResult.getQqqDirection());
-                        }
-                        return signals;
-                    }
+                    log.info("[{}] ✗✗✗ SIGNAL REJECTED — DIRECTIONAL CONFLICT", analysisId);
+                    return signals;
                 }
             }
 
-            log.info("[{}] ✓ Directional validation PASSED - proceeding to option selection", analysisId);
-// ============================================================
+            // ═══ 6/6 CONFIRMED — BUILD SIGNAL ═══
+            log.info("[{}] ✓✓✓ MR CONFIRMATION SIGNAL APPROVED — 6/6", analysisId);
 
-            log.info("[{}] Step 7: Validating signal direction with candles and leaders", analysisId);
-
-            boolean directionValid = directionalConfirmationService.validateSignalDirection(
-                    signalType,
-                    analysisId
-            );
-
-            if (!directionValid) {
-                log.info("[{}] ✗✗✗ SIGNAL REJECTED - DIRECTIONAL CONFLICT ✗✗✗", analysisId);
-                log.info("[{}] No valid confirmation signal generated", analysisId);
-                log.info("[{}] Rejection reasons:", analysisId);
-                log.info("[{}]   ✗ [DIRECTIONAL-CONFLICT] Signal {} conflicts with QQQ candles or leader momentum",
-                        analysisId, signalType);
-                return signals;
-            }
-
-            log.info("[{}] ✓ Directional validation PASSED - proceeding to option selection", analysisId);
-// ============================================================
-            // ALL 6 CONFIRMATIONS PASSED - SIGNAL APPROVED
-            // ====================================================================
-            log.info("========================================");
-            log.info("[{}] ✓✓✓ CONFIRMATION SIGNAL APPROVED ✓✓✓", analysisId);
-            log.info("[{}] Confirmations: 6/6", analysisId);
-            log.info("[{}] Entry: ${}, Target: ${}, Stop: ${}", analysisId, entryPrice, targetPrice, stopLoss);
-            log.info("========================================");
-
-            // ============================================================
-            // OPTION CHAIN FETCHING WITH DETAILED LOGGING
-            // ============================================================
-
-            // Check for today's expiration
             LocalDate today = LocalDate.now(ET_ZONE);
-            log.info("[{}] [OPTION-FETCH] Step 1: Fetching expirations for {} (today: {})",
-                    analysisId, symbol, today);
-
             List<LocalDate> expirations = tradierService.getExpirations(symbol);
-
-            log.info("[{}] [OPTION-FETCH] Step 2: Received expirations - Count: {}, Dates: {}",
-                    analysisId,
-                    expirations != null ? expirations.size() : 0,
-                    expirations != null ? expirations.toString() : "null");
-
-            if (expirations == null || expirations.isEmpty()) {
-                log.warn("[{}] [OPTION-FETCH] ❌ FAILED at Step 2: No expiration dates returned", analysisId);
+            if (expirations == null || expirations.isEmpty() || !expirations.contains(today)) {
                 return signals;
             }
-
-            if (!expirations.contains(today)) {
-                log.warn("[{}] [OPTION-FETCH] ❌ FAILED at Step 2: Today {} not in available dates {}",
-                        analysisId, today, expirations);
-                return signals;
-            }
-
-            log.info("[{}] [OPTION-FETCH] ✓ Step 2 passed: Today is in expiration list", analysisId);
-
-            // Get option chain
-            log.info("[{}] [OPTION-FETCH] Step 3: Calling getOptionChain({}, {})",
-                    analysisId, symbol, today);
 
             OptionChainResponse chainResponse = tradierService.getOptionChain(symbol, today);
-
-            log.info("[{}] [OPTION-FETCH] Step 4: Received option chain response - IsNull: {}, HasOptions: {}",
-                    analysisId,
-                    chainResponse == null,
-                    chainResponse != null ? chainResponse.hasOptions() : "N/A");
-
-            if (chainResponse == null) {
-                log.warn("[{}] [OPTION-FETCH] ❌ FAILED at Step 4: chainResponse is NULL", analysisId);
-                return signals;
-            }
-
-            if (!chainResponse.hasOptions()) {
-                log.warn("[{}] [OPTION-FETCH] ❌ FAILED at Step 4: chainResponse.hasOptions() = false", analysisId);
-                return signals;
-            }
+            if (chainResponse == null || !chainResponse.hasOptions()) return signals;
 
             List<Option> options = chainResponse.getOptionsList();
+            if (options == null || options.isEmpty()) return signals;
 
-            log.info("[{}] [OPTION-FETCH] Step 5: Extracted options list - Count: {}",
-                    analysisId,
-                    options != null ? options.size() : 0);
-
-            if (options == null || options.isEmpty()) {
-                log.warn("[{}] [OPTION-FETCH] ❌ FAILED at Step 5: Options list is empty", analysisId);
-                return signals;
-            }
-
-            // Log detailed breakdown
-            long callCount = options.stream()
-                    .filter(o -> o.getType() != null && "CALL".equalsIgnoreCase(o.getType()))
-                    .count();
-            long putCount = options.stream()
-                    .filter(o -> o.getType() != null && "PUT".equalsIgnoreCase(o.getType()))
-                    .count();
-            long todayCount = options.stream()
-                    .filter(o -> {
-                        if (o.getExpirationDate() == null) return false;
-                        try {
-                            Object expiryObj = o.getExpirationDate();
-                            if (expiryObj instanceof String) {
-                                LocalDate expiryDate = LocalDate.parse((String) expiryObj);
-                                return expiryDate.equals(today);
-                            } else if (expiryObj instanceof LocalDate) {
-                                return expiryObj.equals(today);
-                            }
-                            return false;
-                        } catch (Exception e) {
-                            return false;
-                        }
-                    })
-                    .count();
-            long withPrices = options.stream()
-                    .filter(o -> o.getStrikePrice() != null && o.getBid() != null && o.getAsk() != null)
-                    .count();
-            long nonZeroBid = options.stream()
-                    .filter(o -> o.getBid() != null && o.getBid().compareTo(BigDecimal.ZERO) > 0)
-                    .count();
-
-            log.info("[{}] [OPTION-FETCH] ✓ Step 5 passed: Options breakdown:", analysisId);
-            log.info("[{}]   - Total options: {}", analysisId, options.size());
-            log.info("[{}]   - CALLs: {}, PUTs: {}", analysisId, callCount, putCount);
-            log.info("[{}]   - Expiring today: {}", analysisId, todayCount);
-            log.info("[{}]   - With all prices: {}", analysisId, withPrices);
-            log.info("[{}]   - With bid > $0: {}", analysisId, nonZeroBid);
-
-            // Select best option
-            log.info("[{}] [OPTION-FETCH] Step 6: Selecting best {} option", analysisId, signalType);
-            log.info("[{}]   - Entry price: ${}", analysisId, entryPrice);
-            log.info("[{}]   - Target price: ${}", analysisId, targetPrice);
-
-            // Select appropriate option based on signal type
             Option selectedOption;
             if (signalType.equals("CALL")) {
                 selectedOption = selectBestCallOption(options, entryPrice, targetPrice, analysisId);
             } else {
                 selectedOption = selectBestPutOption(options, entryPrice, targetPrice, analysisId);
             }
-
-            if (selectedOption == null) {
-                log.warn("[{}] [OPTION-FETCH] ❌ FAILED at Step 6: No suitable option selected", analysisId);
-                return signals;
-            }
-
-            log.info("[{}] [OPTION-FETCH] ✓ Step 6 passed: Option selected", analysisId);
-            log.info("[{}]   - Symbol: {}", analysisId, selectedOption.getSymbol());
-            log.info("[{}]   - Strike: ${}", analysisId, selectedOption.getStrikePrice());
-            log.info("[{}]   - Bid: ${}, Ask: ${}", analysisId, selectedOption.getBid(), selectedOption.getAsk());
-
-            // Create signal
-            log.info("[{}] [OPTION-FETCH] Step 7: Creating signal", analysisId);
+            if (selectedOption == null) return signals;
 
             Signal signal = new Signal();
             signal.setSymbol(selectedOption.getSymbol());
             signal.setOptionSymbol(selectedOption.getSymbol());
             signal.setSignalType(signalType);
-            signal.setEntryPrice(selectedOption.getAsk()); // Buy at ask
+            signal.setEntryPrice(selectedOption.getAsk());
             signal.setTargetPrice(targetPrice);
             signal.setStopLoss(stopLoss);
             signal.setStrikePrice(selectedOption.getStrikePrice());
-
-            // ✅ FIXED: create a proper ET expiry datetime instead of parsing plain date
             ZonedDateTime expiry = today.atTime(16, 0).atZone(ET_ZONE);
             signal.setExpirationDate(expiry);
-
             signal.setStrategy("CONFIRMATION_BASED_0DTE");
 
-            // Dynamic confidence calculation based on signal quality factors
             Map<String, Double> candleNets = fetchCandleNetsForConfidence(analysisId);
-            double calculatedConfidence = calculateSignalConfidence(signal, ta, leadersConfirming, candleNets, analysisId);
-            signal.setConfidence(calculatedConfidence);
+            levels = dailyLevelService.getQQQDailyLevels();
+            BigDecimal todayHigh = (levels != null) ? levels.getTodayHigh() : null;
+            BigDecimal todayLow = (levels != null) ? levels.getTodayLow() : null;
 
+            double calculatedConfidence = calculateSignalConfidence(
+                    signal, ta, leadersConfirming, candleNets, todayHigh, todayLow, wickRejectionBonus, analysisId);
+
+            // Apply soft-gate adjustments
+            calculatedConfidence += keyLevelConfidenceAdj;
+            calculatedConfidence += pocConfidenceAdj;
+
+            // TREND_EXHAUSTING penalty for MR counter-trend
+            if (currentRegime == SessionRegime.TREND_EXHAUSTING) {
+                calculatedConfidence -= 0.10;
+                log.info("[{}] TREND_EXHAUSTING penalty: -10% confidence for MR", analysisId);
+            }
+
+            // Strong trend penalty
+            if (isStrongTrendConfirmed()) {
+                calculatedConfidence -= 0.15;
+                log.info("[{}] Strong trend penalty: -15% confidence for counter-trend MR", analysisId);
+            }
+
+            calculatedConfidence = Math.max(0.0, Math.min(1.0, calculatedConfidence));
+            signal.setConfidence(calculatedConfidence);
             signal.setCreatedAt(LocalDateTime.now());
 
-            log.info("[{}] Signal created: {} ${} {}, Entry: ${}, Target: ${}, Confidence: {}%",
+            log.info("[{}] MR Signal: {} ${} {}, Entry: ${}, Target: ${}, Confidence: {}%",
                     analysisId, symbol, selectedOption.getStrikePrice(), signalType,
-                    signal.getEntryPrice(), targetPrice, (int) (signal.getConfidence() * 100));
+                    signal.getEntryPrice(), targetPrice, (int)(signal.getConfidence() * 100));
 
-            // Apply risk management
-            log.info("[{}] [OPTION-FETCH] Step 8: Applying risk management", analysisId);
             signal = applyRiskManagement(signal, analysisId);
 
             if (signal != null && signal.getConfidence() != null && signal.getConfidence() >= 0.60) {
                 signals.add(signal);
+                lastSignalByTypeAndStrike.put(signalType + "_" + symbol, LocalDateTime.now(ET_ZONE));
+                signalsGeneratedToday++;
+                if ("PUT".equals(signalType)) putSignalsToday++;
+                if ("CALL".equals(signalType)) callSignalsToday++;
 
-                // Notify via Telegram
-                try {
-                    String message = formatSignalMessage(signal, analysisId);
-                    telegramService.sendMessage(message);
-                } catch (Exception e) {
-                    log.error("[{}] Error sending Telegram message: {}", analysisId, e.getMessage());
-                }
-
-                log.info("[{}] ✓✓✓ SIGNAL READY FOR EXECUTION ✓✓✓", analysisId);
-                executeSignalImmediately(signal, null, analysisId);
-
-                log.info("[{}] Signal added to list", analysisId);
-            } else {
-                log.warn("[{}] [OPTION-FETCH] ❌ FAILED at Step 8: Signal rejected by risk management", analysisId);
-                if (signal != null) {
-                    log.warn("[{}]   - Confidence: {}", analysisId, signal.getConfidence());
+                boolean handled = routeSignalByConfidence(signal, ta, analysisId);
+                if (!handled) {
+                    log.warn("[{}] Signal could not be routed", analysisId);
                 }
             }
 
         } catch (Exception e) {
-            log.error("[{}] ❌❌❌ EXCEPTION in analyzeOptions: {}", analysisId, e.getMessage(), e);
-            e.printStackTrace();
+            log.error("[{}] Error in analysis: {}", analysisId, e.getMessage(), e);
         }
 
         return signals;
     }
+
+
 
 
     /**
@@ -823,6 +1235,7 @@ public class ZeroDTEStrategy {
             return;
         }
 
+
         BigDecimal currentPrice = ta.getCurrentPrice();
         BigDecimal vwap = ta.getVwap();
         double vwapDistancePercent = currentPrice.subtract(vwap)
@@ -834,6 +1247,30 @@ public class ZeroDTEStrategy {
         log.info("[VWAP-STRATEGIES][{}] Price: ${}, VWAP: ${}, Distance: {}%, Momentum: {}",
                 analysisId, currentPrice, vwap, String.format("%.2f", vwapDistancePercent * 100),
                 qqqVelocity != null ? qqqVelocity.state : "UNKNOWN");
+
+        // ═══ REGIME-GATE FOR PIPELINE B ═══
+        if (currentRegime == SessionRegime.TRENDING_UP && vwapDistancePercent > 0) {
+            // Suppress rejection-put in uptrend; only allow breakout-call
+            log.info("[VWAP-STRATEGIES][{}] TRENDING_UP: Suppressing rejection-PUT, only breakout-CALL allowed", analysisId);
+            if (vwapDistancePercent > 0.001 && vwapDistancePercent <= 0.015) {
+                Option callOption = findBestATMOption(allOptions, currentPrice, true);
+                if (callOption != null) {
+                    analyzeVWAPBreakoutCall(callOption, allOptions, ta, signals, marketTrend, analysisId);
+                }
+            }
+            return;
+        }
+
+        if (currentRegime == SessionRegime.TRENDING_DOWN && vwapDistancePercent < 0) {
+            log.info("[VWAP-STRATEGIES][{}] TRENDING_DOWN: Suppressing bounce-CALL, only breakdown-PUT allowed", analysisId);
+            if (vwapDistancePercent < -0.001 && vwapDistancePercent >= -0.015) {
+                Option putOption = findBestATMOption(allOptions, currentPrice, false);
+                if (putOption != null) {
+                    analyzeVWAPBreakdownPut(putOption, allOptions, ta, signals, marketTrend, analysisId);
+                }
+            }
+            return;
+        }
 
         // Skip if not in optimal distance range (0.3%-1.5%)
         double absDistance = Math.abs(vwapDistancePercent);
@@ -1300,8 +1737,9 @@ public class ZeroDTEStrategy {
         log.info("[VWAP-BREAKOUT-CALL][{}] === ANALYZING CALL BREAKOUT === Distance: {}%",
                 analysisId, String.format("%.2f", vwapDistancePercent * 100));
 
-        // Skip if not above VWAP in fresh breakout range (0.1%-0.8%)
-        if (vwapDistancePercent <= 0.001 || vwapDistancePercent > 0.008) {
+        // Widened cap in TRENDING regimes to capture mid-trend continuation entries
+        double maxBreakoutDistance = (currentRegime == SessionRegime.TRENDING_UP) ? 0.015 : 0.008;
+        if (vwapDistancePercent <= 0.001 || vwapDistancePercent > maxBreakoutDistance) {
             log.debug("[VWAP-BREAKOUT-CALL][{}] Distance {}% outside range (need 0.1% to 0.8%)",
                     analysisId, String.format("%.2f", vwapDistancePercent * 100));
             return;
@@ -1697,7 +2135,7 @@ public class ZeroDTEStrategy {
 
                 // If already down >1% from recent high, the breakdown already happened
                 if (distancePercent > 0.010) { // More than 1% from high
-                    log.warn("[TOO-LATE][{}] ⚠️ Already {:.2f}% from recent high - breakdown complete",
+                    log.warn("[TOO-LATE][{}] ⚠️ Already {}% from recent high - breakdown complete",
                             analysisId, distancePercent * 100);
                     return true;
                 }
@@ -1939,6 +2377,53 @@ public class ZeroDTEStrategy {
                 log.debug("[MOMENTUM][{}] Error updating current momentum: {}", analysisId, e.getMessage());
             }
         }
+
+        /**
+         * Calculate velocity collapse ratio: peak velocity in last N bars / current velocity.
+         * A ratio > 3.0 means 70%+ collapse = confirmed capitulation.
+         * Returns 0.0 if insufficient data.
+         */
+        public double getVelocityCollapseRatio(String symbol, int lookbackBars) {
+            List<MomentumReading> history = momentumHistory.get(symbol);
+            if (history == null || history.size() < 3) {
+                return 0.0;
+            }
+
+            int limit = Math.min(lookbackBars, history.size());
+            double peakVelocity = 0.0;
+            double currentVelocity = Math.abs(history.get(0).momentum);
+
+            for (int i = 0; i < limit; i++) {
+                double vel = Math.abs(history.get(i).momentum);
+                if (vel > peakVelocity) {
+                    peakVelocity = vel;
+                }
+            }
+
+            // Avoid division by zero — if current velocity is near zero, that IS exhaustion
+            if (currentVelocity < 0.0001) {
+                return peakVelocity > 0.001 ? 100.0 : 0.0; // infinite collapse if peak was real
+            }
+
+            return peakVelocity / currentVelocity;
+        }
+
+        /**
+         * Get the peak velocity value from last N bars (for logging).
+         */
+        public double getPeakVelocity(String symbol, int lookbackBars) {
+            List<MomentumReading> history = momentumHistory.get(symbol);
+            if (history == null || history.isEmpty()) return 0.0;
+
+            int limit = Math.min(lookbackBars, history.size());
+            double peak = 0.0;
+            for (int i = 0; i < limit; i++) {
+                double vel = Math.abs(history.get(i).momentum);
+                if (vel > peak) peak = vel;
+            }
+            return peak;
+        }
+
 
         private double calculateRawMomentum(String symbol) {
             try {
@@ -2789,7 +3274,16 @@ public class ZeroDTEStrategy {
 
         // Time-based boost for reverse strategies
         LocalTime now = LocalTime.now(ET_ZONE);
-        if (now.isAfter(LocalTime.of(15, 0))) confidence *= 1.10;
+        // Late session: PENALIZE (not boost) due to 0DTE theta/gamma acceleration
+        if (now.isAfter(LocalTime.of(15, 45))) {
+            confidence *= 0.70; // Severe penalty — near-expiry
+        } else if (now.isAfter(LocalTime.of(15, 30))) {
+            confidence *= 0.80;
+        } else if (now.isAfter(LocalTime.of(15, 15))) {
+            confidence *= 0.90;
+        } else if (now.isAfter(LocalTime.of(15, 0))) {
+            confidence *= 0.95;
+        }
 
         String strategy = type.equals("CALL") ? "0DTE_ENHANCED_AI_REVERSE_LEADER_LAG_CALL" : "0DTE_ENHANCED_AI_REVERSE_LEADER_LAG_PUT";
         String reason = String.format(
@@ -3263,7 +3757,7 @@ public class ZeroDTEStrategy {
                 }
             }
 
-           // log.info("[DATA-CHECK][{}] Data sufficiency ✅ - {} minutes of data available", analysisId, recentData.size());
+            // log.info("[DATA-CHECK][{}] Data sufficiency ✅ - {} minutes of data available", analysisId, recentData.size());
             return true;
 
         } catch (Exception e) {
@@ -3402,8 +3896,7 @@ public class ZeroDTEStrategy {
             // Leader direction validation (skip for AI signals)
             // Leader direction validation (skip for AI signals and VWAP strategies)
             if (!signal.getStrategy().contains("AI_LEADER_LAG") &&
-                    !signal.getStrategy().contains("ENHANCED_AI") &&
-                    !signal.getStrategy().contains("VWAP")) {
+                    !signal.getStrategy().contains("ENHANCED_AI")) {
                 LeaderDirectionValidator.ValidationResult leaderValidation =
                         leaderValidator.validateLeaderDirection(signal, analysisId, hasExistingPosition);
 
@@ -3630,22 +4123,19 @@ public class ZeroDTEStrategy {
             try {
                 LocalTime now = LocalTime.now(ET_ZONE);
 
-                if (now.isBefore(LocalTime.of(10, 0))) {
-                    return new ValidationResult(true, 1.0, "Early session - skipping leader check", "");
-                }
+                // ═══ NO BYPASSES — all signals must pass leader validation ═══
+                // Early session: use relaxed thresholds but still validate
+                boolean earlySession = now.isBefore(LocalTime.of(10, 0));
 
-                Double confidence = signal.getConfidence();
-                if (confidence != null && confidence >= 0.85) {
-                    return new ValidationResult(true, 1.0, "High confidence signal - leader check bypassed", "");
-                }
-
-                if (signal.getStrategy().contains("REVERSION")) {
-                    return new ValidationResult(true, 1.0, "Reversion play - leaders may be extended", "");
-                }
-
+                // High volume: note it but don't bypass
                 TechnicalAnalysis qqqTA = technicalAnalysisService.analyze("QQQ");
-                if (qqqTA != null && qqqTA.getVolumeRatio() > 2.0) {
-                    return new ValidationResult(true, 1.0, "QQQ leading with high volume", "");
+                boolean highVolume = qqqTA != null && qqqTA.getVolumeRatio() > 2.0;
+
+                if (earlySession) {
+                    log.info("[LEADER-VALIDATOR][{}] Early session — using relaxed thresholds (not bypassed)", analysisId);
+                }
+                if (highVolume) {
+                    log.info("[LEADER-VALIDATOR][{}] High QQQ volume — noted but validation continues", analysisId);
                 }
 
                 boolean isCallSignal;
@@ -3765,7 +4255,8 @@ public class ZeroDTEStrategy {
             double oppositionCutoff = getAdaptiveOppositionCutoff(regime);
 
             for (String leader : LEADER_STOCKS) {
-                LeaderMomentum momentum = new LeaderMomentum(leader, LEADER_WEIGHTS.get(leader));
+                Map<String, Double> adjustedWeights = getRegimeAdjustedLeaderWeights();
+                LeaderMomentum momentum = new LeaderMomentum(leader, adjustedWeights.get(leader));
 
                 List<MarketData> data5min = marketDataRepository.findRecentData(leader, 5);
                 List<MarketData> data10min = marketDataRepository.findRecentData(leader, 10);
@@ -4881,7 +5372,7 @@ public class ZeroDTEStrategy {
                 .collect(Collectors.toList());
 
         //log.info("[ATM-FILTER][{}] ATM filtering result: {} options selected (from {} total)",
-                //analysisId, atmOptions.size(), options.size());
+        //analysisId, atmOptions.size(), options.size());
 
         if (atmOptions.isEmpty()) {
             log.warn("[ATM-FILTER][{}] No ATM options found - expanding to $1.00 range", analysisId);
@@ -5507,10 +5998,10 @@ public class ZeroDTEStrategy {
                     log.info("[ENHANCED-AI-DEBUG][{}] - Strongest Leader: {}", analysisId, context.strongestLeader);
 //                    log.info("[ENHANCED-AI-DEBUG][{}] - Correlation: {}%", analysisId, String.format("%.1f",context.correlation * 100));
 
- //                   leaderPatterns.forEach((leader, pattern) ->
- //                           log.info("[ENHANCED-AI-DEBUG][{}] - {} Pattern: {}", analysisId, leader, pattern));
+                    //                   leaderPatterns.forEach((leader, pattern) ->
+                    //                           log.info("[ENHANCED-AI-DEBUG][{}] - {} Pattern: {}", analysisId, leader, pattern));
 
- //                   rsiContexts.forEach((leader, rsiContext) ->
+                    //                   rsiContexts.forEach((leader, rsiContext) ->
 //                            log.info("[ENHANCED-AI-DEBUG][{}] - {} RSI Context: {} → Action: {}",
 //                                    analysisId, leader, rsiContext.interpretation, rsiContext.signalAction));
                 }
@@ -6012,6 +6503,100 @@ public class ZeroDTEStrategy {
             log.error("[TRACKER-CLEANUP] ❌ Error cleaning up trackers: {}", e.getMessage(), e);
         }
     }
+
+    @PostConstruct
+    public void initializeCoilTracking() {
+        // Register callback so CoilTrackingService can execute signals through ZeroDTEStrategy
+        coilTrackingService.setExecutionCallback(this::executeCoilSignal);
+        log.info("[INIT] CoilTrackingService callback registered");
+    }
+
+    /**
+     * Callback method for CoilTrackingService to execute signals
+     * This keeps all execution logic in ZeroDTEStrategy
+     */
+    private void executeCoilSignal(Signal signal) {
+        String analysisId = "COIL-" + UUID.randomUUID().toString().substring(0, 8);
+        log.info("[{}] ═══════════════════════════════════════════════", analysisId);
+        log.info("[{}] EXECUTING COIL SIGNAL VIA CALLBACK", analysisId);
+        log.info("[{}] Signal: {} {} @ ${}", analysisId, signal.getSignalType(),
+                signal.getStrikePrice(), signal.getEntryPrice());
+        log.info("[{}] Strategy: {}", analysisId, signal.getStrategy());
+        log.info("[{}] Confidence: {}%", analysisId, (int)(signal.getConfidence() * 100));
+        log.info("[{}] ═══════════════════════════════════════════════", analysisId);
+
+        // Use existing execution method
+        executeSignalImmediately(signal, null, analysisId);
+    }
+
+    /**
+     * Route signal based on confidence - either execute immediately or track for coiling
+     *
+     * @param signal The generated signal
+     * @param ta Technical analysis at signal generation
+     * @param analysisId Analysis ID for logging
+     * @return true if signal was handled (executed or tracked), false if rejected
+     */
+    private boolean routeSignalByConfidence(Signal signal, TechnicalAnalysis ta, String analysisId) {
+        if (signal == null || signal.getConfidence() == null) {
+            log.warn("[{}] Cannot route null signal or signal with null confidence", analysisId);
+            return false;
+        }
+
+        double confidence = signal.getConfidence();
+
+        // Execution threshold: 70% (was 75%)
+        double executionThreshold = 0.70;
+
+        // ════════════════════════════════════════════════════════════════
+        // CONFIDENCE < 70%: Route to Coil Tracker
+        // ════════════════════════════════════════════════════════════════
+        if (confidence < executionThreshold) {
+            if (coilTrackingService.shouldTrackForCoil(signal)) {
+                log.info("[{}] ═══════════════════════════════════════════════", analysisId);
+                log.info("[{}] 🔄 ROUTING TO COIL TRACKER", analysisId);
+                log.info("[{}] Confidence: {}% (below {}% threshold)", analysisId,
+                        (int)(confidence * 100), (int)(executionThreshold * 100));
+                log.info("[{}] ═══════════════════════════════════════════════", analysisId);
+
+                coilTrackingService.trackSignal(signal, ta, analysisId);
+
+                try {
+                    String message = String.format(
+                            "🔄 SIGNAL → COIL TRACKER\nID: %s\nSignal: %s %s\nStrike: $%s\nConfidence: %d%%\nStatus: Monitoring",
+                            analysisId, signal.getSignalType(), signal.getOptionSymbol(),
+                            signal.getStrikePrice(), (int)(confidence * 100));
+                    telegramService.sendMessage(message);
+                } catch (Exception e) {
+                    log.error("[{}] Error sending Telegram: {}", analysisId, e.getMessage());
+                }
+                return true;
+            } else {
+                log.warn("[{}] Low confidence signal ({}%) cannot be tracked - skipping",
+                        analysisId, (int)(confidence * 100));
+                return false;
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // CONFIDENCE >= 70%: Execute immediately
+        // ════════════════════════════════════════════════════════════════
+        log.info("[{}] ═══════════════════════════════════════════════", analysisId);
+        log.info("[{}] ✓ EXECUTING SIGNAL (confidence {}% >= {}%)", analysisId,
+                (int)(confidence * 100), (int)(executionThreshold * 100));
+        log.info("[{}] ═══════════════════════════════════════════════", analysisId);
+
+        try {
+            String message = formatSignalMessage(signal, analysisId);
+            telegramService.sendMessage(message);
+        } catch (Exception e) {
+            log.error("[{}] Error sending Telegram: {}", analysisId, e.getMessage());
+        }
+
+        executeSignalImmediately(signal, null, analysisId);
+        return true;
+    }
+
 
     // ADD this new method for comprehensive rejection logging
     private void logSignalRejectionSummary(String analysisId, String strategy,
@@ -6736,6 +7321,334 @@ public class ZeroDTEStrategy {
         }
     }
 
+    @Scheduled(fixedDelay = 15000) // Every 15 seconds — matches analysis cycle
+    public void updateSessionState() {
+        try {
+            LocalDate today = LocalDate.now(ET_ZONE);
+            LocalTime now = LocalTime.now(ET_ZONE);
+
+            // Reset on new day
+            if (sessionDate == null || !sessionDate.equals(today)) {
+                sessionDate = today;
+                sessionOpenPrice = null;
+                rollingVwapSlope30min = BigDecimal.ZERO;
+                sessionHighPrice = BigDecimal.ZERO;
+                sessionLowPrice = new BigDecimal("9999");
+                continuousAboveVwapMinutes = 0;
+                continuousBelowVwapMinutes = 0;
+                lastVwapCrossTime = null;
+                lastVwapCrossPrice = null;
+                rollingVwapSlope30min = BigDecimal.ZERO;
+                higherHighCount15m = 0;
+                lowerLowCount15m = 0;
+                signalsGeneratedToday = 0;
+                signalsKilledByCoilToday = 0;
+                putSignalsToday = 0;
+                callSignalsToday = 0;
+                currentRegime = SessionRegime.RANGING;
+                trendContinuationCallCount = 0;
+                trendContinuationPutCount = 0;
+                lastDepartureSignalTime = null;
+                regimeStartRSI = 50.0;
+                sessionPeakRSI = 0.0;
+                sessionTroughRSI = 100.0;
+                swingLowAfterRSIPeak = null;
+                swingHighAfterRSITrough = null;
+                rsiHasPeaked = false;
+                rsiHasTroughed = false;
+                leaderOppositionStreaks.clear();
+                lastSignalByTypeAndStrike.clear();
+                lastCallCrossSignalTime = null;
+                lastPutCrossSignalTime = null;
+                log.info("[SESSION-STATE] New trading day initialized: {}", today);
+            }
+
+            if (now.isBefore(LocalTime.of(9, 30)) || now.isAfter(LocalTime.of(16, 0))) {
+                return;
+            }
+
+            TechnicalAnalysis ta = technicalAnalysisService.analyze("QQQ");
+            if (ta == null || ta.getCurrentPrice() == null || ta.getVwap() == null) return;
+
+            BigDecimal price = ta.getCurrentPrice();
+            BigDecimal vwap = ta.getVwap();
+
+            // Capture session open
+            if (sessionOpenPrice == null) {
+                sessionOpenPrice = price;
+                log.info("[SESSION-STATE] Session open captured: ${}", sessionOpenPrice);
+            }
+
+            // Update session high/low
+            if (price.compareTo(sessionHighPrice) > 0) sessionHighPrice = price;
+            // Update VWAP slope for regime detection
+            updateVwapSlope("QQQ");
+
+            if (price.compareTo(sessionLowPrice) < 0) sessionLowPrice = price;
+
+            double currentRSIForTracking = ta.getRsi();
+
+            if (currentRSIForTracking > sessionPeakRSI) {
+                sessionPeakRSI = currentRSIForTracking;
+                rsiHasPeaked = false;
+                swingLowAfterRSIPeak = null;
+            }
+            if (!rsiHasPeaked && sessionPeakRSI - currentRSIForTracking >= 10.0) {
+                rsiHasPeaked = true;
+                swingLowAfterRSIPeak = price;
+                log.info("[SESSION-STATE] RSI PEAKED at {}, now {} (declined {})",
+                        String.format("%.1f", sessionPeakRSI),
+                        String.format("%.1f", currentRSIForTracking),
+                        String.format("%.1f", sessionPeakRSI - currentRSIForTracking));
+            }
+            if (rsiHasPeaked && swingLowAfterRSIPeak != null && price.compareTo(swingLowAfterRSIPeak) < 0) {
+                swingLowAfterRSIPeak = price;
+            }
+
+            if (currentRSIForTracking < sessionTroughRSI) {
+                sessionTroughRSI = currentRSIForTracking;
+                rsiHasTroughed = false;
+                swingHighAfterRSITrough = null;
+            }
+            if (!rsiHasTroughed && currentRSIForTracking - sessionTroughRSI >= 10.0) {
+                rsiHasTroughed = true;
+                swingHighAfterRSITrough = price;
+                log.info("[SESSION-STATE] RSI TROUGHED at {}, now {} (risen {})",
+                        String.format("%.1f", sessionTroughRSI),
+                        String.format("%.1f", currentRSIForTracking),
+                        String.format("%.1f", currentRSIForTracking - sessionTroughRSI));
+            }
+            if (rsiHasTroughed && swingHighAfterRSITrough != null && price.compareTo(swingHighAfterRSITrough) > 0) {
+                swingHighAfterRSITrough = price;
+            }
+
+
+            // Track VWAP side duration
+            boolean aboveVwap = price.compareTo(vwap) > 0;
+            boolean belowVwap = price.compareTo(vwap) < 0;
+
+            if (aboveVwap) {
+                if (continuousBelowVwapMinutes > 0) {
+                    // Just crossed above — reset
+                    lastVwapCrossTime = LocalDateTime.now(ET_ZONE);
+                    lastVwapCrossPrice = price;
+                    continuousBelowVwapMinutes = 0;
+                    log.info("[SESSION-STATE] VWAP cross UP at ${}", price);
+                }
+                continuousAboveVwapMinutes++;
+            } else if (belowVwap) {
+                if (continuousAboveVwapMinutes > 0) {
+                    lastVwapCrossTime = LocalDateTime.now(ET_ZONE);
+                    lastVwapCrossPrice = price;
+                    continuousAboveVwapMinutes = 0;
+                    log.info("[SESSION-STATE] VWAP cross DOWN at ${}", price);
+                }
+                continuousBelowVwapMinutes++;
+            }
+            // VWAP slope is now computed by updateVwapSlope() using smoothed 5-bar averages
+            // (inline endpoint computation removed — was vulnerable to single-bar spike flips)
+
+            // Count higher-highs / lower-lows on 15-min bars
+            List<MarketData> bars15m = barAggregationService.getRecentBars("QQQ", 30);
+            if (bars15m != null && bars15m.size() >= 10) {
+                int hhCount = 0;
+                int llCount = 0;
+                // Sample every 15th bar (approximate 15-min candles from 1-min bars)
+                for (int i = bars15m.size() - 1; i >= 15; i -= 15) {
+                    MarketData current = bars15m.get(i);
+                    MarketData previous = bars15m.get(i - 15 < 0 ? 0 : i - 15);
+                    if (current.getHigh() != null && previous.getHigh() != null) {
+                        if (current.getHigh().compareTo(previous.getHigh()) > 0 &&
+                                current.getLow().compareTo(previous.getLow()) > 0) {
+                            hhCount++;
+                        }
+                        if (current.getHigh().compareTo(previous.getHigh()) < 0 &&
+                                current.getLow().compareTo(previous.getLow()) < 0) {
+                            llCount++;
+                        }
+                    }
+                }
+                higherHighCount15m = hhCount;
+                lowerLowCount15m = llCount;
+            }
+
+            // ═══════════════════════════════════════════
+            // REGIME CLASSIFICATION (accelerated + exhaustion)
+            // ═══════════════════════════════════════════
+            SessionRegime previousRegime = currentRegime;
+
+            BigDecimal displacement = price.subtract(sessionOpenPrice)
+                    .divide(sessionOpenPrice, 6, RoundingMode.HALF_UP);
+            double displacementPct = displacement.doubleValue();
+            double vwapSlopePerHour = rollingVwapSlope30min.doubleValue() * 2;
+
+            // ACCELERATED: 180 → 60 cycles (~15 min)
+            boolean trendingUp = (displacementPct > 0.01 && continuousAboveVwapMinutes >= 12)
+                    || (vwapSlopePerHour > 0.50 && higherHighCount15m >= 3)
+                    || (continuousAboveVwapMinutes >= 60);   // Was 180
+
+            boolean trendingDown = (displacementPct < -0.01 && continuousBelowVwapMinutes >= 12)
+                    || (vwapSlopePerHour < -0.50 && lowerLowCount15m >= 3)
+                    || (continuousBelowVwapMinutes >= 60);   // Was 180
+
+            // NEW: Exhaustion detection
+            boolean exhaustingUp = false;
+            boolean exhaustingDown = false;
+
+            if ((currentRegime == SessionRegime.TRENDING_UP || currentRegime == SessionRegime.TREND_EXHAUSTING)
+                    && trendingUp) {
+                double currentRSI = ta.getRsi();
+                boolean rsiDeclining = currentRSI < (regimeStartRSI - 15.0);
+                boolean longTrend = continuousAboveVwapMinutes >= 80; // ~20 min
+                if (rsiDeclining && longTrend) {
+                    exhaustingUp = true;
+                    log.info("[REGIME] Trend exhaustion UP: RSI {} → {}, {} cycles",
+                            String.format("%.1f", regimeStartRSI),
+                            String.format("%.1f", currentRSI), continuousAboveVwapMinutes);
+                }
+            }
+            if ((currentRegime == SessionRegime.TRENDING_DOWN || currentRegime == SessionRegime.TREND_EXHAUSTING)
+                    && trendingDown) {
+                double currentRSI = ta.getRsi();
+                boolean rsiRising = currentRSI > (regimeStartRSI + 15.0);
+                boolean longTrend = continuousBelowVwapMinutes >= 80;
+                if (rsiRising && longTrend) {
+                    exhaustingDown = true;
+                    log.info("[REGIME] Trend exhaustion DOWN: RSI {} → {}, {} cycles",
+                            String.format("%.1f", regimeStartRSI),
+                            String.format("%.1f", currentRSI), continuousBelowVwapMinutes);
+                }
+            }
+
+            if (exhaustingUp || exhaustingDown) {
+                currentRegime = SessionRegime.TREND_EXHAUSTING;
+            } else if (trendingUp) {
+                currentRegime = SessionRegime.TRENDING_UP;
+            } else if (trendingDown) {
+                currentRegime = SessionRegime.TRENDING_DOWN;
+            } else {
+                currentRegime = SessionRegime.RANGING;
+            }
+
+            if (currentRegime != previousRegime) {
+                log.info("═══════════════════════════════════════════════════════════════");
+                log.info("[SESSION-STATE] ⚡ REGIME CHANGE: {} → {}", previousRegime, currentRegime);
+                log.info("[SESSION-STATE]   Displacement: {}%, VWAP slope: ${}/hr, HH15m: {}, LL15m: {}",
+                        String.format("%.2f", displacementPct * 100),
+                        String.format("%.2f", vwapSlopePerHour),
+                        higherHighCount15m, lowerLowCount15m);
+                log.info("[SESSION-STATE]   Above VWAP: {} cycles, Below VWAP: {} cycles",
+                        continuousAboveVwapMinutes, continuousBelowVwapMinutes);
+                log.info("═══════════════════════════════════════════════════════════════");
+
+                regimeStartRSI = ta.getRsi();
+
+                if (currentRegime == SessionRegime.TRENDING_DOWN || currentRegime == SessionRegime.TRENDING_UP) {
+                    regimeTrendingStartTime = LocalDateTime.now(ET_ZONE);
+                } else {
+                    regimeTrendingStartTime = null;
+                }
+
+                // Reset continuation counts on direction change
+                if (currentRegime == SessionRegime.RANGING || currentRegime == SessionRegime.TREND_EXHAUSTING) {
+                    trendContinuationCallCount = 0;
+                    trendContinuationPutCount = 0;
+                }
+            }
+
+            // Track consecutive bar closes for VWAP breach detection (unchanged)
+            List<MarketData> latestBars = barAggregationService.getRecentBars("QQQ", 5);
+            if (latestBars != null && !latestBars.isEmpty()) {
+                MarketData lastBar = latestBars.get(latestBars.size() - 1);
+                if (lastBar.getClose() != null && vwap != null) {
+                    if (lastBar.getClose().compareTo(vwap) < 0) {
+                        consecutiveBarsBelow++;
+                        consecutiveBarsAbove = 0;
+                    } else if (lastBar.getClose().compareTo(vwap) > 0) {
+                        consecutiveBarsAbove++;
+                        consecutiveBarsBelow = 0;
+                    }
+                }
+            }
+
+            // Reset breach flag on VWAP cross (unchanged)
+            if (aboveVwap && "DOWN".equals(lastBreachDirection)) {
+                vwapBreachSignalFired = false;
+            }
+            if (belowVwap && "UP".equals(lastBreachDirection)) {
+                vwapBreachSignalFired = false;
+            }
+
+            if (currentRegime != previousRegime) {
+                if (currentRegime == SessionRegime.TRENDING_DOWN || currentRegime == SessionRegime.TRENDING_UP) {
+                    regimeTrendingStartTime = LocalDateTime.now(ET_ZONE);
+                } else {
+                    regimeTrendingStartTime = null;
+                }
+            }
+
+
+            consecutiveBarsBelow = 0;
+            consecutiveBarsAbove = 0;
+
+        } catch (Exception e) {
+            log.debug("[SESSION-STATE] Error updating session state: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Compute rolling VWAP slope from the last 30 bars (30 minutes of 1-min bars).
+     * Slope = (VWAP at current bar - VWAP at bar 30 ago) / 30 minutes.
+     * Result is stored in rollingVwapSlope30min as $/30min.
+     *
+     * A steep slope (>$0.50/30min) means VWAP is trending — price is directional.
+     * A flat slope (<$0.15/30min) means VWAP is flat — price is ranging around fair value.
+     */
+    private void updateVwapSlope(String symbol) {
+        try {
+            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 30);
+            if (recentBars == null || recentBars.size() < 20) {
+                return; // Not enough data yet
+            }
+
+            int size = recentBars.size();
+
+            // Smoothed slope: average VWAP of newest 5 bars vs average VWAP of oldest 5 bars
+            // This prevents a single spike bar from flipping the regime
+            BigDecimal newestSum = BigDecimal.ZERO;
+            int newestCount = 0;
+            for (int i = size - 1; i >= Math.max(0, size - 5); i--) {
+                BigDecimal bv = recentBars.get(i).getVwap();
+                if (bv != null && bv.compareTo(BigDecimal.ZERO) > 0) {
+                    newestSum = newestSum.add(bv);
+                    newestCount++;
+                }
+            }
+
+            BigDecimal oldestSum = BigDecimal.ZERO;
+            int oldestCount = 0;
+            for (int i = 0; i < Math.min(5, size); i++) {
+                BigDecimal bv = recentBars.get(i).getVwap();
+                if (bv != null && bv.compareTo(BigDecimal.ZERO) > 0) {
+                    oldestSum = oldestSum.add(bv);
+                    oldestCount++;
+                }
+            }
+
+            if (newestCount == 0 || oldestCount == 0) return;
+
+            BigDecimal newestAvg = newestSum.divide(BigDecimal.valueOf(newestCount), 4, RoundingMode.HALF_UP);
+            BigDecimal oldestAvg = oldestSum.divide(BigDecimal.valueOf(oldestCount), 4, RoundingMode.HALF_UP);
+
+            // Slope = average of newest 5 VWAP values minus average of oldest 5 VWAP values
+            // A single spike bar contributes only 1/5 of the newest average, not 100%
+            rollingVwapSlope30min = newestAvg.subtract(oldestAvg);
+
+        } catch (Exception e) {
+            log.debug("[VWAP-SLOPE] Error computing slope: {}", e.getMessage());
+        }
+    }
+
     // Add this new inner class to ZeroDTEStrategy
     private class GEXCalculator {
 
@@ -6878,17 +7791,27 @@ public class ZeroDTEStrategy {
     // Add as field in ZeroDTEStrategy
     private final GEXCalculator gexCalculator = new GEXCalculator();
 
-    // Replace existing isGoodTradingTime method
     private boolean isGoodTradingTime(LocalTime now) {
-        // Block dead zone entirely
-        if (now.isAfter(LocalTime.of(13, 0)) && now.isBefore(LocalTime.of(14, 0))) {
+        if (now.isAfter(LocalTime.of(15, 50))) {
             return false;
+        }
+
+        // Dead zone 13:00-14:00: LOWERED volume threshold (was 0.5, now 0.3)
+        if (now.isAfter(LocalTime.of(13, 0)) && now.isBefore(LocalTime.of(14, 0))) {
+            double volRatio = volumeTracker.getVolumeRatio("QQQ");
+            if (volRatio < 0.3) {
+                log.debug("[TIME-GATE] Dead zone — volume ratio {} < 0.3, blocking",
+                        String.format("%.2f", volRatio));
+                return false;
+            }
+            log.info("[TIME-GATE] Dead zone BYPASSED — volume ratio {} >= 0.3",
+                    String.format("%.2f", volRatio));
         }
 
         return (now.isAfter(PRIME_WINDOW_1_START) && now.isBefore(PRIME_WINDOW_1_END)) ||
                 (now.isAfter(PRIME_WINDOW_2_START) && now.isBefore(PRIME_WINDOW_2_END)) ||
                 (now.isAfter(PRIME_WINDOW_3_START) && now.isBefore(PRIME_WINDOW_3_END)) ||
-                (now.isAfter(FINAL_WINDOW_START) && now.isBefore(FINAL_WINDOW_END));
+                (now.isAfter(FINAL_WINDOW_START) && now.isBefore(LocalTime.of(15, 50)));
     }
 
     // Add new method for time-adjusted confidence
@@ -6896,28 +7819,39 @@ public class ZeroDTEStrategy {
         double multiplier = 1.0;
         String window = "UNKNOWN";
 
-        if (now.isAfter(LocalTime.of(10, 15)) && now.isBefore(LocalTime.of(11, 0))) {
+        if (now.isAfter(LocalTime.of(10, 0)) && now.isBefore(LocalTime.of(11, 0))) {
             multiplier = 1.0;
             window = "OPTIMAL";
         } else if (now.isAfter(LocalTime.of(11, 0)) && now.isBefore(LocalTime.of(13, 0))) {
             multiplier = 0.85;
             window = "MIDDAY_LULL";
+        } else if (now.isAfter(LocalTime.of(13, 0)) && now.isBefore(LocalTime.of(14, 0))) {
+            multiplier = 0.90;    // Was 0.80
+            window = "DEAD_ZONE_ACTIVE";
         } else if (now.isAfter(LocalTime.of(14, 0)) && now.isBefore(LocalTime.of(15, 0))) {
             multiplier = 1.0;
             window = "AFTERNOON";
+        } else if (now.isAfter(LocalTime.of(15, 0)) && now.isBefore(LocalTime.of(15, 30))) {
+            multiplier = 0.90;
+            window = "LATE_SESSION";
+        } else if (now.isAfter(LocalTime.of(15, 30)) && now.isBefore(LocalTime.of(15, 45))) {
+            multiplier = 0.85;    // Was 0.80 — power hour boost
+            window = "POWER_HOUR";
+        } else if (now.isAfter(LocalTime.of(15, 45))) {
+            multiplier = 0.65;
+            window = "FINAL_MINUTES";
         } else {
-            multiplier = 0.9;
-            window = "OTHER";
+            multiplier = 0.95;
+            window = "EARLY";
         }
 
         double adjusted = baseConfidence * multiplier;
-
         log.info("[TIME-ADJUST][{}] Window: {}, Base: {}%, Multiplier: {}x, Adjusted: {}%",
                 analysisId, window, (int)(baseConfidence * 100),
                 String.format("%.2f", multiplier), (int)(adjusted * 100));
-
         return adjusted;
     }
+
 
     // ============================================
 // STEP 4: ADD ALL THESE NEW METHODS
@@ -7547,7 +8481,6 @@ public class ZeroDTEStrategy {
                 signal.setPassedPreTradeChecks(true);
             }
 
-            // Apply ML confidence adjustment - FIXED: uses isShouldExecute() getter
             if (integratedBayesianMLSystem != null) {
                 try {
                     IntegratedBayesianMLSystem.IntegratedAnalysisResult mlResult =
@@ -7555,35 +8488,22 @@ public class ZeroDTEStrategy {
 
                     if (mlResult != null && mlResult.getBayesianAnalysis() != null) {
                         IntegratedBayesianMLSystem.BayesianAnalysis bayesianAnalysis = mlResult.getBayesianAnalysis();
-
                         double mlConfidence = bayesianAnalysis.getPosteriorProbability();
- //                       signal.setConfidence(mlConfidence);
+
+                        // Store ML score for diagnostic logging — do NOT modify rule confidence
                         signal.setAdjustedConfidence(mlConfidence);
                         signal.setBayesianProbability(mlConfidence);
 
-                        // FIXED: Use isShouldExecute() getter method
-//                        boolean shouldExecute = bayesianAnalysis.isShouldExecute();
-//                        signal.setPassedBayesianFilter(shouldExecute);
-
-                        log.info("[{}] ML-adjusted confidence: {}%", analysisId, (int)(mlConfidence * 100));
-
-//                        if (!shouldExecute) {
-//                            log.warn("[{}] Signal rejected by Bayesian filter", analysisId);
-//                            signal.setStatus("BAYESIAN_REJECTED");
-//                            return null;
-//                        }
+                        double ruleConfidence = signal.getConfidence();
+                        double divergence = Math.abs(ruleConfidence - mlConfidence);
+                        log.info("[{}] ML DIAGNOSTIC (bypass mode): rule={}%, ML={}%, divergence={}% — rule confidence PRESERVED",
+                                analysisId, (int)(ruleConfidence * 100), (int)(mlConfidence * 100),
+                                (int)(divergence * 100));
                     }
                 } catch (Exception e) {
                     log.error("[{}] Error in ML analysis: {}", analysisId, e.getMessage());
-                    // Continue without ML adjustment
                 }
             }
-
-            // Apply time-based adjustment
-            LocalTime now = LocalTime.now(ET_ZONE);
-            double timeAdjusted = getTimeAdjustedConfidence(signal.getConfidence(), now, analysisId);
-            signal.setConfidence(timeAdjusted);
-            signal.setAdjustedConfidence(timeAdjusted);
 
             return signal;
 
@@ -8193,67 +9113,755 @@ public class ZeroDTEStrategy {
         }
     }
 
+
     /**
-     * Check if price momentum aligns with signal direction
-     * For CALL: last 3 bars should show upward momentum (at least 2 of 3 rising)
-     * For PUT: last 3 bars should show downward momentum (at least 2 of 3 falling)
+     * Enhanced exhaustion score: 4 components, returns score 0-4.
+     * Fixes from Mar 2/Mar 4 backtest:
+     *   1. Volume: waived in low-vol environment (<0.5x avg), checks relative decline instead
+     *   2. RSI divergence: relaxed to allow RSI recovery >8pts while price near low (<0.25%)
+     *   3. Momentum deceleration: new 4th component using velocity collapse ratio
+     *   4. DecliningRange: unchanged (already works)
+     *
+     * Threshold: score >= 3 out of 4 = exhaustion confirmed
      */
-    private boolean checkPriceMomentumAlignment(String symbol, String signalType) {
+    private int checkExhaustionScore(String symbol, String signalType, String analysisId) {
         try {
-            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 4);
-            if (recentBars.size() < 4) {
-                log.warn("[MOMENTUM] Insufficient bars for momentum check");
-                return false;
+            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 8);
+            if (recentBars.size() < 6) {
+                log.warn("[EXHAUSTION-V4][{}] Insufficient bars: {}", analysisId, recentBars.size());
+                return 0;
             }
 
-            // Get last 3 bars (excluding current accumulating bar)
-            List<MarketData> last3Bars = recentBars.subList(recentBars.size() - 3, recentBars.size());
+            // Use last 5 closed bars (skip current accumulating bar)
+            int endIdx = recentBars.size() - 1;
+            LocalDateTime barEnd = recentBars.get(endIdx).getTimestamp().plusMinutes(1);
+            boolean latestClosed = LocalDateTime.now(ET_ZONE).isAfter(barEnd);
+            if (!latestClosed) endIdx--;
+            int startIdx = Math.max(0, endIdx - 4);
+            if (endIdx - startIdx < 4) {
+                log.warn("[EXHAUSTION-V4][{}] Not enough closed bars", analysisId);
+                return 0;
+            }
 
-            if (signalType.equals("CALL")) {
-                // For CALL: expect rising prices
-                int risingBars = 0;
-                for (int i = 1; i < last3Bars.size(); i++) {
-                    if (last3Bars.get(i).getClose() != null &&
-                            last3Bars.get(i-1).getClose() != null &&
-                            last3Bars.get(i).getClose().compareTo(last3Bars.get(i-1).getClose()) > 0) {
-                        risingBars++;
+            // ═══ COMPONENT 1: DECLINING RANGE ═══
+            int decliningRangeCount = 0;
+            for (int i = startIdx + 1; i <= endIdx; i++) {
+                MarketData current = recentBars.get(i);
+                MarketData previous = recentBars.get(i - 1);
+                if (current.getHigh() == null || current.getLow() == null ||
+                        previous.getHigh() == null || previous.getLow() == null) continue;
+
+                BigDecimal currentRange = current.getHigh().subtract(current.getLow());
+                BigDecimal previousRange = previous.getHigh().subtract(previous.getLow());
+                if (currentRange.compareTo(previousRange) < 0) {
+                    decliningRangeCount++;
+                }
+            }
+            boolean decliningRangePass = decliningRangeCount >= 3;
+
+            // ═══ COMPONENT 2: VOLUME (FIXED — low-volume environment waiver) ═══
+            boolean volumePass = false;
+            String volumeReason;
+
+            // Get volume ratio from TechnicalAnalysisService (reliable pipeline)
+            TechnicalAnalysis ta = technicalAnalysisService.analyze(symbol);
+            double currentVolumeRatio = (ta != null) ? ta.getVolumeRatio() : 0.0;
+
+            // Check if we're in a low-volume environment
+            boolean lowVolumeEnvironment = currentVolumeRatio < 0.50;
+
+            if (lowVolumeEnvironment) {
+                // Low-volume environment: waive strict declining-volume check
+                // Instead: check if capitulation bar had higher volume than post-cap bars
+                // (relative decline from an already-low base)
+                Long capBarVolume = recentBars.get(startIdx).getIncrementalVolume();
+                Long latestBarVolume = recentBars.get(endIdx).getIncrementalVolume();
+
+                // Fallback to cumulative difference if incremental is null
+                if ((capBarVolume == null || capBarVolume <= 0) && startIdx > 0) {
+                    Long prev = recentBars.get(startIdx - 1).getVolume();
+                    Long curr = recentBars.get(startIdx).getVolume();
+                    if (prev != null && curr != null) capBarVolume = Math.max(0L, curr - prev);
+                }
+                if ((latestBarVolume == null || latestBarVolume <= 0) && endIdx > 0) {
+                    Long prev = recentBars.get(endIdx - 1).getVolume();
+                    Long curr = recentBars.get(endIdx).getVolume();
+                    if (prev != null && curr != null) latestBarVolume = Math.max(0L, curr - prev);
+                }
+
+                if (capBarVolume != null && latestBarVolume != null && capBarVolume > 0) {
+                    volumePass = capBarVolume > latestBarVolume;
+                    volumeReason = String.format("LOW-ENV WAIVED (ratio=%.2fx, capIncrVol=%d > latestIncrVol=%d = %s)",
+                            currentVolumeRatio, capBarVolume, latestBarVolume, volumePass ? "yes" : "no");
+                }
+            } else {
+                // Normal volume environment: use existing declining-volume check
+                int decliningVolumeCount = 0;
+                for (int i = startIdx + 1; i <= endIdx; i++) {
+                    MarketData current = recentBars.get(i);
+                    MarketData previous = recentBars.get(i - 1);
+
+                    // Use incremental volume (per-bar), not cumulative daily volume
+                    Long currentIncVol = current.getIncrementalVolume();
+                    Long previousIncVol = previous.getIncrementalVolume();
+
+                    // Fallback: compute incremental from cumulative difference
+                    if ((currentIncVol == null || currentIncVol <= 0) && i > 0) {
+                        if (current.getVolume() != null && previous.getVolume() != null) {
+                            currentIncVol = Math.max(0L, current.getVolume() - previous.getVolume());
+                        }
+                    }
+                    if ((previousIncVol == null || previousIncVol <= 0) && i > 1) {
+                        MarketData beforePrev = recentBars.get(i - 2);
+                        if (previous.getVolume() != null && beforePrev.getVolume() != null) {
+                            previousIncVol = Math.max(0L, previous.getVolume() - beforePrev.getVolume());
+                        }
+                    }
+
+                    if (currentIncVol != null && previousIncVol != null &&
+                            currentIncVol > 0 && previousIncVol > 0 &&
+                            currentIncVol < previousIncVol) {
+                        decliningVolumeCount++;
                     }
                 }
 
-                // At least 2 of 3 bars rising
-                boolean momentumAligned = risingBars <= 1;
-
-                log.info("[MOMENTUM] CALL momentum check: {}/2 rising bars needed - {}",
-                        risingBars, momentumAligned ? "PASS" : "FAIL");
-
-                return momentumAligned;
-
-            } else if (signalType.equals("PUT")) {
-                // For PUT: expect falling prices
-                int fallingBars = 0;
-                for (int i = 1; i < last3Bars.size(); i++) {
-                    if (last3Bars.get(i).getClose() != null &&
-                            last3Bars.get(i-1).getClose() != null &&
-                            last3Bars.get(i).getClose().compareTo(last3Bars.get(i-1).getClose()) < 0) {
-                        fallingBars++;
-                    }
-                }
-
-                // At least 2 of 3 bars falling
-                boolean momentumAligned = fallingBars <= 1;
-
-                log.info("[MOMENTUM] PUT momentum check: {}/2 falling bars needed - {}",
-                        fallingBars, momentumAligned ? "PASS" : "FAIL");
-
-                return momentumAligned;
+                volumePass = decliningVolumeCount >= 3;
+                volumeReason = String.format("STANDARD (%d/4 declining)", decliningVolumeCount);
             }
 
-            return false;
+            // ═══ COMPONENT 3: RSI DIVERGENCE (FIXED — relaxed definition) ═══
+            boolean rsiDivergencePass = false;
+            String rsiDivReason = "no data";
+
+            if (ta != null && ta.getRsi() > 0) {
+                double currentRsi = ta.getRsi();
+                BigDecimal currentPrice = ta.getCurrentPrice();
+
+                if ("CALL".equals(signalType)) {
+                    // FIXED: Two paths to confirm bullish divergence:
+                    // Path A (original): price at/near session low with RSI above trough
+                    // Path B (new): RSI has recovered 8+ points from recent trough while price
+                    //   is within session_range * 3% of the low (not strict $0.20)
+
+                    BigDecimal sessionRange = sessionHighPrice.subtract(sessionLowPrice);
+                    BigDecimal proximityThreshold = sessionRange.compareTo(new BigDecimal("1.00")) > 0
+                            ? sessionRange.multiply(new BigDecimal("0.03"))
+                            : new BigDecimal("0.30");
+
+                    // Path A: price near session low
+                    boolean nearSessionLow = recentBars.get(endIdx).getLow() != null &&
+                            recentBars.get(endIdx).getLow().compareTo(
+                                    sessionLowPrice.add(proximityThreshold)) <= 0;
+
+                    // Path B: RSI recovery > 8 points while price still within 0.25% of recent low
+                    double rsiRecovery = currentRsi - sessionTroughRSI;
+                    boolean rsiRecoveredStrong = rsiRecovery > 8.0;
+
+                    BigDecimal recentLow = getRecentLow(recentBars, 5);
+                    boolean priceNearRecentLow = false;
+                    if (recentLow != null && currentPrice != null && recentLow.compareTo(BigDecimal.ZERO) > 0) {
+                        double pctFromLow = currentPrice.subtract(recentLow).abs()
+                                .divide(recentLow, 6, RoundingMode.HALF_UP).doubleValue() * 100;
+                        priceNearRecentLow = pctFromLow < 0.25;
+                    }
+
+                    if (nearSessionLow && currentRsi > 30) {
+                        rsiDivergencePass = true;
+                        rsiDivReason = String.format("PATH-A: near session low + RSI %.1f > 30", currentRsi);
+                    } else if (rsiRecoveredStrong && priceNearRecentLow) {
+                        rsiDivergencePass = true;
+                        rsiDivReason = String.format("PATH-B: RSI recovery +%.1f pts, price within 0.25%% of low",
+                                rsiRecovery);
+                    } else if (rsiRecoveredStrong) {
+                        // Relaxed: even if price isn't near low, 8+ pt RSI recovery is meaningful
+                        rsiDivergencePass = true;
+                        rsiDivReason = String.format("PATH-C: RSI recovery +%.1f pts (strong)", rsiRecovery);
+                    } else {
+                        rsiDivReason = String.format("FAIL: RSI recovery +%.1f pts (need >8), nearLow=%s",
+                                rsiRecovery, nearSessionLow);
+                    }
+
+                } else if ("PUT".equals(signalType)) {
+                    // Mirror logic for PUT
+                    BigDecimal sessionRange = sessionHighPrice.subtract(sessionLowPrice);
+                    BigDecimal proximityThreshold = sessionRange.compareTo(new BigDecimal("1.00")) > 0
+                            ? sessionRange.multiply(new BigDecimal("0.03"))
+                            : new BigDecimal("0.30");
+
+                    boolean nearSessionHigh = recentBars.get(endIdx).getHigh() != null &&
+                            recentBars.get(endIdx).getHigh().compareTo(
+                                    sessionHighPrice.subtract(proximityThreshold)) >= 0;
+
+                    double rsiDecline = sessionPeakRSI - currentRsi;
+                    boolean rsiDeclinedStrong = rsiDecline > 8.0;
+
+                    if (nearSessionHigh && currentRsi < 70) {
+                        rsiDivergencePass = true;
+                        rsiDivReason = String.format("PATH-A: near session high + RSI %.1f < 70", currentRsi);
+                    } else if (rsiDeclinedStrong) {
+                        rsiDivergencePass = true;
+                        rsiDivReason = String.format("PATH-B: RSI decline -%.1f pts from peak", rsiDecline);
+                    } else {
+                        rsiDivReason = String.format("FAIL: RSI decline -%.1f pts (need >8), nearHigh=%s",
+                                rsiDecline, nearSessionHigh);
+                    }
+                }
+            }
+
+            // ═══ COMPONENT 4: MOMENTUM DECELERATION (NEW) ═══
+            boolean momentumDecelerationPass = false;
+            String momDecelReason = "no data";
+
+            double collapseRatio = momentumTracker.getVelocityCollapseRatio(symbol, 8);
+            double peakVel = momentumTracker.getPeakVelocity(symbol, 8);
+
+            if (collapseRatio > 3.0) {
+                // >70% collapse from peak
+                momentumDecelerationPass = true;
+                momDecelReason = String.format("PASS: collapse ratio %.1fx (peak=%.4f%%)", collapseRatio, peakVel * 100);
+            } else if (collapseRatio > 1.5) {
+                // >40% collapse — pass if momentum is also slowing
+                MomentumVelocity mv = momentumTracker.calculateVelocity(symbol);
+                if (mv != null && (mv.getState() == VelocityState.WEAKENING_BEARISH
+                        || mv.getState() == VelocityState.WEAKENING_BULLISH
+                        || mv.getState() == VelocityState.COILING)) {
+                    momentumDecelerationPass = true;
+                    momDecelReason = String.format("PASS: collapse %.1fx + state=%s", collapseRatio, mv.getState());
+                } else {
+                    momDecelReason = String.format("FAIL: collapse %.1fx but state=%s",
+                            collapseRatio, mv != null ? mv.getState() : "null");
+                }
+            } else if (collapseRatio > 0) {
+                momDecelReason = String.format("FAIL: collapse ratio %.1fx < 1.5 (need >3.0)", collapseRatio);
+            }
+
+            // ═══ SCORE ═══
+            int exhaustionScore = 0;
+            if (decliningRangePass) exhaustionScore++;
+            if (volumePass) exhaustionScore++;
+            if (rsiDivergencePass) exhaustionScore++;
+            if (momentumDecelerationPass) exhaustionScore++;
+
+            boolean exhaustionConfirmed = exhaustionScore >= 3;
+
+//            log.info("[EXHAUSTION-V4][{}] DeclRange: {}/4 {} | Volume: {} {} | RSI Divg: {} | MomDecel: {} → Score: {}/4 → {}",
+//                    symbol,
+//                    decliningRangeCount, decliningRangePass ? "✓" : "✗",
+//                    volumeReason, volumePass ? "✓" : "✗",
+//                    rsiDivReason,
+//                    momDecelReason,
+//                    exhaustionScore, exhaustionConfirmed ? "PASS" : "FAIL");
+
+            return exhaustionScore;
 
         } catch (Exception e) {
-            log.error("[MOMENTUM] Error checking price momentum: {}", e.getMessage());
-            return false;
+            log.error("[EXHAUSTION-V4][{}] Error: {}", analysisId, e.getMessage());
+            return 0;
         }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════
+// METHOD 1: checkADRExhaustionReversal
+// Place this after checkExhaustionScore (~line 9330) or anywhere in the private methods section
+// ══════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * PRO TRADER SIGNAL: ADR Exhaustion Reversal
+     *
+     * A 20-year 0DTE QQQ vet doesn't wait for RSI to hit 20 or bars to show declining range.
+     * They see that the day's total move (gap + intraday) has consumed the average daily range,
+     * and price is stabilizing at an extreme. The move is done — not because of bar-level
+     * exhaustion patterns, but because there's simply no range left.
+     *
+     * This catches setups like Mar 9 09:55: $9 gap down + $3.45 intraday selloff = $12.45 total,
+     * which is 118% of ADR. RSI was 48 (not extreme), bars weren't declining (expanding selloff),
+     * but the move was over because sellers had nowhere left to go.
+     *
+     * Components (all must pass):
+     *   1. Total range (including gap) has consumed significant portion of ADR
+     *   2. Price is at an extreme of the day's range (near LOD for CALL, near HOD for PUT)
+     *   3. Price is stabilizing (not making new extremes — 3+ bars holding above LOD or below HOD)
+     *   4. At least 1/3 leaders confirming the reversal direction
+     *   5. Gap must exist and be in the direction of the selloff (gap down for CALL, gap up for PUT)
+     *
+     * Uses existing infrastructure:
+     *   - totalRangeRatio (already computed in analyzeOptions)
+     *   - sessionLowPrice, sessionHighPrice (session tracking)
+     *   - barAggregationService.getRecentBars()
+     *   - checkLeadersForDirection()
+     *   - buildAndRouteSignal()
+     *   - analyzeGapConditions() / ta.getPreviousClose()
+     */
+    private List<Signal> checkADRExhaustionReversal(String symbol, TechnicalAnalysis ta, BigDecimal atr,
+                                                    BigDecimal currentPrice, BigDecimal vwap, double rsi,
+                                                    double totalRangeRatio, double moveFromLOD, double moveFromHOD,
+                                                    boolean priceBelowVWAP, boolean priceAboveVWAP, String analysisId) {
+        List<Signal> signals = new ArrayList<>();
+
+        try {
+            // ═══ GATE 1: Gap must exist ═══
+            GapAnalysis gap = analyzeGapConditions(ta);
+            if (gap == null || Math.abs(gap.getGapPercentage()) < 0.005) {
+                return signals; // No meaningful gap — this isn't an ADR exhaustion day
+            }
+
+            // ═══ GATE 2: Total range consumed relative to ADR ═══
+            // Include the gap in the total move calculation
+            double gapSize = 0;
+            if (ta.getPreviousClose() != null) {
+                gapSize = Math.abs(sessionOpenPrice.subtract(ta.getPreviousClose()).doubleValue());
+            }
+            double totalMoveWithGap = (sessionHighPrice.subtract(sessionLowPrice).doubleValue()) + gapSize;
+            double totalMoveRatio = totalMoveWithGap / averageDailyRange;
+
+            // The move must have consumed a meaningful portion of ADR
+            // On a $10.50 ADR day, consuming $8+ (76%) with gap means the trend leg is likely done
+            if (totalMoveRatio < 0.70) {
+                log.debug("[ADR-EXHAUST][{}] Total move ratio {}% < 70% — not enough range consumed",
+                        analysisId, String.format("%.0f", totalMoveRatio * 100));
+                return signals;
+            }
+
+            // ═══ GATE 3: Price at extreme + correct gap direction ═══
+            boolean callSetup = false;
+            boolean putSetup = false;
+
+            BigDecimal sessionRange = sessionHighPrice.subtract(sessionLowPrice);
+            if (sessionRange.doubleValue() < 1.0) return signals; // Too narrow
+
+            double pctFromLOD = moveFromLOD / sessionRange.doubleValue();
+            double pctFromHOD = moveFromHOD / sessionRange.doubleValue();
+
+            // CALL: Gap down day, price near LOD (bottom 25% of range)
+            if (gap.getGapPercentage() < -0.005 && pctFromLOD < 0.25) {
+                callSetup = true;
+            }
+            // PUT: Gap up day, price near HOD (top 25% of range)
+            if (gap.getGapPercentage() > 0.005 && pctFromHOD < 0.25) {
+                putSetup = true;
+            }
+
+            if (!callSetup && !putSetup) {
+                return signals;
+            }
+
+            // ═══ GATE 4: Price stabilizing (not making new extremes) ═══
+            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 8);
+            if (recentBars == null || recentBars.size() < 5) return signals;
+
+            boolean stabilized = false;
+            if (callSetup) {
+                // Last 3 bars should NOT be making new session lows
+                int barsAboveLow = 0;
+                BigDecimal recentLow = getRecentLow(recentBars, recentBars.size());
+                for (int bi = recentBars.size() - 1; bi >= Math.max(0, recentBars.size() - 4); bi--) {
+                    if (recentBars.get(bi).getClose() != null && recentLow != null &&
+                            recentBars.get(bi).getClose().compareTo(recentLow.add(new BigDecimal("0.15"))) > 0) {
+                        barsAboveLow++;
+                    }
+                }
+                stabilized = barsAboveLow >= 3;
+            } else {
+                // PUT: last 3 bars NOT making new session highs
+                int barsBelowHigh = 0;
+                BigDecimal recentHigh = getRecentHigh(recentBars, recentBars.size());
+                for (int bi = recentBars.size() - 1; bi >= Math.max(0, recentBars.size() - 4); bi--) {
+                    if (recentBars.get(bi).getClose() != null && recentHigh != null &&
+                            recentBars.get(bi).getClose().compareTo(recentHigh.subtract(new BigDecimal("0.15"))) < 0) {
+                        barsBelowHigh++;
+                    }
+                }
+                stabilized = barsBelowHigh >= 3;
+            }
+
+            if (!stabilized) {
+                log.debug("[ADR-EXHAUST][{}] Price not stabilized at extreme", analysisId);
+                return signals;
+            }
+
+            // ═══ GATE 5: Leader confirmation ═══
+            String signalType = callSetup ? "CALL" : "PUT";
+            int leadersConfirming = checkLeadersForDirection(symbol, signalType);
+            if (leadersConfirming < 1) {
+                log.info("[ADR-EXHAUST][{}] Only {}/3 leaders confirming {} — need minimum 1",
+                        analysisId, leadersConfirming, signalType);
+                return signals;
+            }
+
+            // ═══ ALL GATES PASSED — GENERATE SIGNAL ═══
+            log.info("═══════════════════════════════════════════════════════════════");
+            log.info("[ADR-EXHAUST][{}] ⚡ {} ADR EXHAUSTION REVERSAL — totalMove={}% ADR, gap={}%, " +
+                            "pctFromExtreme={}%, stabilized=true, leaders={}/3",
+                    analysisId, signalType,
+                    totalMoveRatio * 100, gap.getGapPercentage() * 100,
+                    callSetup ? pctFromLOD * 100 : pctFromHOD * 100,
+                    leadersConfirming);
+            log.info("[ADR-EXHAUST][{}] Price=${}, VWAP=${}, RSI={}, LOD=${}, HOD=${}",
+                    analysisId, currentPrice, vwap, rsi, sessionLowPrice, sessionHighPrice);
+            log.info("═══════════════════════════════════════════════════════════════");
+
+            // Target: VWAP (mean reversion)
+            BigDecimal target = vwap;
+
+            // Stop: beyond the session extreme
+            BigDecimal stop;
+            if (callSetup) {
+                stop = sessionLowPrice.subtract(atr.multiply(new BigDecimal("0.3")));
+            } else {
+                stop = sessionHighPrice.add(atr.multiply(new BigDecimal("0.3")));
+            }
+
+            signals = buildAndRouteSignal(symbol, signalType, currentPrice, target, stop,
+                    leadersConfirming, ta, "ADR_EXHAUSTION_REVERSAL_" + (callSetup ? "UP" : "DOWN"), analysisId);
+
+        } catch (Exception e) {
+            log.error("[ADR-EXHAUST][{}] Error: {}", analysisId, e.getMessage());
+        }
+
+        return signals;
+    }
+
+    private List<Signal> checkCompressionBreakout(String symbol, TechnicalAnalysis ta, BigDecimal atr,
+                                                  BigDecimal currentPrice, BigDecimal vwap, double rsi,
+                                                  boolean priceAboveVWAP, boolean priceBelowVWAP,
+                                                  String analysisId) {
+        List<Signal> signals = new ArrayList<>();
+
+        try {
+            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 25);
+            if (recentBars == null || recentBars.size() < 20) return signals;
+
+            // ═══ GATE 1: Identify compression zone from bars 5-20 (skip last 5 for breakout) ═══
+            int compStart = Math.max(0, recentBars.size() - 20);
+            int compEnd = recentBars.size() - 5;
+            if (compEnd <= compStart) return signals;
+
+            BigDecimal compHigh = BigDecimal.ZERO;
+            BigDecimal compLow = new BigDecimal("9999");
+            long compVolumeSum = 0;
+            int compBarCount = 0;
+
+            for (int i = compStart; i < compEnd; i++) {
+                MarketData bar = recentBars.get(i);
+                if (bar.getHigh() != null && bar.getLow() != null) {
+                    if (bar.getHigh().compareTo(compHigh) > 0) compHigh = bar.getHigh();
+                    if (bar.getLow().compareTo(compLow) < 0) compLow = bar.getLow();
+                }
+                Long incVol = bar.getIncrementalVolume();
+                if (incVol != null && incVol > 0) {
+                    compVolumeSum += incVol;
+                    compBarCount++;
+                }
+            }
+
+            BigDecimal compRange = compHigh.subtract(compLow);
+
+            // Compression range must be narrow relative to ATR
+            // A tight consolidation is less than 50% of ATR
+            if (compRange.compareTo(atr.multiply(new BigDecimal("0.50"))) > 0) {
+                log.debug("[COMPRESSION][{}] Range ${} > 50% ATR ${} — not compressed",
+                        analysisId, compRange, atr.multiply(new BigDecimal("0.50")));
+                return signals;
+            }
+
+            // ═══ GATE 2: Volume surge on breakout bars ═══
+            double avgCompVolume = compBarCount > 0 ? (double) compVolumeSum / compBarCount : 0;
+            if (avgCompVolume <= 0) return signals;
+
+            // Check last 3 bars for volume surge
+            boolean volumeSurge = false;
+            for (int i = recentBars.size() - 3; i < recentBars.size(); i++) {
+                Long incVol = recentBars.get(i).getIncrementalVolume();
+                if (incVol != null && incVol > avgCompVolume * 1.5) {
+                    volumeSurge = true;
+                    break;
+                }
+            }
+
+            if (!volumeSurge) {
+                log.debug("[COMPRESSION][{}] No volume surge on breakout bars", analysisId);
+                return signals;
+            }
+
+            // ═══ GATE 3: Price has broken out of compression range ═══
+            boolean breakoutUp = currentPrice.compareTo(compHigh) > 0;
+            boolean breakoutDown = currentPrice.compareTo(compLow) < 0;
+
+            if (!breakoutUp && !breakoutDown) {
+                return signals; // Still inside compression
+            }
+
+            // ═══ GATE 4: Breakout direction aligns with VWAP side ═══
+            boolean callBreakout = breakoutUp && priceAboveVWAP;
+            boolean putBreakout = breakoutDown && priceBelowVWAP;
+
+            if (!callBreakout && !putBreakout) {
+                return signals;
+            }
+
+            String signalType = callBreakout ? "CALL" : "PUT";
+
+            // ═══ GATE 5: Leader confirmation (2/3 minimum for breakout) ═══
+            int leadersConfirming = checkLeadersForDirection(symbol, signalType);
+            if (leadersConfirming < 2) {
+                log.info("[COMPRESSION][{}] Only {}/3 leaders confirming {} breakout — need 2",
+                        analysisId, leadersConfirming, signalType);
+                return signals;
+            }
+
+            // ═══ ALL GATES PASSED — GENERATE SIGNAL ═══
+            log.info("═══════════════════════════════════════════════════════════════");
+            log.info("[COMPRESSION][{}] ⚡ {} COMPRESSION BREAKOUT — compRange={}, " +
+                            "breakout {} above compHigh {}, volSurge=true, leaders={}/3",
+                    analysisId, signalType,
+                    compRange, currentPrice, compHigh, leadersConfirming);
+            log.info("[COMPRESSION][{}] Price=${}, VWAP=${}, RSI={}, compBars={}",
+                    analysisId, currentPrice, vwap, rsi, compEnd - compStart);
+            log.info("═══════════════════════════════════════════════════════════════");
+
+            // Target: HOD + ATR extension for CALL, LOD - ATR extension for PUT
+            BigDecimal target;
+            BigDecimal stop;
+            if (callBreakout) {
+                target = sessionHighPrice.add(atr.multiply(new BigDecimal("0.5")));
+                stop = compLow.subtract(new BigDecimal("0.30"));
+            } else {
+                target = sessionLowPrice.subtract(atr.multiply(new BigDecimal("0.5")));
+                stop = compHigh.add(new BigDecimal("0.30"));
+            }
+
+            signals = buildAndRouteSignal(symbol, signalType, currentPrice, target, stop,
+                    leadersConfirming, ta, "COMPRESSION_BREAKOUT_" + (callBreakout ? "UP" : "DOWN"), analysisId);
+
+        } catch (Exception e) {
+            log.error("[COMPRESSION][{}] Error: {}", analysisId, e.getMessage());
+        }
+
+        return signals;
+    }
+
+    /**
+     * VWAP CROSS SIGNAL — Primary directional signal
+     *
+     * A pro 0DTE QQQ trader trades one thing: the moment price crosses VWAP with conviction.
+     * Not the departure. Not the continuation. Not the pullback. Just the cross.
+     *
+     * What makes a cross "with conviction":
+     *   1. Price actually crosses from one side to the other (detected in recent bars)
+     *   2. RSI accelerates in the cross direction (>10 point change in 3 bars)
+     *   3. Volume confirms participation (volume ratio > 0.8)
+     *   4. Leaders confirm the direction (at least 2/3)
+     *
+     * Mar 10 validation:
+     *   10:22-10:23: Price crosses above VWAP. RSI jumps 45→64 (+19 in 2 bars). Vol 1.29x. → CALL +$2.99
+     *   13:34-13:38: Price crosses below VWAP. RSI drops 62→30 (-32 in 4 bars). Vol 1.31x. → PUT +$1.76
+     *   15:21-15:27: Price crosses below VWAP. RSI drops 62→41 (-21 in 6 bars). Vol. → PUT +$2.01
+     *   14:15: NO cross — price already below VWAP and falling. System gave 97%. This method gives nothing.
+     *
+     * @param callDebounceOk true if CALL signals are allowed (15min since last CALL)
+     * @param putDebounceOk true if PUT signals are allowed (15min since last PUT)
+     */
+    private List<Signal> checkVWAPCrossSignal(String symbol, TechnicalAnalysis ta, BigDecimal atr,
+                                              BigDecimal currentPrice, BigDecimal vwap, double currentRsi,
+                                              boolean callDebounceOk, boolean putDebounceOk,
+                                              String analysisId) {
+        List<Signal> signals = new ArrayList<>();
+
+        try {
+            // Get recent bars for cross detection and RSI acceleration
+            List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 10);
+            if (recentBars == null || recentBars.size() < 6) return signals;
+
+            // Also get RSI history for acceleration measurement
+            List<RSIReading> rsiHistory = rsiTracker.getRSIHistory(symbol);
+
+            // ═══ STEP 1: Detect VWAP cross in last 5 bars ═══
+            // Find the most recent bar where price side flipped relative to VWAP
+            int crossBarIndex = -1;
+            String crossDirection = null; // "CALL" if crossed above, "PUT" if crossed below
+
+            // Need VWAP per bar — use the session VWAP (it moves slowly, close enough)
+            // Compare each bar's close to VWAP
+            for (int i = recentBars.size() - 1; i >= Math.max(1, recentBars.size() - 5); i--) {
+                MarketData curr = recentBars.get(i);
+                MarketData prev = recentBars.get(i - 1);
+
+                if (curr.getClose() == null || prev.getClose() == null || vwap == null) continue;
+
+                boolean currAbove = curr.getClose().compareTo(vwap) > 0;
+                boolean prevBelow = prev.getClose().compareTo(vwap) <= 0;
+                boolean currBelow = curr.getClose().compareTo(vwap) < 0;
+                boolean prevAbove = prev.getClose().compareTo(vwap) >= 0;
+
+                if (currAbove && prevBelow) {
+                    crossBarIndex = i;
+                    crossDirection = "CALL";
+                    break;
+                }
+                if (currBelow && prevAbove) {
+                    crossBarIndex = i;
+                    crossDirection = "PUT";
+                    break;
+                }
+            }
+
+            if (crossBarIndex < 0 || crossDirection == null) {
+                return signals; // No cross in last 5 bars
+            }
+
+            // Check debounce for this direction
+            if ("CALL".equals(crossDirection) && !callDebounceOk) return signals;
+            if ("PUT".equals(crossDirection) && !putDebounceOk) return signals;
+
+            // ═══ STEP 2: Confirm price is holding on the new side ═══
+            // After the cross, price should still be on the cross side
+            boolean stillOnCrossSide;
+            if ("CALL".equals(crossDirection)) {
+                stillOnCrossSide = currentPrice.compareTo(vwap) > 0;
+            } else {
+                stillOnCrossSide = currentPrice.compareTo(vwap) < 0;
+            }
+            if (!stillOnCrossSide) {
+                log.debug("[VWAP-CROSS][{}] Cross detected at bar {} but price reverted", analysisId, crossBarIndex);
+                return signals;
+            }
+
+            // ═══ STEP 2B: VWAP SLOPE REGIME CHECK ═══
+            // If VWAP is sloping steeply, only fire in the slope direction.
+            // If VWAP is flat, suppress VWAP_CROSS entirely (crosses are noise on flat VWAP).
+            double slopeValue = rollingVwapSlope30min.doubleValue();
+            double absSlope = Math.abs(slopeValue);
+
+            if (absSlope < 0.15) {
+                // FLAT VWAP — crosses are noise, price is oscillating around fair value
+                // Suppress VWAP_CROSS. Let mean-reversion (MR-SIGNAL) or reversal paths handle it.
+                log.info("[VWAP-CROSS][{}] SUPPRESSED — VWAP slope {}/30m is FLAT (<$0.15). " +
+                                "Crosses are noise in ranging market. Direction: {}",
+                        analysisId, String.format("%.2f", slopeValue), crossDirection);
+                return signals;
+            }
+
+            // STEEP VWAP — only fire in the slope direction
+            boolean slopeBullish = slopeValue > 0.15;   // VWAP rising → bullish trend
+            boolean slopeBearish = slopeValue < -0.15;   // VWAP falling → bearish trend
+
+            if ("CALL".equals(crossDirection) && slopeBearish) {
+                // CALL cross against a bearish VWAP slope — counter-trend, suppress
+                log.info("[VWAP-CROSS][{}] SUPPRESSED — CALL cross against bearish slope {}/30m",
+                        analysisId, String.format("%.2f", slopeValue));
+                return signals;
+            }
+            if ("PUT".equals(crossDirection) && slopeBullish) {
+                // PUT cross against a bullish VWAP slope — counter-trend, suppress
+                log.info("[VWAP-CROSS][{}] SUPPRESSED — PUT cross against bullish slope {}/30m",
+                        analysisId, String.format("%.2f", slopeValue));
+                return signals;
+            }
+
+            // Log the slope for signals that pass
+            log.info("[VWAP-CROSS][{}] VWAP slope {}/30m — {} is aligned with slope",
+                    analysisId, String.format("%.2f", slopeValue), crossDirection);
+
+            // ═══ STEP 3: RSI acceleration confirms conviction ═══
+            // Measure RSI change over the last 3-4 bars
+            // RSI should have moved significantly in the cross direction
+            double rsiAtCross = 50.0; // default
+            double rsiNow = currentRsi;
+
+            // Try to get RSI from a few bars before the cross
+            if (rsiHistory != null && rsiHistory.size() >= 4) {
+                // History is newest-first, so index 3 = 3 readings ago
+                rsiAtCross = rsiHistory.get(Math.min(3, rsiHistory.size() - 1)).rsi;
+            } else {
+                // Fallback: estimate from bar data if available
+                // Use the RSI at the bar before the cross if we can get it
+                // Since we don't have per-bar RSI in MarketData, use the RSI history tracker
+                return signals; // Can't confirm acceleration without RSI history
+            }
+
+            double rsiChange = rsiNow - rsiAtCross;
+            double absRsiChange = Math.abs(rsiChange);
+
+            // CALL cross: RSI should be rising (positive change)
+            // PUT cross: RSI should be falling (negative change)
+            boolean rsiConfirms = false;
+            if ("CALL".equals(crossDirection) && rsiChange > 10.0) {
+                rsiConfirms = true;
+            } else if ("PUT".equals(crossDirection) && rsiChange < -10.0) {
+                rsiConfirms = true;
+            }
+
+            if (!rsiConfirms) {
+                log.debug("[VWAP-CROSS][{}] {} cross but RSI change only {} (need >10 in cross direction)",
+                        analysisId, crossDirection, String.format("%.1f", rsiChange));
+                return signals;
+            }
+
+            // ═══ STEP 4: Volume confirms participation ═══
+            double volumeRatio = (ta != null) ? ta.getVolumeRatio() : 0.0;
+            if (volumeRatio < 0.8) {
+                log.debug("[VWAP-CROSS][{}] {} cross but volume {}x < 0.8 threshold",
+                        analysisId, crossDirection, String.format("%.2f", volumeRatio));
+                return signals;
+            }
+
+            // ═══ STEP 5: Leader confirmation ═══
+            int leadersConfirming = checkLeadersForDirection(symbol, crossDirection);
+            if (leadersConfirming < 2) {
+                log.info("[VWAP-CROSS][{}] {} cross — RSI {} change, vol {}x — but only {}/3 leaders",
+                        analysisId, crossDirection, String.format("%.1f", rsiChange), String.format("%.2f", volumeRatio), leadersConfirming);
+                return signals;
+            }
+
+            // ═══ ALL GATES PASSED — GENERATE SIGNAL ═══
+            BigDecimal vwapDist = currentPrice.subtract(vwap).abs();
+
+            log.info("═══════════════════════════════════════════════════════════════");
+            log.info("[VWAP-CROSS][{}] VWAP slope: {}/30m (regime: {})",
+                    analysisId, String.format("%.2f", slopeValue),
+                    absSlope > 0.50 ? "STRONG_TREND" :
+                            absSlope > 0.15 ? "TRENDING" : "FLAT");
+            log.info("[VWAP-CROSS][{}] Price=${}, VWAP=${}, Dist=${}, RSI={}",
+                    analysisId, currentPrice, vwap,
+                    vwapDist.setScale(2, RoundingMode.HALF_UP), currentRsi);
+            log.info("[VWAP-CROSS][{}] RSI acceleration: {} → {} ({} in ~3 bars)",
+                    analysisId, String.format("%.1f", rsiAtCross), String.format("%.1f", rsiNow), String.format("%+.1f", rsiChange));
+            log.info("[VWAP-CROSS][{}] Volume: {}x | Leaders: {}/3",
+                    analysisId, String.format("%.2f", volumeRatio), leadersConfirming);
+            log.info("═══════════════════════════════════════════════════════════════");
+
+            // Target: use existing ADR-aware target calculation
+            BigDecimal target = calculateADRAwareTarget(currentPrice, crossDirection,
+                    "VWAP_CROSS_" + (crossDirection.equals("CALL") ? "UP" : "DOWN"),
+                    vwap, atr, analysisId);
+
+            // Stop: other side of VWAP by 0.5 × ATR
+            BigDecimal stop;
+            if ("CALL".equals(crossDirection)) {
+                stop = vwap.subtract(atr.multiply(new BigDecimal("0.5")));
+            } else {
+                stop = vwap.add(atr.multiply(new BigDecimal("0.5")));
+            }
+
+            signals = buildAndRouteSignal(symbol, crossDirection, currentPrice, target, stop,
+                    leadersConfirming, ta,
+                    "VWAP_CROSS_" + (crossDirection.equals("CALL") ? "UP" : "DOWN"),
+                    analysisId);
+
+        } catch (Exception e) {
+            log.error("[VWAP-CROSS][{}] Error: {}", analysisId, e.getMessage());
+        }
+
+        return signals;
+    }
+
+    /**
+     * Backward-compatible wrapper: returns boolean like the old method.
+     * Calls the new score-based method internally.
+     */
+    private boolean checkPriceMomentumAlignment(String symbol, String signalType) {
+        int score = checkExhaustionScore(symbol, signalType, symbol);
+        return score >= 4;  // V5: All 4 components mandatory for exhaustion reversal
     }
 
     /**
@@ -8362,16 +9970,25 @@ public class ZeroDTEStrategy {
                     // because that suggests divergence, not sector-wide dip
                     // =====================================================================
 
-                    boolean isOversold = leaderRSI < 45;
-                    boolean isBelowVwap = distanceFromVwap < -0.001;  // Below by 0.1%+
+                    boolean isOversold = leaderRSI < 35;  // Tightened from 45
+                    boolean isBelowVwap = distanceFromVwap < -0.003;  // Tightened from -0.001
+                    boolean isNeutralCall = leaderRSI >= 40 && leaderRSI <= 60 && Math.abs(distanceFromVwap) < 0.003;
+
+                    if (isNeutralCall) {
+                        confirms = false;
+                        confirmReason = String.format("NEUTRAL — RSI %.1f, VWAP dist %.2f%%", leaderRSI, distanceFromVwap * 100);
+                        continue;
+                    }
                     boolean isNearVwap = Math.abs(distanceFromVwap) < 0.003;  // Within 0.3%
                     boolean isNotOverbought = leaderRSI < 55;
                     boolean isClearlyBullish = leaderRSI > 60 && distanceFromVwap > 0.002;
 
                     if (isClearlyBullish) {
-                        // Leader diverging bullish - doesn't confirm CALL
-                        confirms = false;
-                        confirmReason = "diverging bullish";
+                        // V3: Leader is bullish (above VWAP, RSI > 60) — this CONFIRMS the CALL direction
+                        // A leader that is already bullish is the strongest evidence a CALL move is real.
+                        // Previous logic incorrectly tagged this as "diverging" and rejected it.
+                        confirms = true;
+                        confirmReason = String.format("bullish-aligned (RSI %.1f, dist %.2f%%)", leaderRSI, distanceFromVwap * 100);
                     } else if (isOversold) {
                         confirms = true;
                         confirmReason = String.format("RSI oversold (%.1f < 45)", leaderRSI);
@@ -8398,16 +10015,29 @@ public class ZeroDTEStrategy {
                     // because that suggests divergence, not sector-wide extension
                     // =====================================================================
 
-                    boolean isOverbought = leaderRSI > 55;
-                    boolean isAboveVwap = distanceFromVwap > 0.001;  // Above by 0.1%+
-                    boolean isNearVwap = Math.abs(distanceFromVwap) < 0.003;  // Within 0.3%
+                    boolean isOverbought = leaderRSI > 65;  // Tightened from 55
+                    boolean isAboveVwap = distanceFromVwap > 0.003;  // Tightened from 0.001
+                    boolean isNearVwap = Math.abs(distanceFromVwap) < 0.002;  // Tightened from 0.003
                     boolean isNotOversold = leaderRSI > 45;
                     boolean isClearlyBearish = leaderRSI < 40 && distanceFromVwap < -0.002;
+                    boolean isNeutral = leaderRSI >= 40 && leaderRSI <= 60 && Math.abs(distanceFromVwap) < 0.003;
+
+                    // NEUTRAL leaders do not count as confirming OR opposing
+                    if (isNeutral) {
+                        confirms = false;
+                        confirmReason = String.format("NEUTRAL — RSI %.1f, VWAP dist %.2f%% (no opinion)", leaderRSI, distanceFromVwap * 100);
+                        log.info("[LEADERS] ◯ {} is NEUTRAL for {} — skipping (RSI: {}, Dist: {}%)",
+                                leader, signalType, String.format("%.1f", leaderRSI), String.format("%.2f", distanceFromVwap * 100));
+                        // Note: does NOT increment confirming — effectively reduces the denominator
+                        continue; // Skip to next leader
+                    }
 
                     if (isClearlyBearish) {
-                        // Leader diverging bearish - doesn't confirm PUT
-                        confirms = false;
-                        confirmReason = "diverging bearish";
+                        // V3: Leader is bearish (below VWAP, RSI < 40) — this CONFIRMS the PUT direction
+                        // A leader already positioned bearish is the strongest evidence a PUT move is real.
+                        // Previous logic incorrectly tagged this as "diverging" and rejected it.
+                        confirms = true;
+                        confirmReason = String.format("bearish-aligned (RSI %.1f, dist %.2f%%)", leaderRSI, distanceFromVwap * 100);
                     } else if (isOverbought && isAboveVwap) {
                         confirms = true;
                         confirmReason = String.format("RSI overbought (%.1f > 55) + above VWAP", leaderRSI);
@@ -8439,6 +10069,42 @@ public class ZeroDTEStrategy {
             }
         }
 
+        // ═══ Track leader opposition streaks ═══
+        for (String leader : leaders) {
+            String streakKey = leader + "_" + signalType;
+            try {
+                TechnicalAnalysis leaderTA = technicalAnalysisService.analyze(leader);
+                if (leaderTA == null) continue;
+
+                double leaderDist = 0;
+                if (leaderTA.getVwap() != null && leaderTA.getVwap().compareTo(BigDecimal.ZERO) > 0) {
+                    leaderDist = leaderTA.getCurrentPrice().subtract(leaderTA.getVwap())
+                            .divide(leaderTA.getVwap(), 6, RoundingMode.HALF_UP).doubleValue();
+                }
+
+                boolean isOpposingThisCycle = false;
+                if ("PUT".equals(signalType) && leaderDist < -0.002 && leaderTA.getRsi() < 40) {
+                    isOpposingThisCycle = true; // Leader is bearish while we want PUT (counter-trend)
+                }
+                if ("CALL".equals(signalType) && leaderDist > 0.002 && leaderTA.getRsi() > 60) {
+                    isOpposingThisCycle = true; // Leader is bullish while we want CALL from below (not exhausting)
+                }
+
+                if (isOpposingThisCycle) {
+                    leaderOppositionStreaks.merge(streakKey, 1, Integer::sum);
+                } else {
+                    leaderOppositionStreaks.put(streakKey, 0);
+                }
+
+                int streak = leaderOppositionStreaks.getOrDefault(streakKey, 0);
+                if (streak >= 20) { // 20 cycles × 15s = 5 minutes persistent opposition
+                    log.warn("[LEADERS-PERSISTENCE] ⚠ {} has opposed {} for {} consecutive cycles — hard penalty active",
+                            leader, signalType, streak);
+                }
+            } catch (Exception e) {
+                // ignore
+            }
+        }
         return confirming;
     }
 
@@ -8593,16 +10259,11 @@ public class ZeroDTEStrategy {
     }
 
     /**
-     * Calculate dynamic confidence based on signal quality factors.
-     * Replaces hardcoded 0.85 confidence with factor-based calculation.
-     *
-     * Factors:
-     * - Target distance: $1.00-$2.00 ideal (+15%), <$1.00 penalty (-5%)
-     * - Leader confirmations: 3/3 (+15%), 2/3 (+8%)
-     * - Candle net alignment: 4/4 (+15%), 3/4 (+10%), 2/4 (+5%), 0-1 (-5%)
-     * - RSI extremity: oversold CALL / overbought PUT (+5% to +10%)
-     * - Volume ratio: >1.5x (+10%), >1.2x (+5%), <0.8x (-5%)
-     * - VWAP distance: 0.05%-0.15% ideal (+5%), >0.30% (-3%)
+     * Calculate dynamic signal confidence (V4).
+     * Changes from V3:
+     *   - Volume < 0.20x now penalizes -10% (was -5%)
+     *   - New exhaustion quality factor for EXHAUSTION/CAPITULATION signals
+     *   - Exhaustion score embedded in strategy name: "INTRADAY_CAPITULATION_UP" or "EXHAUSTION_REVERSAL_UP"
      *
      * @return confidence between 0.40 and 0.95
      */
@@ -8611,6 +10272,9 @@ public class ZeroDTEStrategy {
             TechnicalAnalysis ta,
             int leaderConfirmations,
             Map<String, Double> candleNets,
+            BigDecimal todayHigh,
+            BigDecimal todayLow,
+            double barCloseBonus,
             String analysisId) {
 
         try {
@@ -8618,36 +10282,20 @@ public class ZeroDTEStrategy {
             StringBuilder reasoning = new StringBuilder();
             reasoning.append("[CONFIDENCE-CALC][").append(analysisId).append("] ");
 
-            // FACTOR 1: Target Distance
-            double targetDistanceBonus = 0.0;
-            if (signal.getTargetPrice() != null && signal.getEntryPrice() != null) {
-                BigDecimal targetDistance = signal.getTargetPrice().subtract(signal.getEntryPrice()).abs();
-                double distanceValue = targetDistance.doubleValue();
-
-                if (distanceValue >= 1.00 && distanceValue <= 2.00) {
-                    targetDistanceBonus = 0.15;
-                } else if (distanceValue > 2.00 && distanceValue <= 3.00) {
-                    targetDistanceBonus = 0.10;
-                } else if (distanceValue < 1.00) {
-                    targetDistanceBonus = -0.05;
-                } else {
-                    targetDistanceBonus = 0.05;
-                }
-                reasoning.append(String.format("TargetDist=$%.2f→%+.0f%% | ", distanceValue, targetDistanceBonus * 100));
-            }
-
-            // FACTOR 2: Leader Confirmations
+            // FACTOR 1: Leader Confirmations
             double leaderBonus = 0.0;
             if (leaderConfirmations >= 3) {
                 leaderBonus = 0.15;
             } else if (leaderConfirmations == 2) {
                 leaderBonus = 0.08;
+            } else if (leaderConfirmations == 1) {
+                leaderBonus = 0.02;
             } else {
                 leaderBonus = -0.05;
             }
             reasoning.append(String.format("Leaders=%d/3→%+.0f%% | ", leaderConfirmations, leaderBonus * 100));
 
-            // FACTOR 3: Candle Net Alignment
+            // FACTOR 2: Candle Net Alignment
             double candleNetBonus = 0.0;
             if (candleNets != null && !candleNets.isEmpty()) {
                 String signalType = signal.getSignalType();
@@ -8657,76 +10305,85 @@ public class ZeroDTEStrategy {
                 for (Map.Entry<String, Double> entry : candleNets.entrySet()) {
                     double netValue = entry.getValue();
                     totalMagnitude += Math.abs(netValue);
-
                     boolean aligned = ("CALL".equals(signalType) && netValue > 0) ||
                             ("PUT".equals(signalType) && netValue < 0);
-                    if (aligned) {
-                        alignedCount++;
-                    }
+                    if (aligned) alignedCount++;
                 }
 
-                if (alignedCount >= 4) {
-                    candleNetBonus = 0.15;
-                } else if (alignedCount == 3) {
-                    candleNetBonus = 0.10;
-                } else if (alignedCount == 2) {
-                    candleNetBonus = 0.05;
-                } else {
-                    candleNetBonus = -0.05;
-                }
+                if (alignedCount >= 4) candleNetBonus = 0.15;
+                else if (alignedCount == 3) candleNetBonus = 0.10;
+                else if (alignedCount == 2) candleNetBonus = 0.05;
+                else candleNetBonus = -0.05;
 
                 double avgMagnitude = candleNets.size() > 0 ? totalMagnitude / candleNets.size() : 0;
-                if (avgMagnitude > 0.30) {
-                    candleNetBonus += 0.05;
-                }
+                if (avgMagnitude > 0.30) candleNetBonus += 0.05;
                 reasoning.append(String.format("CandleAlign=%d/%d,Mag=%.2f→%+.0f%% | ",
                         alignedCount, candleNets.size(), avgMagnitude, candleNetBonus * 100));
             } else {
                 reasoning.append("CandleNets=N/A→+0% | ");
             }
 
-            // FACTOR 4: RSI Extremity
+            // FACTOR 3: RSI Extremity
             double rsiBonus = 0.0;
             if (ta != null && ta.getRsi() > 0) {
                 double rsi = ta.getRsi();
                 String signalType = signal.getSignalType();
 
                 if ("CALL".equals(signalType)) {
-                    if (rsi <= 25) {
-                        rsiBonus = 0.10;
-                    } else if (rsi <= 35) {
-                        rsiBonus = 0.05;
-                    } else if (rsi >= 55) {
-                        rsiBonus = -0.05;
-                    }
+                    if (rsi <= 25) rsiBonus = 0.10;
+                    else if (rsi <= 35) rsiBonus = 0.05;
+                    else if (rsi >= 55) rsiBonus = -0.05;
                 } else if ("PUT".equals(signalType)) {
-                    if (rsi >= 75) {
-                        rsiBonus = 0.10;
-                    } else if (rsi >= 65) {
-                        rsiBonus = 0.05;
-                    } else if (rsi <= 45) {
-                        rsiBonus = -0.05;
-                    }
+                    if (rsi >= 75) rsiBonus = 0.10;
+                    else if (rsi >= 65) rsiBonus = 0.05;
+                    else if (rsi <= 45) rsiBonus = -0.05;
                 }
                 reasoning.append(String.format("RSI=%.1f→%+.0f%% | ", rsi, rsiBonus * 100));
             }
 
-            // FACTOR 5: Volume Ratio
+            // FACTOR 4: Volume Ratio — UPDATED: heavier penalty for dead volume
             double volumeBonus = 0.0;
             if (ta != null && ta.getVolumeRatio() > 0) {
                 double volumeRatio = ta.getVolumeRatio();
+                BigDecimal currentPrice = ta.getCurrentPrice();
+                String signalType = signal.getSignalType();
 
-                if (volumeRatio >= 1.5) {
-                    volumeBonus = 0.10;
-                } else if (volumeRatio >= 1.2) {
-                    volumeBonus = 0.05;
-                } else if (volumeRatio < 0.8) {
-                    volumeBonus = -0.05;
+                boolean nearHOD = false;
+                boolean nearLOD = false;
+
+                if (todayHigh != null && currentPrice != null &&
+                        todayHigh.compareTo(BigDecimal.ZERO) > 0) {
+                    BigDecimal distToHOD = todayHigh.subtract(currentPrice).abs()
+                            .divide(todayHigh, 6, RoundingMode.HALF_UP);
+                    nearHOD = distToHOD.doubleValue() < 0.0020;
                 }
-                reasoning.append(String.format("Volume=%.2fx→%+.0f%% | ", volumeRatio, volumeBonus * 100));
+                if (todayLow != null && currentPrice != null &&
+                        todayLow.compareTo(BigDecimal.ZERO) > 0) {
+                    BigDecimal distToLOD = currentPrice.subtract(todayLow).abs()
+                            .divide(todayLow, 6, RoundingMode.HALF_UP);
+                    nearLOD = distToLOD.doubleValue() < 0.0020;
+                }
+
+                if ("PUT".equals(signalType) && nearHOD) {
+                    if (volumeRatio < 0.5) volumeBonus = 0.08;
+                    else if (volumeRatio > 1.2) volumeBonus = -0.08;
+                    reasoning.append(String.format("Volume=%.2fx@HOD→%+.0f%% | ", volumeRatio, volumeBonus * 100));
+                } else if ("CALL".equals(signalType) && nearLOD) {
+                    if (volumeRatio < 0.5) volumeBonus = 0.08;
+                    else if (volumeRatio > 1.2) volumeBonus = -0.08;
+                    reasoning.append(String.format("Volume=%.2fx@LOD→%+.0f%% | ", volumeRatio, volumeBonus * 100));
+                } else {
+                    // Mid-range — UPDATED penalties
+                    if (volumeRatio >= 1.5) volumeBonus = 0.10;
+                    else if (volumeRatio >= 1.2) volumeBonus = 0.05;
+                    else if (volumeRatio < 0.20) volumeBonus = -0.10;   // V4: was -0.05, now -0.10 for dead volume
+                    else if (volumeRatio < 0.50) volumeBonus = -0.05;
+                    else volumeBonus = 0.0;
+                    reasoning.append(String.format("Volume=%.2fx→%+.0f%% | ", volumeRatio, volumeBonus * 100));
+                }
             }
 
-            // FACTOR 6: VWAP Distance
+            // FACTOR 5: VWAP Distance
             double vwapBonus = 0.0;
             if (ta != null && ta.getVwap() != null && ta.getCurrentPrice() != null
                     && ta.getVwap().compareTo(BigDecimal.ZERO) > 0) {
@@ -8734,17 +10391,88 @@ public class ZeroDTEStrategy {
                 BigDecimal vwapDistancePercent = vwapDistance.divide(ta.getVwap(), 6, RoundingMode.HALF_UP);
                 double distPct = vwapDistancePercent.doubleValue() * 100;
 
-                if (distPct >= 0.05 && distPct <= 0.15) {
-                    vwapBonus = 0.05;
-                } else if (distPct > 0.30) {
-                    vwapBonus = -0.03;
-                }
+                if (distPct >= 0.05 && distPct <= 0.15) vwapBonus = 0.05;
+                else if (distPct > 0.30) vwapBonus = -0.03;
                 reasoning.append(String.format("VWAPDist=%.2f%%→%+.0f%% | ", distPct, vwapBonus * 100));
             }
 
+            // FACTOR 6: Bar Close Confirmation
+            reasoning.append(String.format("BarClose→%+.0f%% | ", barCloseBonus * 100));
+
+            // FACTOR 7: Duration Decay
+            double durationDecay = 0.0;
+            String signalDir = signal.getSignalType();
+            if ("PUT".equals(signalDir) && continuousAboveVwapMinutes > 0) {
+                long minutesAbove = continuousAboveVwapMinutes / 4;
+                if (minutesAbove > 90) durationDecay = -0.20;
+                else if (minutesAbove > 60) durationDecay = -0.15;
+                else if (minutesAbove > 30) durationDecay = -0.10;
+                else if (minutesAbove > 15) durationDecay = -0.05;
+                reasoning.append(String.format("DurationDecay(PUT,%dmin)→%+.0f%% | ", minutesAbove, durationDecay * 100));
+            } else if ("CALL".equals(signalDir) && continuousBelowVwapMinutes > 0) {
+                long minutesBelow = continuousBelowVwapMinutes / 4;
+                if (minutesBelow > 90) durationDecay = -0.20;
+                else if (minutesBelow > 60) durationDecay = -0.15;
+                else if (minutesBelow > 30) durationDecay = -0.10;
+                else if (minutesBelow > 15) durationDecay = -0.05;
+                reasoning.append(String.format("DurationDecay(CALL,%dmin)→%+.0f%% | ", minutesBelow, durationDecay * 100));
+            }
+
+            // FACTOR 8: Leader Persistence Penalty
+            double persistencePenalty = 0.0;
+            for (String leader : LEADER_STOCKS) {
+                String streakKey = leader + "_" + signal.getSignalType();
+                int streak = leaderOppositionStreaks.getOrDefault(streakKey, 0);
+                if (streak >= 20) {
+                    double leaderWeight = LEADER_WEIGHTS.getOrDefault(leader, 0.2);
+                    persistencePenalty -= 0.15 * leaderWeight;
+                    reasoning.append(String.format("LeaderPersistence(%s,%dcycles)→%+.0f%% | ",
+                            leader, streak, -15.0 * leaderWeight));
+                }
+            }
+
+            // FACTOR 9 (NEW): Exhaustion Quality — for EXHAUSTION/CAPITULATION signals
+            double exhaustionBonus = 0.0;
+            String strategy = signal.getStrategy() != null ? signal.getStrategy() : "";
+            if (strategy.contains("EXHAUSTION") || strategy.contains("CAPITULATION")) {
+                if (strategy.contains("CAPITULATION")) {
+                    // CAPITULATION signals use independent gates (velocity + trough RSI + cap volume)
+                    // They already passed strict gates, so give a flat bonus
+                    exhaustionBonus = 0.10;
+                    reasoning.append(String.format("CapQuality→+%.0f%% | ", exhaustionBonus * 100));
+                } else {
+                    // EXHAUSTION signals use the 4/4 scoring system
+                    int exhScore = checkExhaustionScore("QQQ", signal.getSignalType(), analysisId + "_conf");
+                    if (exhScore >= 4) exhaustionBonus = 0.15;       // perfect exhaustion
+                    else if (exhScore >= 3) exhaustionBonus = 0.05;  // good but missing one component
+                    else exhaustionBonus = -0.10;                    // shouldn't happen with 4/4 gate, but safety net
+                    reasoning.append(String.format("ExhQuality=%d/4→%+.0f%% | ", exhScore, exhaustionBonus * 100));
+                }
+            }
+
+            // RSI Acceleration bonus for VWAP_CROSS signals
+            if (strategy.contains("VWAP_CROSS")) {
+                // The cross was already validated with >10pt RSI acceleration
+                // Give additional bonus for stronger acceleration
+                List<RSIReading> rsiHist = rsiTracker.getRSIHistory("QQQ");
+                if (rsiHist != null && rsiHist.size() >= 4) {
+                    double recentRsi = rsiHist.get(0).rsi;
+                    double olderRsi = rsiHist.get(3).rsi;
+                    double accel = Math.abs(recentRsi - olderRsi);
+                    double accelBonus = 0.0;
+                    if (accel > 20) accelBonus = 0.15;
+                    else if (accel > 15) accelBonus = 0.10;
+                    else if (accel > 10) accelBonus = 0.05;
+                    reasoning.append(String.format("RSIAccel=%.0f→%+.0f%% | ", accel, accelBonus * 100));
+                    exhaustionBonus += accelBonus; // Reuse the variable, it gets added to final
+                }
+            }
+
+
             // FINAL CALCULATION
-            double finalConfidence = baseConfidence + targetDistanceBonus + leaderBonus
-                    + candleNetBonus + rsiBonus + volumeBonus + vwapBonus;
+            double finalConfidence = baseConfidence + leaderBonus + candleNetBonus + rsiBonus
+                    + volumeBonus + vwapBonus + barCloseBonus + durationDecay
+                    + persistencePenalty + exhaustionBonus;
 
             finalConfidence = Math.max(0.40, Math.min(0.95, finalConfidence));
 
@@ -8758,6 +10486,150 @@ public class ZeroDTEStrategy {
             return 0.70;
         }
     }
+
+
+    public static class BarCloseConfirmation {
+        public boolean isValid;
+        public boolean isBarClosed;
+        public double wickRejectionBonus;
+        public String reason;
+        public MarketData confirmationBar;
+
+        public BarCloseConfirmation() {
+            this.isValid = false;
+            this.isBarClosed = false;
+            this.wickRejectionBonus = 0.0;
+            this.reason = "";
+            this.confirmationBar = null;
+        }
+    }
+
+    /**
+     * NEW: Validate bar close and direction alignment before signal generation
+     *
+     * Rules:
+     * - Only generate signals after bar closes (not mid-bar)
+     * - PUT signal requires last closed bar to be RED (close < open)
+     * - CALL signal requires last closed bar to be GREEN (close > open)
+     * - Wick rejection adds confidence bonus
+     *
+     * @param recentBars List of recent bars (minimum 2 required)
+     * @param signalType "PUT" or "CALL"
+     * @param analysisId Tracking ID for logging
+     * @return BarCloseConfirmation with validation result and bonus
+     */
+    private BarCloseConfirmation validateBarCloseConfirmation(List<MarketData> recentBars,
+                                                              String signalType,
+                                                              String analysisId) {
+        BarCloseConfirmation result = new BarCloseConfirmation();
+
+        if (recentBars == null || recentBars.size() < 2) {
+            result.reason = "Insufficient bars for confirmation";
+            log.warn("[BAR-CLOSE][{}] ❌ {}", analysisId, result.reason);
+            return result;
+        }
+
+        MarketData latestBar = recentBars.get(recentBars.size() - 1);
+        MarketData previousBar = recentBars.get(recentBars.size() - 2);
+
+        // Check if latest bar is closed (timestamp + 1 minute < now)
+        LocalDateTime now = LocalDateTime.now(ET_ZONE);
+        LocalDateTime barTimestamp = latestBar.getTimestamp();
+        LocalDateTime barEndTime = barTimestamp.plusMinutes(1);
+
+        boolean isBarClosed = now.isAfter(barEndTime);
+        result.isBarClosed = isBarClosed;
+
+        // Select the appropriate bar for confirmation
+        MarketData confirmationBar;
+        if (isBarClosed) {
+            confirmationBar = latestBar;
+            log.debug("[BAR-CLOSE][{}] Using latest closed bar at {}", analysisId, barTimestamp);
+        } else {
+            confirmationBar = previousBar;
+            log.info("[BAR-CLOSE][{}] Current bar incomplete ({}), using previous closed bar",
+                    analysisId, barTimestamp);
+        }
+        result.confirmationBar = confirmationBar;
+
+        // Validate bar has required data
+        if (confirmationBar.getOpen() == null || confirmationBar.getClose() == null ||
+                confirmationBar.getHigh() == null || confirmationBar.getLow() == null) {
+            result.reason = "Confirmation bar missing OHLC data";
+            log.warn("[BAR-CLOSE][{}] ❌ {}", analysisId, result.reason);
+            return result;
+        }
+
+        BigDecimal barOpen = confirmationBar.getOpen();
+        BigDecimal barClose = confirmationBar.getClose();
+        BigDecimal barHigh = confirmationBar.getHigh();
+        BigDecimal barLow = confirmationBar.getLow();
+
+        boolean isGreenBar = barClose.compareTo(barOpen) > 0;
+        boolean isRedBar = barClose.compareTo(barOpen) < 0;
+        boolean isDoji = barClose.compareTo(barOpen) == 0;
+
+        log.info("[BAR-CLOSE][{}] Bar: O=${}, H=${}, L=${}, C=${} → {}",
+                analysisId, barOpen, barHigh, barLow, barClose,
+                isGreenBar ? "GREEN" : (isRedBar ? "RED" : "DOJI"));
+
+        // HARD REJECT: Bar direction must align with signal
+        if (signalType.equals("PUT") && isGreenBar) {
+            result.reason = "PUT signal but last bar is GREEN - direction mismatch";
+            result.isValid = false;
+            log.info("[BAR-CLOSE][{}] ❌ REJECTED - {}", analysisId, result.reason);
+            return result;
+        }
+
+        if (signalType.equals("CALL") && isRedBar) {
+            result.reason = "CALL signal but last bar is RED - direction mismatch";
+            result.isValid = false;
+            log.info("[BAR-CLOSE][{}] ❌ REJECTED - {}", analysisId, result.reason);
+            return result;
+        }
+
+        // Bar direction aligned - calculate wick rejection bonus
+        BigDecimal bodySize = barClose.subtract(barOpen).abs();
+        BigDecimal upperWick = barHigh.subtract(barClose.max(barOpen));
+        BigDecimal lowerWick = barClose.min(barOpen).subtract(barLow);
+
+        // Ensure we don't divide by zero
+        if (bodySize.compareTo(BigDecimal.ZERO) == 0) {
+            bodySize = new BigDecimal("0.01");  // Doji bar
+        }
+
+        double wickRejectionBonus = 0.0;
+
+        if (signalType.equals("PUT") && upperWick.compareTo(bodySize) > 0) {
+            // PUT with upper wick rejection (sellers pushed back)
+            wickRejectionBonus = 0.05;
+            log.info("[BAR-CLOSE][{}] ✓ Upper wick rejection detected (wick: ${}, body: ${}) → +5%",
+                    analysisId, upperWick.setScale(2, RoundingMode.HALF_UP),
+                    bodySize.setScale(2, RoundingMode.HALF_UP));
+        } else if (signalType.equals("CALL") && lowerWick.compareTo(bodySize) > 0) {
+            // CALL with lower wick rejection (buyers pushed back)
+            wickRejectionBonus = 0.05;
+            log.info("[BAR-CLOSE][{}] ✓ Lower wick rejection detected (wick: ${}, body: ${}) → +5%",
+                    analysisId, lowerWick.setScale(2, RoundingMode.HALF_UP),
+                    bodySize.setScale(2, RoundingMode.HALF_UP));
+        } else if ((signalType.equals("PUT") && isRedBar) || (signalType.equals("CALL") && isGreenBar)) {
+            // Bar direction aligned without significant wick
+            wickRejectionBonus = 0.03;
+            log.info("[BAR-CLOSE][{}] ✓ Bar direction aligned → +3%", analysisId);
+        } else if (isDoji) {
+            // Doji - neutral, no bonus
+            wickRejectionBonus = 0.0;
+            log.info("[BAR-CLOSE][{}] ✓ Doji bar - neutral → +0%", analysisId);
+        }
+
+        result.isValid = true;
+        result.wickRejectionBonus = wickRejectionBonus;
+        result.reason = "Bar close confirmation passed";
+        log.info("[BAR-CLOSE][{}] ✓ PASSED - Bonus: +{}%", analysisId, (int)(wickRejectionBonus * 100));
+
+        return result;
+    }
+
 
 //    /**
 //     * Validate that target distance is sufficient for profitable trade
@@ -8803,5 +10675,639 @@ public class ZeroDTEStrategy {
 //
 //        return originalTarget;
 //    }
+
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PART 5: checkVwapBreachSignal() — REPLACE ENTIRE METHOD (around line 9519)
+    // Changes:
+    //   - 3 consecutive bars → 2 of 3 bars confirming
+    //   - Volume threshold 0.8 → 0.6
+    //   - Already called from relaxed regime gate in analyzeOptionsInternal
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    private List<Signal> checkVwapBreachSignal(String symbol, TechnicalAnalysis ta,
+                                               BigDecimal atr, String analysisId) {
+        List<Signal> signals = new ArrayList<>();
+        BigDecimal currentPrice = ta.getCurrentPrice();
+        BigDecimal vwap = ta.getVwap();
+
+        List<MarketData> recentBars = barAggregationService.getRecentBars(symbol, 5);
+        if (recentBars == null || recentBars.size() < 3) return signals;
+
+        // RELAXED: 2-of-3 bars (was 3/3 consecutive)
+        int closesBelow = 0;
+        int closesAbove = 0;
+        for (int i = Math.max(0, recentBars.size() - 3); i < recentBars.size(); i++) {
+            MarketData bar = recentBars.get(i);
+            if (bar.getClose() != null && vwap != null) {
+                if (bar.getClose().compareTo(vwap) < 0) closesBelow++;
+                if (bar.getClose().compareTo(vwap) > 0) closesAbove++;
+            }
+        }
+
+        // 2 of 3 bars confirming (was 3 of 3)
+        boolean breachDown = closesBelow >= 2 && currentPrice.compareTo(vwap) < 0;
+        boolean breachUp = closesAbove >= 2 && currentPrice.compareTo(vwap) > 0;
+
+        if (!breachDown && !breachUp) return signals;
+
+        String direction = breachDown ? "DOWN" : "UP";
+
+        // Debounce: one breach signal per direction per session
+        if (direction.equals(lastBreachDirection) && vwapBreachSignalFired) {
+            return signals;
+        }
+
+        // Debounce: no trend signal within 5 minutes
+        if (lastTrendSignalTime != null &&
+                lastTrendSignalTime.isAfter(LocalDateTime.now(ET_ZONE).minusMinutes(5))) {
+            return signals;
+        }
+
+        {
+            double moveFromLOD = currentPrice.subtract(sessionLowPrice).doubleValue();
+            double moveFromHOD = sessionHighPrice.subtract(currentPrice).doubleValue();
+            double bullDirBreach = moveFromLOD / averageDailyRange;
+            double bearDirBreach = moveFromHOD / averageDailyRange;
+
+            if (breachUp && bearDirBreach > 0.01 && bullDirBreach > 0.01) {
+                double sessionRatio = bearDirBreach / bullDirBreach;
+                if (sessionRatio > 2.0) {
+                    log.info("[VWAP-BREACH][{}] ⛔ CALL breach blocked — counter-session-trend " +
+                                    "(bear {}%/bull {}% = {}:1)", analysisId,
+                            String.format("%.0f", bearDirBreach * 100),
+                            String.format("%.0f", bullDirBreach * 100),
+                            String.format("%.1f", sessionRatio));
+                    return signals;
+                }
+            }
+            if (breachDown && bullDirBreach > 0.01 && bearDirBreach > 0.01) {
+                double sessionRatio = bullDirBreach / bearDirBreach;
+                if (sessionRatio > 2.0) {
+                    log.info("[VWAP-BREACH][{}] ⛔ PUT breach blocked — counter-session-trend " +
+                                    "(bull {}%/bear {}% = {}:1)", analysisId,
+                            String.format("%.0f", bullDirBreach * 100),
+                            String.format("%.0f", bearDirBreach * 100),
+                            String.format("%.1f", sessionRatio));
+                    return signals;
+                }
+            }
+
+            // V3: Block breach signals when signal-direction already consumed >80% of ADR
+            if (breachDown && bearDirBreach > 0.80) {
+                log.info("[VWAP-BREACH][{}] ⛔ PUT breach blocked — bearDir {}% > 80% (no room to run)",
+                        analysisId, String.format("%.0f", bearDirBreach * 100));
+                return signals;
+            }
+            if (breachUp && bullDirBreach > 0.80) {
+                log.info("[VWAP-BREACH][{}] ⛔ CALL breach blocked — bullDir {}% > 80% (no room to run)",
+                        analysisId, String.format("%.0f", bullDirBreach * 100));
+                return signals;
+            }
+        }
+
+        // V3: Dynamic volume gate — lower threshold in first 90 minutes when VWAP volume
+        // averages haven't built up yet. Morning breakouts routinely show 0.15-0.55x ratios
+        // because the denominator (average volume) is inflated by later-session activity.
+        double volRatio = ta.getVolumeRatio();
+        LocalTime breachTime = LocalTime.now(ET_ZONE);
+        double volumeThreshold = 0.6;  // Default
+        if (breachTime.isBefore(LocalTime.of(11, 0))) {
+            volumeThreshold = 0.3;  // First 90 min: lower gate for morning breakouts
+        }
+        if (volRatio < volumeThreshold) {
+            log.info("[VWAP-BREACH][{}] Breach {} but volume {} < {} — skipping",
+                    analysisId, direction, String.format("%.2f", volRatio),
+                    String.format("%.1f", volumeThreshold));
+            return signals;
+        }
+
+        // Leader confirmation: 2/3
+        String signalType = breachDown ? "PUT" : "CALL";
+        int leadersConfirming = checkLeadersForDirection(symbol, signalType);
+        if (leadersConfirming < 2) {
+            log.info("[VWAP-BREACH][{}] Breach {} but only {}/3 leaders — skipping",
+                    analysisId, direction, leadersConfirming);
+            return signals;
+        }
+
+        log.info("═══════════════════════════════════════════════════════════════");
+        log.info("[VWAP-BREACH][{}] ⚡ VWAP BREACH {} DETECTED (2-of-3 bars)", analysisId, direction);
+        log.info("[VWAP-BREACH][{}] Price: ${}, VWAP: ${}, Volume: {}x, Leaders: {}/3",
+                analysisId, currentPrice, vwap, String.format("%.2f", volRatio), leadersConfirming);
+        log.info("═══════════════════════════════════════════════════════════════");
+
+        BigDecimal targetPrice;
+        BigDecimal stopLoss;
+
+        if (breachDown) {
+            targetPrice = calculateADRAwareTarget(currentPrice, "PUT",
+                    "VWAP_BREACH_DOWN", vwap, atr, analysisId);
+            stopLoss = vwap.add(new BigDecimal("0.30"));
+        } else {
+            targetPrice = calculateADRAwareTarget(currentPrice, "CALL",
+                    "VWAP_BREACH_UP", vwap, atr, analysisId);
+            stopLoss = vwap.subtract(new BigDecimal("0.30"));
+        }
+
+        BigDecimal targetDistAbs = targetPrice.subtract(currentPrice).abs();
+        if (targetDistAbs.compareTo(new BigDecimal("0.50")) < 0) {
+            log.info("[VWAP-BREACH][{}] Target too close (${})", analysisId, targetDistAbs);
+            return signals;
+        }
+
+
+        signals = buildAndRouteSignal(symbol, signalType, currentPrice, targetPrice, stopLoss,
+                leadersConfirming, ta, "VWAP_BREACH_" + direction, analysisId);
+
+        if (!signals.isEmpty()) {
+            vwapBreachSignalFired = true;
+            lastBreachDirection = direction;
+            lastTrendSignalTime = LocalDateTime.now(ET_ZONE);
+        }
+
+        return signals;
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PART 6: checkTrendFollowingPullback() — REPLACE ENTIRE METHOD (around line 9635)
+    // Changes:
+    //   - Pullback distance: 0.3% → 0.5% (wider zone to catch entries)
+    //   - Volume: 0.5 → 0.3 (less restrictive)
+    //   - Added TREND_EXHAUSTING regime support
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    private List<Signal> checkTrendFollowingPullback(String symbol, TechnicalAnalysis ta,
+                                                     BigDecimal atr, String analysisId) {
+        List<Signal> signals = new ArrayList<>();
+        BigDecimal currentPrice = ta.getCurrentPrice();
+        BigDecimal vwap = ta.getVwap();
+        BigDecimal distFromVwap = currentPrice.subtract(vwap).abs();
+
+        double distPct = distFromVwap.divide(vwap, 6, RoundingMode.HALF_UP).doubleValue();
+        if (distPct > 0.005) {
+            return signals;
+        }
+
+        if (lastTrendSignalTime != null &&
+                lastTrendSignalTime.isAfter(LocalDateTime.now(ET_ZONE).minusMinutes(10))) {
+            return signals;
+        }
+
+        // V2: Exhaustion metrics
+        double moveFromLOD = currentPrice.subtract(sessionLowPrice).doubleValue();
+        double moveFromHOD = sessionHighPrice.subtract(currentPrice).doubleValue();
+
+        String signalType;
+        BigDecimal stopLoss;
+
+        if (currentRegime == SessionRegime.TRENDING_DOWN) {
+            signalType = "PUT";
+
+            // V3: Counter-session-trend suppression
+            double bullDirPull = moveFromLOD / averageDailyRange;
+            double bearDirPull = moveFromHOD / averageDailyRange;
+            if (bullDirPull > 0.01 && bearDirPull > 0.01) {
+                double sessionRatioPull = bullDirPull / bearDirPull;
+                if (sessionRatioPull > 2.0) {
+                    log.info("[TREND-PULLBACK][{}] ⛔ PUT blocked — counter-session-trend (bull {}%/bear {}% = {}:1)",
+                            analysisId, String.format("%.0f", bullDirPull * 100),
+                            String.format("%.0f", bearDirPull * 100),
+                            String.format("%.1f", sessionRatioPull));
+                    return signals;
+                }
+            }
+
+            // V3: Exhaustion gate raised from 65% to 70%
+            if (moveFromHOD / averageDailyRange > 0.70) {
+                log.info("[TREND-PULLBACK][{}] ⛔ PUT blocked — bearDir {}% exhausted (>70%)",
+                        analysisId, String.format("%.0f", moveFromHOD / averageDailyRange * 100));
+                return signals;
+            }
+            // V2: RSI coherence — PUT pullback needs RSI < 58
+            if (ta.getRsi() > 58) {
+                log.info("[TREND-PULLBACK][{}] ⛔ PUT blocked — RSI {} > 58",
+                        analysisId, String.format("%.1f", ta.getRsi()));
+                return signals;
+            }
+            // V2: Price-side — should be at/below VWAP for PUT pullback
+            if (currentPrice.compareTo(vwap.add(new BigDecimal("0.10"))) > 0) {
+                log.info("[TREND-PULLBACK][{}] ⛔ PUT blocked — price ${} above VWAP ${}",
+                        analysisId, currentPrice, vwap);
+                return signals;
+            }
+            stopLoss = vwap.add(atr.multiply(new BigDecimal("0.75")));
+
+        } else if (currentRegime == SessionRegime.TRENDING_UP) {
+            signalType = "CALL";
+
+            // V3: Counter-session-trend suppression
+            double bullDirPullC = moveFromLOD / averageDailyRange;
+            double bearDirPullC = moveFromHOD / averageDailyRange;
+            if (bullDirPullC > 0.01 && bearDirPullC > 0.01) {
+                double sessionRatioPullC = bearDirPullC / bullDirPullC;
+                if (sessionRatioPullC > 2.0) {
+                    log.info("[TREND-PULLBACK][{}] ⛔ CALL blocked — counter-session-trend (bear {}%/bull {}% = {}:1)",
+                            analysisId, String.format("%.0f", bearDirPullC * 100),
+                            String.format("%.0f", bullDirPullC * 100),
+                            String.format("%.1f", sessionRatioPullC));
+                    return signals;
+                }
+            }
+
+            // V3: Exhaustion gate raised from 65% to 70%
+            if (moveFromLOD / averageDailyRange > 0.70) {
+                log.info("[TREND-PULLBACK][{}] ⛔ CALL blocked — bullDir {}% exhausted (>70%)",
+                        analysisId, String.format("%.0f", moveFromLOD / averageDailyRange * 100));
+                return signals;
+            }
+            // V2: RSI coherence — CALL pullback needs RSI > 42
+            if (ta.getRsi() < 42) {
+                log.info("[TREND-PULLBACK][{}] ⛔ CALL blocked — RSI {} < 42",
+                        analysisId, String.format("%.1f", ta.getRsi()));
+                return signals;
+            }
+            // V2: Price-side — should be at/above VWAP for CALL pullback
+            if (currentPrice.compareTo(vwap.subtract(new BigDecimal("0.10"))) < 0) {
+                log.info("[TREND-PULLBACK][{}] ⛔ CALL blocked — price ${} below VWAP ${}",
+                        analysisId, currentPrice, vwap);
+                return signals;
+            }
+            stopLoss = vwap.subtract(atr.multiply(new BigDecimal("0.75")));
+
+            // V4: VWAP cross-up confirmation for CALL pullbacks
+            // Prevents entering false bounces below VWAP
+            if ("CALL".equals(signalType)) {
+                boolean recentVwapCrossUp = lastVwapCrossTime != null
+                        && lastBreachDirection != null
+                        && lastBreachDirection.equals("UP")
+                        && lastVwapCrossTime.isAfter(LocalDateTime.now(ET_ZONE).minusMinutes(3));
+
+                if (!recentVwapCrossUp) {
+                    log.info("[TREND-PULLBACK][{}] ⛔ CALL waiting for VWAP cross-up confirmation " +
+                                    "(lastCross={}, lastDir={})",
+                            analysisId,
+                            lastVwapCrossTime != null ? lastVwapCrossTime.toLocalTime() : "null",
+                            lastBreachDirection);
+                    return signals;
+                }
+            }
+
+            // V4: Same for PUT pullbacks — require VWAP cross-down
+            if ("PUT".equals(signalType)) {
+                boolean recentVwapCrossDown = lastVwapCrossTime != null
+                        && lastBreachDirection != null
+                        && lastBreachDirection.equals("DOWN")
+                        && lastVwapCrossTime.isAfter(LocalDateTime.now(ET_ZONE).minusMinutes(3));
+
+                if (!recentVwapCrossDown) {
+                    log.info("[TREND-PULLBACK][{}] ⛔ PUT waiting for VWAP cross-down confirmation",
+                            analysisId);
+                    return signals;
+                }
+            }
+
+        } else {
+            return signals;
+        }
+
+        int leadersConfirming = checkLeadersForDirection(symbol, signalType);
+        if (leadersConfirming < 2) {
+            log.info("[TREND-PULLBACK][{}] Only {}/3 leaders confirm {} — skipping",
+                    analysisId, leadersConfirming, signalType);
+            return signals;
+        }
+
+        double volRatio = ta.getVolumeRatio();
+        if (volRatio < 0.3) {
+            log.info("[TREND-PULLBACK][{}] Volume too low ({}) for trend entry",
+                    analysisId, String.format("%.2f", volRatio));
+            return signals;
+        }
+
+        BigDecimal targetPrice = calculateADRAwareTarget(currentPrice, signalType,
+                "TREND_PULLBACK", vwap, atr, analysisId);
+
+        BigDecimal targetDist = targetPrice.subtract(currentPrice).abs();
+        if (targetDist.compareTo(new BigDecimal("0.50")) < 0) {
+            return signals;
+        }
+
+        log.info("═══════════════════════════════════════════════════════════════");
+        log.info("[TREND-PULLBACK][{}] ⚡ {} PULLBACK ENTRY", analysisId, signalType);
+        log.info("[TREND-PULLBACK][{}] Price=${}, VWAP=${}, Dist={}%, Regime={}, Leaders={}/3",
+                analysisId, currentPrice, vwap, String.format("%.3f", distPct * 100),
+                currentRegime, leadersConfirming);
+        log.info("═══════════════════════════════════════════════════════════════");
+
+        signals = buildAndRouteSignal(symbol, signalType, currentPrice, targetPrice, stopLoss,
+                leadersConfirming, ta, "TREND_PULLBACK", analysisId);
+
+        if (!signals.isEmpty()) {
+            lastTrendSignalTime = LocalDateTime.now(ET_ZONE);
+        }
+
+        return signals;
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PART 6b: isStrongTrendConfirmed() — REPLACE ENTIRE METHOD (around line 9736)
+    // Change: support TREND_EXHAUSTING regime
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    private boolean isStrongTrendConfirmed() {
+        if (currentRegime == SessionRegime.RANGING || currentRegime == SessionRegime.TREND_EXHAUSTING) {
+            return false; // TREND_EXHAUSTING is no longer "strong"
+        }
+
+        boolean longDuration = (currentRegime == SessionRegime.TRENDING_DOWN && continuousBelowVwapMinutes >= 120)
+                || (currentRegime == SessionRegime.TRENDING_UP && continuousAboveVwapMinutes >= 120);
+
+        boolean largeDisplacement = false;
+        if (sessionOpenPrice != null && sessionOpenPrice.compareTo(BigDecimal.ZERO) > 0) {
+            TechnicalAnalysis ta = null;
+            try { ta = technicalAnalysisService.analyze("QQQ"); } catch (Exception ignored) {}
+            if (ta != null && ta.getCurrentPrice() != null) {
+                double dispPct = Math.abs(ta.getCurrentPrice().subtract(sessionOpenPrice)
+                        .divide(sessionOpenPrice, 6, RoundingMode.HALF_UP).doubleValue());
+                largeDisplacement = dispPct > 0.015;
+            }
+        }
+
+        return longDuration || largeDisplacement;
+    }
+
+
+    /**
+     * V3: ADR-aware target calculation.
+     *
+     * Computes realistic, achievable targets based on:
+     * - Remaining directional room in the ADR
+     * - Session structure (VWAP, HOD, LOD)
+     * - Strategy type (MR vs trend)
+     *
+     * Returns a target that represents 50% of remaining directional room,
+     * capped to realistic 0DTE intraday move distances, with VWAP as the
+     * anchor for mean-reversion strategies.
+     */
+    private BigDecimal calculateADRAwareTarget(BigDecimal currentPrice, String signalType,
+                                               String strategy, BigDecimal vwap,
+                                               BigDecimal atr, String analysisId) {
+
+        double price = currentPrice.doubleValue();
+        double vwapVal = vwap.doubleValue();
+
+        // Session metrics
+        double moveFromLOD = currentPrice.subtract(sessionLowPrice).doubleValue();
+        double moveFromHOD = sessionHighPrice.subtract(currentPrice).doubleValue();
+        double hodVal = sessionHighPrice.doubleValue();
+        double lodVal = sessionLowPrice.doubleValue();
+
+        // Remaining directional room
+        double remainingBullRoom = Math.max(0, averageDailyRange - moveFromLOD);
+        double remainingBearRoom = Math.max(0, averageDailyRange - moveFromHOD);
+
+        double targetVal;
+
+        if (strategy.startsWith("EXHAUSTION_REVERSAL")) {
+            // Exhaustion reversals: target is VWAP (mean reversion to center)
+            targetVal = vwapVal;
+            log.info("[TARGET][{}] {} exhaustion reversal → target VWAP ${}", analysisId, signalType,
+                    String.format("%.2f", targetVal));
+
+        } else if (strategy.contains("BREACH") || strategy.contains("DEPARTURE")
+                || strategy.contains("CONTINUATION")) {
+            // Trend signals: target is 50% of remaining directional room
+            if ("CALL".equals(signalType)) {
+                double room = remainingBullRoom;
+                double extensionTarget = price + (room * 0.50);
+                // Also consider HOD as natural resistance if above current price
+                if (hodVal > price && hodVal < extensionTarget) {
+                    targetVal = hodVal;  // Use HOD as more conservative target
+                } else {
+                    targetVal = extensionTarget;
+                }
+                // Floor: at least $0.50 above entry, ceiling: entry + ADR * 0.40
+                double maxTarget = price + (averageDailyRange * 0.40);
+                targetVal = Math.min(targetVal, maxTarget);
+                targetVal = Math.max(targetVal, price + 0.50);
+            } else {
+                double room = remainingBearRoom;
+                double extensionTarget = price - (room * 0.50);
+                // LOD as natural support if below current price
+                if (lodVal < price && lodVal > extensionTarget) {
+                    targetVal = lodVal;  // Use LOD as more conservative target
+                } else {
+                    targetVal = extensionTarget;
+                }
+                double maxTarget = price - (averageDailyRange * 0.40);
+                targetVal = Math.max(targetVal, maxTarget);
+                targetVal = Math.min(targetVal, price - 0.50);
+            }
+            log.info("[TARGET][{}] {} {} trend → target ${} (room={}, 50%={})",
+                    analysisId, signalType, strategy, String.format("%.2f", targetVal),
+                    String.format("%.2f", "CALL".equals(signalType) ? remainingBullRoom : remainingBearRoom),
+                    String.format("%.2f", ("CALL".equals(signalType) ? remainingBullRoom : remainingBearRoom) * 0.50));
+
+        } else if (strategy.equals("TREND_PULLBACK")) {
+            // Pullback: target is the further of VWAP or 40% of remaining room
+            if ("CALL".equals(signalType)) {
+                double vwapTarget = vwapVal;  // MR back above VWAP
+                double roomTarget = price + (remainingBullRoom * 0.40);
+                targetVal = Math.max(vwapTarget, roomTarget);
+                targetVal = Math.min(targetVal, price + (averageDailyRange * 0.30));
+                targetVal = Math.max(targetVal, price + 0.50);
+            } else {
+                double vwapTarget = vwapVal;
+                double roomTarget = price - (remainingBearRoom * 0.40);
+                targetVal = Math.min(vwapTarget, roomTarget);
+                targetVal = Math.max(targetVal, price - (averageDailyRange * 0.30));
+                targetVal = Math.min(targetVal, price - 0.50);
+            }
+            log.info("[TARGET][{}] {} pullback → target ${} (VWAP=${}, room={})",
+                    analysisId, signalType, String.format("%.2f", targetVal),
+                    String.format("%.2f", vwapVal),
+                    String.format("%.2f", "CALL".equals(signalType) ? remainingBullRoom : remainingBearRoom));
+
+        } else {
+            // MR signals (bounce/rejection): target VWAP
+            targetVal = vwapVal;
+            log.info("[TARGET][{}] {} MR signal → target VWAP ${}", analysisId, signalType,
+                    String.format("%.2f", targetVal));
+        }
+
+        // Sanity: target must be in correct direction
+        if ("CALL".equals(signalType) && targetVal <= price) {
+            targetVal = price + 0.50;  // Minimum $0.50 above
+            log.warn("[TARGET][{}] CALL target below entry — forcing +$0.50 minimum", analysisId);
+        }
+        if ("PUT".equals(signalType) && targetVal >= price) {
+            targetVal = price - 0.50;
+            log.warn("[TARGET][{}] PUT target above entry — forcing -$0.50 minimum", analysisId);
+        }
+
+        return BigDecimal.valueOf(targetVal).setScale(2, RoundingMode.HALF_UP);
+    }
+
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // PART 7: buildAndRouteSignal() — REPLACE ENTIRE METHOD (around line 9763)
+    // Changes:
+    //   - Recognizes new strategy names (VWAP_DEPARTURE_*, TREND_CONTINUATION_*,
+    //     EXHAUSTION_REVERSAL_*)
+    //   - Departure/Continuation get +10% confidence boost (regime-aligned)
+    //   - Exhaustion reversal gets +5% (counter-trend but high-probability)
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    private List<Signal> buildAndRouteSignal(String symbol, String signalType,
+                                             BigDecimal entryPrice, BigDecimal targetPrice, BigDecimal stopLoss,
+                                             int leadersConfirming, TechnicalAnalysis ta,
+                                             String strategy, String analysisId) {
+        List<Signal> signals = new ArrayList<>();
+        LocalTime now = LocalTime.now(ET_ZONE);
+
+        try {
+            LocalDate today = LocalDate.now(ET_ZONE);
+            List<LocalDate> expirations = tradierService.getExpirations(symbol);
+            if (expirations == null || !expirations.contains(today)) {
+                log.warn("[{}] No 0DTE expiration for {}", analysisId, strategy);
+                return signals;
+            }
+
+            OptionChainResponse chainResponse = tradierService.getOptionChain(symbol, today);
+            if (chainResponse == null || !chainResponse.hasOptions()) {
+                log.warn("[{}] No option chain for {}", analysisId, strategy);
+                return signals;
+            }
+
+            List<Option> options = chainResponse.getOptionsList();
+            if (options == null || options.isEmpty()) return signals;
+
+            Option selectedOption;
+            if (signalType.equals("CALL")) {
+                selectedOption = selectBestCallOption(options, entryPrice, targetPrice, analysisId);
+            } else {
+                selectedOption = selectBestPutOption(options, entryPrice, targetPrice, analysisId);
+            }
+
+            if (selectedOption == null) {
+                log.warn("[{}] No suitable option for {}", analysisId, strategy);
+                return signals;
+            }
+
+            Signal signal = new Signal();
+            signal.setSymbol(selectedOption.getSymbol());
+            signal.setOptionSymbol(selectedOption.getSymbol());
+            signal.setSignalType(signalType);
+            signal.setEntryPrice(selectedOption.getAsk());
+            signal.setTargetPrice(targetPrice);
+            signal.setStopLoss(stopLoss);
+            signal.setStrikePrice(selectedOption.getStrikePrice());
+            signal.setExpirationDate(today.atTime(16, 0).atZone(ET_ZONE));
+            signal.setStrategy(strategy);
+
+            // Calculate confidence
+            Map<String, Double> candleNets = fetchCandleNetsForConfidence(analysisId);
+            DailyLevelService.DailyLevels levels = dailyLevelService.getQQQDailyLevels();
+            BigDecimal todayHigh = (levels != null) ? levels.getTodayHigh() : null;
+            BigDecimal todayLow = (levels != null) ? levels.getTodayLow() : null;
+
+            double confidence = calculateSignalConfidence(
+                    signal, ta, leadersConfirming, candleNets, todayHigh, todayLow, 0.0, analysisId);
+
+            // V2: Strategy-specific confidence adjustments — conditional bonuses
+            if (strategy.startsWith("VWAP_DEPARTURE") || strategy.startsWith("TREND_CONTINUATION")) {
+                confidence += 0.10;
+                log.info("[{}] {} bonus: +10% confidence (trend-aligned)", analysisId, strategy);
+
+            } else if (strategy.startsWith("VWAP_BREACH")) {
+                confidence += 0.10;
+                log.info("[{}] {} bonus: +10% confidence (regime-aligned)", analysisId, strategy);
+
+            } else if (strategy.equals("TREND_PULLBACK")) {
+                // V2: Conditional pullback bonus — requires regime stability + RSI coherence
+                boolean regimeStable = regimeTrendingStartTime != null
+                        && java.time.Duration.between(regimeTrendingStartTime,
+                        LocalDateTime.now(ET_ZONE)).toMinutes() >= 10;
+
+                double currentRSI = ta.getRsi();
+                boolean rsiCoherent;
+                if ("CALL".equals(signalType)) {
+                    rsiCoherent = currentRSI > 45;
+                } else {
+                    rsiCoherent = currentRSI < 55;
+                }
+
+                if (regimeStable && rsiCoherent) {
+                    confidence += 0.10;
+                    log.info("[{}] TREND_PULLBACK bonus: +10% (regime {}min stable, RSI {} coherent)",
+                            analysisId,
+                            java.time.Duration.between(regimeTrendingStartTime,
+                                    LocalDateTime.now(ET_ZONE)).toMinutes(),
+                            String.format("%.1f", currentRSI));
+                } else if (!regimeStable) {
+                    log.info("[{}] TREND_PULLBACK bonus: +0% (regime <10min, unstable)", analysisId);
+                } else {
+                    confidence -= 0.05;
+                    log.info("[{}] TREND_PULLBACK penalty: -5% (RSI {} incoherent for {})",
+                            analysisId, String.format("%.1f", currentRSI), signalType);
+                }
+
+            } else if (strategy.startsWith("EXHAUSTION_REVERSAL")) {
+                confidence += 0.05;
+                log.info("[{}] {} bonus: +5% confidence (exhaustion counter-trend)", analysisId, strategy);
+            }
+
+            // V2: Directional coherence gate — penalize trend signals on wrong side of VWAP
+            if (strategy.startsWith("VWAP_DEPARTURE") || strategy.startsWith("TREND_CONTINUATION")
+                    || strategy.equals("TREND_PULLBACK")) {
+                BigDecimal currentVwap = ta.getVwap();
+                BigDecimal price = ta.getCurrentPrice();
+                if ("CALL".equals(signalType) && price.compareTo(currentVwap) < 0) {
+                    confidence *= 0.85;
+                    log.info("[{}] V2 coherence penalty: 0.85x — CALL with price ${} < VWAP ${}",
+                            analysisId, price, currentVwap);
+                } else if ("PUT".equals(signalType) && price.compareTo(currentVwap) > 0) {
+                    confidence *= 0.85;
+                    log.info("[{}] V2 coherence penalty: 0.85x — PUT with price ${} > VWAP ${}",
+                            analysisId, price, currentVwap);
+                }
+            }
+
+            // V3: Time adjustment removed here — applied ONCE in applyRiskManagement only
+            // Previous: time multiplier applied here AND again in applyRiskManagement = double penalty
+            // Example: 83% midday signal → 0.85x here = 70% → 0.85x again in risk mgmt = 60% (killed)
+            // Now: 83% passes through here → 0.85x once in risk mgmt = 70% (executes correctly)
+            signal.setConfidence(Math.max(0.0, Math.min(1.0, confidence)));
+            signal.setCreatedAt(LocalDateTime.now());
+
+
+            log.info("[{}] {} Signal: {} ${}, Entry: ${}, Target: ${}, Confidence: {}%",
+                    analysisId, strategy, signalType, selectedOption.getStrikePrice(),
+                    signal.getEntryPrice(), targetPrice, (int)(signal.getConfidence() * 100));
+
+            signal = applyRiskManagement(signal, analysisId);
+
+            if (signal != null && signal.getConfidence() != null && signal.getConfidence() >= 0.60) {
+                signals.add(signal);
+                lastSignalByTypeAndStrike.put(signalType + "_" + symbol, LocalDateTime.now(ET_ZONE));
+                signalsGeneratedToday++;
+                if ("PUT".equals(signalType)) putSignalsToday++;
+                if ("CALL".equals(signalType)) callSignalsToday++;
+
+                boolean handled = routeSignalByConfidence(signal, ta, analysisId);
+                if (handled) {
+                    log.info("[{}] {} signal routed successfully", analysisId, strategy);
+                }
+            }
+
+        } catch (Exception e) {
+            log.error("[{}] Error building {} signal: {}", analysisId, strategy, e.getMessage(), e);
+        }
+
+        return signals;
+    }
 
 }
